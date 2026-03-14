@@ -60,6 +60,9 @@ var autosave_in_progress: bool = false
 var last_host_contact_time: int = 0
 var last_sent_client_state_hash: int = 0
 var client_state_heartbeat_timer: float = 0.0
+var pending_remote_block_changes: Dictionary = {}
+var pending_remote_water_changes: Dictionary = {}
+var pending_remote_fire_changes: Dictionary = {}
 
 var hud: CanvasLayer
 var overlay: Control
@@ -118,6 +121,7 @@ func _input(event: InputEvent) -> void:
 func _physics_process(delta: float) -> void:
     _refresh_world_authority_mode()
     _refresh_session_load_radius()
+    _flush_pending_remote_world_changes()
 
     if not _has_live_peer():
         _hide_all_markers()
@@ -301,6 +305,9 @@ func disconnect_session(announce: bool = true) -> void:
     guest_persistent_ready = false
     last_host_contact_time = 0
     last_sent_client_state_hash = 0
+    pending_remote_block_changes.clear()
+    pending_remote_water_changes.clear()
+    pending_remote_fire_changes.clear()
 
     if announce:
         status_message = "Disconnected"
@@ -673,6 +680,35 @@ func _autosave_host_world_if_needed() -> void:
     if autosave_in_progress or not multiplayer.is_server() or not _can_share_loaded_world():
         return
     _run_host_autosave.call_deferred()
+
+
+func _flush_pending_remote_world_changes() -> void:
+    if multiplayer.is_server() or not _has_live_peer() or not _can_sample_player() or not is_instance_valid(Ref.world):
+        return
+
+    for block_position in pending_remote_block_changes.keys().duplicate():
+        if not Ref.world.is_position_loaded(block_position):
+            continue
+        var block_id: int = int(pending_remote_block_changes[block_position])
+        pending_remote_block_changes.erase(block_position)
+        if block_id <= 0:
+            _apply_loaded_network_break(block_position)
+        else:
+            _apply_loaded_network_place(block_position, block_id)
+
+    for block_position in pending_remote_water_changes.keys().duplicate():
+        if not Ref.world.is_position_loaded(block_position):
+            continue
+        var water_level: int = int(pending_remote_water_changes[block_position])
+        pending_remote_water_changes.erase(block_position)
+        Ref.world.place_water_at(block_position, water_level)
+
+    for block_position in pending_remote_fire_changes.keys().duplicate():
+        if not Ref.world.is_position_loaded(block_position):
+            continue
+        var fire_level: int = int(pending_remote_fire_changes[block_position])
+        pending_remote_fire_changes.erase(block_position)
+        Ref.world.place_fire_at(block_position, fire_level)
 
 
 func _run_host_autosave() -> void:
@@ -2505,6 +2541,13 @@ func _play_client_entity_hit_feedback(target, attacker, damage_position: Vector3
 func _apply_network_place(block_position: Vector3i, block_id: int) -> void:
     if not is_instance_valid(Ref.world):
         return
+    if not Ref.world.is_position_loaded(block_position):
+        pending_remote_block_changes[block_position] = block_id
+        return
+    _apply_loaded_network_place(block_position, block_id)
+
+
+func _apply_loaded_network_place(block_position: Vector3i, block_id: int) -> void:
     var current_block = Ref.world.get_block_type_at(block_position)
     if current_block != null and int(current_block.id) == block_id:
         return
@@ -2514,6 +2557,13 @@ func _apply_network_place(block_position: Vector3i, block_id: int) -> void:
 func _apply_network_break(block_position: Vector3i) -> void:
     if not is_instance_valid(Ref.world):
         return
+    if not Ref.world.is_position_loaded(block_position):
+        pending_remote_block_changes[block_position] = 0
+        return
+    _apply_loaded_network_break(block_position)
+
+
+func _apply_loaded_network_break(block_position: Vector3i) -> void:
     var block = Ref.world.get_block_type_at(block_position)
     if block.id == 0 and block.internal_name != "cutscene block":
         return
@@ -2552,12 +2602,16 @@ func _apply_network_water_cells(changes: Array) -> void:
         var block_position: Vector3i = entry[0]
         var water_level: int = int(entry[1])
         if not Ref.world.is_position_loaded(block_position):
+            pending_remote_water_changes[block_position] = water_level
             continue
         Ref.world.place_water_at(block_position, water_level)
 
 
 func _apply_network_fire_cell(block_position: Vector3i, fire_level: int) -> void:
-    if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
+    if not is_instance_valid(Ref.world):
+        return
+    if not Ref.world.is_position_loaded(block_position):
+        pending_remote_fire_changes[block_position] = fire_level
         return
     Ref.world.place_fire_at(block_position, fire_level)
 
