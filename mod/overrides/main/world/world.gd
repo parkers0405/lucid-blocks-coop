@@ -30,8 +30,13 @@ var buffer_instance_radius: int = 80
 var fps_cap: int = 60
 var current_seed: int
 var even: bool = false
+var session_region_anchor_index: int = 0
+var session_region_anchor_hold_frames: int = 0
+var session_region_last_chunk_centers: Array = []
 
 var environment_speed_multiplier: float = 1.0
+const SESSION_RADIUS_QUANTUM: int = 16
+const SESSION_ANCHOR_SETTLE_FRAMES: int = 12
 
 
 func _ready() -> void :
@@ -86,13 +91,134 @@ func _physics_process(_delta: float) -> void :
     if load_enabled:
         even = not even
         var load_center: Vector3 = Ref.player.global_position
-        if Ref.coop_manager != null:
-            load_center = Ref.coop_manager.get_world_load_center(load_center)
-        set_loaded_region_center(load_center)
+        if _should_use_host_multi_region_loading() and has_method("set_loaded_region_centers") and Ref.coop_manager != null:
+            var session_positions: Array = Ref.coop_manager.get_same_instance_session_positions()
+            if not session_positions.is_empty():
+                call("set_loaded_region_centers", session_positions)
+            else:
+                set_loaded_region_center(load_center)
+        else:
+            if Ref.coop_native_patch != null and Ref.coop_native_patch.has_method("clear_active_region_centers"):
+                Ref.coop_native_patch.call("clear_active_region_centers")
+            if Ref.coop_manager != null:
+                load_center = Ref.coop_manager.get_world_load_center(load_center)
+            set_loaded_region_center(load_center)
 
         if simulate_enabled and not get_tree().paused and simulate_frame and not (even and Ref.sun.target_time_scale < 1.0):
             simulate_dynamic()
             simulate_frame = false
+
+
+func set_loaded_region_centers(centers: Array) -> void:
+    var active_centers: Array = []
+    for center in centers:
+        if center is Vector3:
+            active_centers.append(center)
+
+    var dirty_indices: Array = _update_session_region_tracking(active_centers)
+
+    if Ref.coop_native_patch != null:
+        if active_centers.is_empty() and Ref.coop_native_patch.has_method("clear_active_region_centers"):
+            Ref.coop_native_patch.call("clear_active_region_centers")
+        elif Ref.coop_native_patch.has_method("set_active_region_centers"):
+            Ref.coop_native_patch.call("set_active_region_centers", active_centers)
+
+    if active_centers.is_empty():
+        session_region_anchor_index = 0
+        session_region_anchor_hold_frames = 0
+        session_region_last_chunk_centers.clear()
+        set_loaded_region_center(Ref.player.global_position)
+        return
+
+    var base_radius: int = _get_session_base_instance_radius()
+    var desired_radius: int = _quantize_session_radius(base_radius)
+    desired_radius = mini(desired_radius, _get_native_instance_radius_cap())
+    desired_radius = maxi(desired_radius, SESSION_RADIUS_QUANTUM)
+    desired_radius = maxi(desired_radius, base_radius)
+
+    if instance_radius != desired_radius:
+        instance_radius = desired_radius
+        force_reload()
+
+    set_loaded_region_center(_get_next_session_anchor_center(active_centers, dirty_indices))
+
+
+func _should_use_host_multi_region_loading() -> bool:
+    return multiplayer != null and multiplayer.has_multiplayer_peer() and multiplayer.is_server()
+
+
+func _get_session_base_instance_radius() -> int:
+    if Ref.save_file_manager != null and Ref.save_file_manager.settings_file != null:
+        return maxi(16, int(Ref.save_file_manager.settings_file.get_data("render_distance", 80.0)))
+    return maxi(16, int(instance_radius))
+
+
+func _get_next_session_anchor_center(active_centers: Array, dirty_indices: Array) -> Vector3:
+    if active_centers.size() == 1:
+        session_region_anchor_index = 0
+        session_region_anchor_hold_frames = SESSION_ANCHOR_SETTLE_FRAMES
+        return active_centers[0]
+
+    if session_region_anchor_index >= active_centers.size():
+        session_region_anchor_index = 0
+
+    if dirty_indices.has(session_region_anchor_index):
+        session_region_anchor_hold_frames = SESSION_ANCHOR_SETTLE_FRAMES
+        return active_centers[session_region_anchor_index]
+
+    if not is_all_loaded():
+        session_region_anchor_hold_frames = SESSION_ANCHOR_SETTLE_FRAMES
+        return active_centers[session_region_anchor_index]
+
+    if session_region_anchor_hold_frames > 0:
+        session_region_anchor_hold_frames -= 1
+        return active_centers[session_region_anchor_index]
+
+    if not dirty_indices.is_empty():
+        session_region_anchor_index = int(dirty_indices[0])
+        session_region_anchor_hold_frames = SESSION_ANCHOR_SETTLE_FRAMES
+        return active_centers[session_region_anchor_index]
+
+    return active_centers[session_region_anchor_index]
+
+
+func _update_session_region_tracking(active_centers: Array) -> Array:
+    var dirty_indices: Array = []
+    var snapped_centers: Array = []
+    for i in range(active_centers.size()):
+        var snapped_center: Vector3i = snap_to_chunk(active_centers[i])
+        snapped_centers.append(snapped_center)
+        if i >= session_region_last_chunk_centers.size() or session_region_last_chunk_centers[i] != snapped_center:
+            dirty_indices.append(i)
+
+    if active_centers.size() != session_region_last_chunk_centers.size():
+        for i in range(active_centers.size()):
+            if not dirty_indices.has(i):
+                dirty_indices.append(i)
+
+    session_region_last_chunk_centers = snapped_centers
+    if session_region_anchor_index >= active_centers.size():
+        session_region_anchor_index = 0
+        session_region_anchor_hold_frames = 0
+
+    return dirty_indices
+
+
+func _get_native_instance_radius_cap() -> int:
+    var cap: int = maxi(maxi(_get_session_base_instance_radius(), int(instance_radius)), 96)
+    if Ref.coop_native_patch == null or not Ref.coop_native_patch.has_method("get_status"):
+        return cap
+
+    var status_variant: Variant = Ref.coop_native_patch.call("get_status")
+    if typeof(status_variant) != TYPE_DICTIONARY:
+        return cap
+
+    var status: Dictionary = status_variant
+    return maxi(cap, int(status.get("current_instance_radius_cap", cap)))
+
+
+func _quantize_session_radius(radius: int) -> int:
+    return maxi(SESSION_RADIUS_QUANTUM, int(ceili(float(radius) / float(SESSION_RADIUS_QUANTUM))) * SESSION_RADIUS_QUANTUM)
 
 
 func _process(_delta: float) -> void :

@@ -12,9 +12,7 @@ const HOST_TIMEOUT_SECONDS: float = 6.0
 const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
-const HOST_SESSION_MIN_LOAD_RADIUS: int = 1024
-const HOST_SESSION_EDGE_BUFFER: float = 1280.0
-const HOST_SESSION_RADIUS_STEP: int = 256
+const NATIVE_WORLD_MAX_INSTANCE_RADIUS: int = 96
 const ENTITY_SYNC_RADIUS: float = 144.0
 const DROP_SYNC_RADIUS: float = 96.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
@@ -39,6 +37,7 @@ var restore_capture_on_close: bool = false
 var restore_panel_movement_enabled: bool = true
 var restore_panel_hotbar_switch: bool = true
 var panel_tree_pause_requested: bool = false
+var spawn_anchor_index: int = 0
 var receiving_host_world: bool = false
 var incoming_snapshot_register_json: String = ""
 var incoming_snapshot_chunk_count: int = 0
@@ -49,7 +48,7 @@ var remote_break_outlines: Dictionary = {}
 var synced_entities: Dictionary = {}
 var synced_dropped_items: Dictionary = {}
 var client_world_sync_ready: bool = false
-var coop_player_death_hooked: bool = false
+var hooked_player_death_target: Node = null
 var handling_client_respawn: bool = false
 var handling_host_respawn: bool = false
 var host_respawning: bool = false
@@ -938,6 +937,8 @@ func _get_same_instance_session_positions() -> Array:
 
     var active_instance_key: String = get_active_dimension_instance_key()
     for peer_id in peer_states.keys():
+        if int(peer_id) == multiplayer.get_unique_id():
+            continue
         var state: Dictionary = peer_states[peer_id]
         if not bool(state.get("active", false)):
             continue
@@ -982,45 +983,64 @@ func _is_near_any_session_position(world_position: Vector3, positions: Array, ra
 
 
 func get_world_load_radius_target(default_radius: int) -> int:
-    if not multiplayer.is_server() or not _has_live_peer():
-        return default_radius
+    return mini(default_radius, NATIVE_WORLD_MAX_INSTANCE_RADIUS)
 
+
+func get_same_instance_session_positions() -> Array:
+    return _get_same_instance_session_positions().duplicate()
+
+
+func get_same_instance_session_player_count() -> int:
+    return _get_same_instance_session_positions().size()
+
+
+func get_same_instance_base_load_radius(default_radius: float = 0.0) -> float:
+    var base_radius: float = default_radius
+
+    if Ref.save_file_manager != null and Ref.save_file_manager.settings_file != null:
+        base_radius = maxf(base_radius, float(Ref.save_file_manager.settings_file.get_data("render_distance", 80.0)))
+
+    if multiplayer.is_server() and session_load_radius_applied and session_previous_instance_radius > 0:
+        base_radius = float(session_previous_instance_radius)
+
+    return maxf(base_radius, 16.0)
+
+
+func get_same_instance_activity_radius(default_radius: float = 0.0) -> float:
+    return maxf(get_same_instance_base_load_radius(default_radius) - 16.0, 16.0)
+
+
+func get_nearest_session_player_distance(world_position: Vector3, fallback_distance: float = INF) -> float:
     var positions: Array = _get_same_instance_session_positions()
-    if positions.size() <= 1:
-        return default_radius
+    if positions.is_empty():
+        return fallback_distance
 
-    var target_radius: int = maxi(default_radius, HOST_SESSION_MIN_LOAD_RADIUS)
-
-    var center: Vector3 = get_world_load_center(Ref.player.global_position)
-    var farthest_distance: float = 0.0
+    var nearest_distance: float = INF
     for position in positions:
-        farthest_distance = maxf(farthest_distance, center.distance_to(position))
+        nearest_distance = minf(nearest_distance, world_position.distance_to(position))
+    return nearest_distance
 
-    var snapped_radius: int = int(ceil((farthest_distance + HOST_SESSION_EDGE_BUFFER) / float(HOST_SESSION_RADIUS_STEP))) * HOST_SESSION_RADIUS_STEP
-    return maxi(target_radius, snapped_radius)
+
+func is_position_near_same_instance_player(world_position: Vector3, radius: float) -> bool:
+    return _is_near_any_session_position(world_position, _get_same_instance_session_positions(), radius)
+
+
+func get_next_same_instance_spawn_anchor(default_position: Vector3) -> Vector3:
+    var positions: Array = _get_same_instance_session_positions()
+    if positions.is_empty():
+        return default_position
+
+    spawn_anchor_index = posmod(spawn_anchor_index, positions.size())
+    var anchor: Vector3 = positions[spawn_anchor_index]
+    spawn_anchor_index = (spawn_anchor_index + 1) % positions.size()
+    return anchor
 
 
 func _refresh_session_load_radius() -> void:
     if not _can_sample_player() or not is_instance_valid(Ref.world):
         return
 
-    if _has_live_peer() and multiplayer.is_server():
-        if not session_load_radius_applied:
-            session_previous_instance_radius = int(Ref.world.instance_radius)
-            session_previous_buffer_instance_radius = int(Ref.world.buffer_instance_radius)
-            session_load_radius_applied = true
-
-        var target_radius: int = get_world_load_radius_target(session_previous_instance_radius)
-
-        var target_buffer_radius: int = maxi(session_previous_buffer_instance_radius, target_radius + 256)
-
-        if int(Ref.world.instance_radius) != target_radius:
-            Ref.world.instance_radius = target_radius
-            Ref.world.buffer_instance_radius = target_buffer_radius
-            Ref.world.force_reload()
-        elif int(Ref.world.buffer_instance_radius) != target_buffer_radius:
-            Ref.world.buffer_instance_radius = target_buffer_radius
-    elif session_load_radius_applied:
+    if session_load_radius_applied:
         if session_previous_instance_radius > 0 and int(Ref.world.instance_radius) != session_previous_instance_radius:
             Ref.world.instance_radius = session_previous_instance_radius
             Ref.world.buffer_instance_radius = session_previous_buffer_instance_radius if session_previous_buffer_instance_radius > 0 else Ref.world.buffer_instance_radius
@@ -2066,16 +2086,20 @@ func _load_host_world_snapshot(register_data: Dictionary, save_data: Dictionary,
 
 
 func _install_player_death_hook() -> void:
-    if coop_player_death_hooked or not is_instance_valid(Ref.player) or not is_instance_valid(Ref.main):
+    if not is_instance_valid(Ref.player) or not is_instance_valid(Ref.main):
         return
 
-    var original_handler := Callable(Ref.main, "_on_player_death")
     var coop_handler := Callable(self, "_on_player_died_for_coop")
+    if is_instance_valid(hooked_player_death_target) and hooked_player_death_target != Ref.player:
+        if hooked_player_death_target.died.is_connected(coop_handler):
+            hooked_player_death_target.died.disconnect(coop_handler)
+
+    var original_handler := Callable(Ref.main, "_on_player_death")
     if Ref.player.died.is_connected(original_handler):
         Ref.player.died.disconnect(original_handler)
     if not Ref.player.died.is_connected(coop_handler):
         Ref.player.died.connect(coop_handler)
-    coop_player_death_hooked = true
+    hooked_player_death_target = Ref.player
 
 
 func _on_player_died_for_coop() -> void:
@@ -2144,14 +2168,25 @@ func _handle_client_player_death() -> void:
         return
 
     handling_client_respawn = true
+    Steamworks.increment_statistic("death_count")
+    Steamworks.set_achievement("DEATH")
     _stop_local_player_actions()
+    if panel_visible:
+        toggle_panel(false)
+
+    Ref.player.disabled = true
+    _set_death_overlay_visible(true, "Respawning near host...")
+    await get_tree().create_timer(1.0, false).timeout
+
     Ref.player.dead = false
     Ref.player.disabled = false
     Ref.player.revive()
     Ref.player.make_invincible_temporary()
-
+    
     var respawn_anchor: Vector3 = peer_states.get(1, {}).get("position", Ref.player.global_position)
     _teleport_local_player_near(respawn_anchor)
+    Ref.player.consume_actions()
+    _set_death_overlay_visible(false)
     _send_persistent_state_to_host()
     status_message = "You died and respawned near host"
     _update_status_text()

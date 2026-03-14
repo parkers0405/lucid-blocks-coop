@@ -1,0 +1,26 @@
+import os
+
+godot_cpp_dir = os.environ.get("GODOT_CPP_DIR", os.path.join(os.getcwd(), "godot-cpp"))
+env = SConscript(os.path.join(godot_cpp_dir, "SConstruct"))
+
+env.Append(CPPPATH=[
+    "extension/",
+    os.path.join(godot_cpp_dir, "include"),
+    os.path.join(godot_cpp_dir, "gen", "include"),
+])
+sources = Glob("extension/*.cpp") + Glob("extension/*.S")
+
+if env["platform"] == "macos":
+    library = env.SharedLibrary(
+        "build/coopnativepatch/libcoopnativepatch.{}.{}.framework/libcoopnativepatch.{}.{}".format(
+            env["platform"], env["target"], env["platform"], env["target"]
+        ),
+        source=sources,
+    )
+else:
+    library = env.SharedLibrary(
+        "build/coopnativepatch/libcoopnativepatch{}{}".format(env["suffix"], env["SHLIBSUFFIX"]),
+        source=sources,
+    )
+
+Default(library)
