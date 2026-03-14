@@ -10,11 +10,36 @@ const TARGET_AVATAR_HEIGHT: float = 2.05
 const GROUND_OFFSET: float = -0.01
 const MOVE_ANIM_THRESHOLD: float = 0.08
 const RIGHT_HAND_BONE: String = "mixamorig_RightHand_022"
+const HIPS_BONE: String = "mixamorig_Hips_01"
+const SPINE_BONE_LOW: String = "mixamorig_Spine_02"
+const SPINE_BONE_MID: String = "mixamorig_Spine1_03"
 const SPINE_BONE: String = "mixamorig_Spine2_04"
 const RIGHT_ARM_BONE: String = "mixamorig_RightArm_00"
 const RIGHT_FOREARM_BONE: String = "mixamorig_RightForeArm_021"
 const LEFT_ARM_BONE: String = "mixamorig_LeftArm_09"
 const LEFT_FOREARM_BONE: String = "mixamorig_LeftForeArm_010"
+const LEFT_UP_LEG_BONE: String = "mixamorig_LeftUpLeg_031"
+const LEFT_LEG_BONE: String = "mixamorig_LeftLeg_032"
+const LEFT_FOOT_BONE: String = "mixamorig_LeftFoot_033"
+const RIGHT_UP_LEG_BONE: String = "mixamorig_RightUpLeg_036"
+const RIGHT_LEG_BONE: String = "mixamorig_RightLeg_037"
+const RIGHT_FOOT_BONE: String = "mixamorig_RightFoot_038"
+const IMPORTED_POSE_BONES: PackedStringArray = [
+    HIPS_BONE,
+    SPINE_BONE_LOW,
+    SPINE_BONE_MID,
+    SPINE_BONE,
+    RIGHT_ARM_BONE,
+    RIGHT_FOREARM_BONE,
+    LEFT_ARM_BONE,
+    LEFT_FOREARM_BONE,
+    LEFT_UP_LEG_BONE,
+    LEFT_LEG_BONE,
+    LEFT_FOOT_BONE,
+    RIGHT_UP_LEG_BONE,
+    RIGHT_LEG_BONE,
+    RIGHT_FOOT_BONE,
+]
 const IMPORTED_LABEL_HEIGHT: float = TARGET_AVATAR_HEIGHT + 0.26
 const IMPORTED_SKIN_SHADER_CODE: String = """
 shader_type spatial;
@@ -120,7 +145,8 @@ func _process(delta: float) -> void:
         action_cycle = wrapf(action_cycle + delta * 9.5, 0.0, TAU)
     else:
         action_cycle = move_toward(action_cycle, 0.0, delta * 10.0)
-    visual_root.position.y = -0.13 * crouch_amount + bob_amount
+    var crouch_root_drop: float = 0.04 if using_imported_avatar else 0.13
+    visual_root.position.y = -crouch_root_drop * crouch_amount + bob_amount
     visual_root.scale = Vector3.ONE * (0.96 - 0.05 * crouch_amount)
     visual_root.rotation.x = -0.08 * hit_pulse - 0.04 * interact_pulse + deg_to_rad(4.0) * crouch_amount
 
@@ -297,7 +323,7 @@ func _capture_imported_base_pose() -> void:
     if avatar_skeleton == null:
         return
 
-    for bone_name in [SPINE_BONE, RIGHT_ARM_BONE, RIGHT_FOREARM_BONE, LEFT_ARM_BONE, LEFT_FOREARM_BONE]:
+    for bone_name in IMPORTED_POSE_BONES:
         var bone_index: int = avatar_skeleton.find_bone(bone_name)
         if bone_index == -1:
             continue
@@ -452,30 +478,66 @@ func _update_imported_avatar_pose(speed_ratio: float) -> void:
 
     avatar_instance.rotation_degrees.x = rad_to_deg(clampf(target_pitch, deg_to_rad(-18.0), deg_to_rad(18.0)) * 0.35)
 
-    var should_act: bool = _has_imported_action_pose()
-
-    if avatar_animation_player == null or imported_anim_name == "":
-        if should_act:
-            _apply_imported_action_pose()
-        else:
-            _clear_imported_action_pose()
-        return
-
-    var should_walk: bool = target_move_speed > MOVE_ANIM_THRESHOLD
-
-    if should_walk and not should_act:
-        if avatar_animation_player.current_animation != imported_anim_name:
-            avatar_animation_player.play(imported_anim_name)
-
-        avatar_animation_player.speed_scale = lerpf(0.85, 2.35, speed_ratio)
-    else:
+    if avatar_animation_player != null and imported_anim_name != "":
         avatar_animation_player.pause()
         avatar_animation_player.seek(0.0, true)
 
-    if should_act:
+    _apply_imported_locomotion_pose(speed_ratio)
+
+    if _has_imported_action_pose():
         _apply_imported_action_pose()
-    elif not should_walk:
-        _clear_imported_action_pose()
+
+
+func _apply_imported_locomotion_pose(speed_ratio: float) -> void:
+    var move_amount: float = clampf(inverse_lerp(MOVE_ANIM_THRESHOLD, 1.0, speed_ratio), 0.0, 1.0)
+    var walk_swing: float = sin(walk_phase)
+    var walk_push: float = sin(walk_phase + PI * 0.5)
+    var left_stride: float = walk_swing * move_amount
+    var right_stride: float = -walk_swing * move_amount
+    var left_knee_drive: float = maxf(0.0, left_stride)
+    var right_knee_drive: float = maxf(0.0, right_stride)
+    var crouch_blend: float = crouch_amount
+    var crouch_walk_blend: float = crouch_blend * move_amount
+
+    var hips_euler := Vector3(7.0 * crouch_blend + 2.0 * move_amount * absf(walk_push), 0.0, 0.0)
+    var spine_low_euler := Vector3(-5.0 * crouch_blend - 2.0 * move_amount * absf(walk_push), 0.0, 0.0)
+    var spine_mid_euler := Vector3(-4.0 * crouch_blend, 0.0, 0.0)
+    var spine_top_euler := Vector3(1.5 * crouch_blend, 0.0, 0.0)
+
+    var arm_swing_scale: float = 24.0 * move_amount * (1.0 - 0.5 * crouch_blend)
+    var left_arm_euler := Vector3(2.0 * crouch_blend, 0.0, 8.0 * crouch_blend + arm_swing_scale * walk_swing)
+    var right_arm_euler := Vector3(2.0 * crouch_blend, 0.0, -8.0 * crouch_blend - arm_swing_scale * walk_swing)
+    var left_forearm_euler := Vector3.ZERO
+    var right_forearm_euler := Vector3.ZERO
+
+    var upper_leg_base: float = 26.0 * crouch_blend
+    var upper_leg_swing: float = 34.0 * move_amount * (1.0 - 0.45 * crouch_blend)
+    var lower_leg_base: float = -30.0 * crouch_blend
+    var lower_leg_stride_scale: float = 24.0 * move_amount
+    var foot_base: float = 10.0 * crouch_blend
+    var foot_stride_scale: float = 18.0 * move_amount
+
+    var left_up_leg_euler := Vector3(upper_leg_base + upper_leg_swing * left_stride, 0.0, 0.0)
+    var right_up_leg_euler := Vector3(upper_leg_base + upper_leg_swing * right_stride, 0.0, 0.0)
+    var left_leg_euler := Vector3(lower_leg_base - lower_leg_stride_scale * left_knee_drive - 8.0 * crouch_walk_blend, 0.0, 0.0)
+    var right_leg_euler := Vector3(lower_leg_base - lower_leg_stride_scale * right_knee_drive - 8.0 * crouch_walk_blend, 0.0, 0.0)
+    var left_foot_euler := Vector3(foot_base + foot_stride_scale * maxf(0.0, -left_stride) + 7.0 * crouch_walk_blend, 0.0, 0.0)
+    var right_foot_euler := Vector3(foot_base + foot_stride_scale * maxf(0.0, -right_stride) + 7.0 * crouch_walk_blend, 0.0, 0.0)
+
+    _set_imported_bone_euler(HIPS_BONE, _degrees_to_radians(hips_euler))
+    _set_imported_bone_euler(SPINE_BONE_LOW, _degrees_to_radians(spine_low_euler))
+    _set_imported_bone_euler(SPINE_BONE_MID, _degrees_to_radians(spine_mid_euler))
+    _set_imported_bone_euler(SPINE_BONE, _degrees_to_radians(spine_top_euler))
+    _set_imported_bone_euler(LEFT_ARM_BONE, _degrees_to_radians(left_arm_euler))
+    _set_imported_bone_euler(RIGHT_ARM_BONE, _degrees_to_radians(right_arm_euler))
+    _set_imported_bone_euler(LEFT_FOREARM_BONE, _degrees_to_radians(left_forearm_euler))
+    _set_imported_bone_euler(RIGHT_FOREARM_BONE, _degrees_to_radians(right_forearm_euler))
+    _set_imported_bone_euler(LEFT_UP_LEG_BONE, _degrees_to_radians(left_up_leg_euler))
+    _set_imported_bone_euler(RIGHT_UP_LEG_BONE, _degrees_to_radians(right_up_leg_euler))
+    _set_imported_bone_euler(LEFT_LEG_BONE, _degrees_to_radians(left_leg_euler))
+    _set_imported_bone_euler(RIGHT_LEG_BONE, _degrees_to_radians(right_leg_euler))
+    _set_imported_bone_euler(LEFT_FOOT_BONE, _degrees_to_radians(left_foot_euler))
+    _set_imported_bone_euler(RIGHT_FOOT_BONE, _degrees_to_radians(right_foot_euler))
 
 
 func _apply_imported_action_pose() -> void:
@@ -484,27 +546,26 @@ func _apply_imported_action_pose() -> void:
 
     var action_pose: Dictionary = _get_imported_action_pose()
     if not bool(action_pose.get("active", false)):
-        _clear_imported_action_pose()
         return
 
     var phase: float = float(action_pose.get("phase", 0.0))
     var strength: float = float(action_pose.get("strength", 0.0))
     var place_bias: float = float(action_pose.get("place_bias", 0.0))
 
-    var hit_spine_windup := Vector3(-3.0, 0.0, 0.0)
-    var hit_spine_strike := Vector3(9.0, 0.0, 0.0)
-    var place_spine_windup := Vector3(-2.0, 0.0, 0.0)
-    var place_spine_strike := Vector3(6.0, 0.0, 0.0)
+    var hit_spine_windup := Vector3(-2.0, 0.0, 0.0)
+    var hit_spine_strike := Vector3(6.0, 0.0, 0.0)
+    var place_spine_windup := Vector3(-1.0, 0.0, 0.0)
+    var place_spine_strike := Vector3(4.0, 0.0, 0.0)
 
-    var hit_right_arm_windup := Vector3(5.0, 0.0, -14.0)
-    var hit_right_arm_strike := Vector3(-32.0, 6.0, -66.0)
-    var place_right_arm_windup := Vector3(3.0, 0.0, -10.0)
-    var place_right_arm_strike := Vector3(-18.0, 4.0, -42.0)
+    var hit_right_arm_windup := Vector3(2.0, 0.0, -20.0)
+    var hit_right_arm_strike := Vector3(-8.0, 0.0, -78.0)
+    var place_right_arm_windup := Vector3(1.0, 0.0, -14.0)
+    var place_right_arm_strike := Vector3(-4.0, 0.0, -52.0)
 
-    var hit_right_forearm_windup := Vector3(0.0, 0.0, 10.0)
-    var hit_right_forearm_strike := Vector3(-12.0, 0.0, 52.0)
-    var place_right_forearm_windup := Vector3(0.0, 0.0, 6.0)
-    var place_right_forearm_strike := Vector3(-6.0, 0.0, 34.0)
+    var hit_right_forearm_windup := Vector3(0.0, 0.0, 8.0)
+    var hit_right_forearm_strike := Vector3(0.0, 0.0, 10.0)
+    var place_right_forearm_windup := Vector3(0.0, 0.0, 4.0)
+    var place_right_forearm_strike := Vector3(0.0, 0.0, 6.0)
 
     var hit_left_arm_windup := Vector3.ZERO
     var hit_left_arm_strike := Vector3(6.0, 0.0, 10.0)
@@ -608,25 +669,6 @@ func _degrees_to_radians(euler_degrees: Vector3) -> Vector3:
     )
 
 
-func _clear_imported_action_pose() -> void:
-    _restore_imported_bone_rotation(SPINE_BONE)
-    _restore_imported_bone_rotation(RIGHT_ARM_BONE)
-    _restore_imported_bone_rotation(RIGHT_FOREARM_BONE)
-    _restore_imported_bone_rotation(LEFT_ARM_BONE)
-    _restore_imported_bone_rotation(LEFT_FOREARM_BONE)
-
-
-func _restore_imported_bone_rotation(bone_name: String) -> void:
-    if avatar_skeleton == null or not imported_base_bone_rotations.has(bone_name):
-        return
-
-    var bone_index: int = avatar_skeleton.find_bone(bone_name)
-    if bone_index == -1:
-        return
-
-    avatar_skeleton.set_bone_pose_rotation(bone_index, imported_base_bone_rotations[bone_name])
-
-
 func _set_imported_bone_euler(bone_name: String, euler: Vector3) -> void:
     if avatar_skeleton == null:
         return
@@ -694,6 +736,7 @@ func _rebuild_held_item_visual() -> void:
 
     held_item_visual = Node3D.new()
     avatar_hand_attachment.add_child(held_item_visual)
+    held_item_visual.position = Vector3(0.02, 0.07, 0.0)
 
     if item is Block and not item.foliage and not item.override_icon and item.texture != null:
         var block_mesh := MeshInstance3D.new()
