@@ -15,6 +15,8 @@ const DEFAULT_AVATAR_ID: String = "default_blocky"
 const HOST_SESSION_MIN_LOAD_RADIUS: int = 1024
 const HOST_SESSION_EDGE_BUFFER: float = 960.0
 const HOST_SESSION_RADIUS_STEP: int = 256
+const ENTITY_SYNC_RADIUS: float = 144.0
+const DROP_SYNC_RADIUS: float = 96.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
 
@@ -850,7 +852,23 @@ func get_world_load_center(default_center: Vector3) -> Vector3:
         min_corner = min_corner.min(position)
         max_corner = max_corner.max(position)
 
-    return (min_corner + max_corner) * 0.5
+    return _snap_world_stream_position((min_corner + max_corner) * 0.5)
+
+
+func _snap_world_stream_position(position: Vector3) -> Vector3:
+    return Vector3(
+        floor(position.x / 16.0) * 16.0 + 8.0,
+        floor(position.y / 16.0) * 16.0 + 8.0,
+        floor(position.z / 16.0) * 16.0 + 8.0
+    )
+
+
+func _is_near_any_session_position(world_position: Vector3, positions: Array, radius: float) -> bool:
+    var radius_squared: float = radius * radius
+    for position in positions:
+        if world_position.distance_squared_to(position) <= radius_squared:
+            return true
+    return false
 
 
 func get_world_load_radius_target(default_radius: int) -> int:
@@ -2029,12 +2047,16 @@ func _capture_host_entity_snapshots() -> Array:
     if not _can_share_loaded_world():
         return snapshots
 
+    var session_positions: Array = _get_same_instance_session_positions()
+
     for child in get_tree().get_root().get_children():
         if not (child is Entity) or child is Player:
             continue
 
         var entity := child as Entity
         if not is_instance_valid(entity) or entity.dead:
+            continue
+        if not _is_near_any_session_position(entity.global_position, session_positions, ENTITY_SYNC_RADIUS):
             continue
 
         var uuid: String = _get_sync_uuid(entity)
@@ -2059,12 +2081,16 @@ func _capture_host_drop_snapshots() -> Array:
     if not _can_share_loaded_world():
         return snapshots
 
+    var session_positions: Array = _get_same_instance_session_positions()
+
     for child in get_tree().get_root().get_children():
         if not (child is DroppedItem):
             continue
 
         var dropped_item := child as DroppedItem
         if not is_instance_valid(dropped_item) or dropped_item.item == null:
+            continue
+        if not _is_near_any_session_position(dropped_item.global_position, session_positions, DROP_SYNC_RADIUS):
             continue
 
         var uuid: String = _get_sync_uuid(dropped_item)
