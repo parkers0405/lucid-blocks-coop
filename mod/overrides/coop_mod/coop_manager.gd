@@ -5,12 +5,14 @@ const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_CLIENTS: int = 4
 const SEND_INTERVAL: float = 0.05
-const WORLD_STATE_INTERVAL: float = 0.06
+const WORLD_STATE_INTERVAL: float = 0.04
 const PERSIST_INTERVAL: float = 1.0
 const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
-const HOST_SESSION_MIN_LOAD_RADIUS: int = 320
+const HOST_SESSION_MIN_LOAD_RADIUS: int = 1024
+const HOST_SESSION_EDGE_BUFFER: float = 960.0
+const HOST_SESSION_RADIUS_STEP: int = 256
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
 
@@ -46,6 +48,7 @@ var host_respawning: bool = false
 var last_local_world_authority: bool = true
 var session_load_radius_applied: bool = false
 var session_previous_instance_radius: int = -1
+var session_previous_buffer_instance_radius: int = -1
 var local_quit_in_progress: bool = false
 var guest_persistent_ready: bool = false
 
@@ -754,6 +757,7 @@ func _refresh_session_load_radius() -> void:
     if _has_live_peer() and multiplayer.is_server():
         if not session_load_radius_applied:
             session_previous_instance_radius = int(Ref.world.instance_radius)
+            session_previous_buffer_instance_radius = int(Ref.world.buffer_instance_radius)
             session_load_radius_applied = true
 
         var target_radius: int = maxi(session_previous_instance_radius, HOST_SESSION_MIN_LOAD_RADIUS)
@@ -768,18 +772,27 @@ func _refresh_session_load_radius() -> void:
             farthest_distance = maxf(farthest_distance, Ref.player.global_position.distance_to(state.get("position", Ref.player.global_position)))
 
         if farthest_distance > 0.0:
-            var snapped_radius: int = int(ceil((farthest_distance + 160.0) / 64.0)) * 64
+            var snapped_radius: int = int(ceil((farthest_distance + HOST_SESSION_EDGE_BUFFER) / float(HOST_SESSION_RADIUS_STEP))) * HOST_SESSION_RADIUS_STEP
             target_radius = maxi(target_radius, snapped_radius)
+
+        var target_buffer_radius: int = maxi(session_previous_buffer_instance_radius, target_radius + 256)
 
         if int(Ref.world.instance_radius) != target_radius:
             Ref.world.instance_radius = target_radius
+            Ref.world.buffer_instance_radius = target_buffer_radius
             Ref.world.force_reload()
+        elif int(Ref.world.buffer_instance_radius) != target_buffer_radius:
+            Ref.world.buffer_instance_radius = target_buffer_radius
     elif session_load_radius_applied:
         if session_previous_instance_radius > 0 and int(Ref.world.instance_radius) != session_previous_instance_radius:
             Ref.world.instance_radius = session_previous_instance_radius
+            Ref.world.buffer_instance_radius = session_previous_buffer_instance_radius if session_previous_buffer_instance_radius > 0 else Ref.world.buffer_instance_radius
             Ref.world.force_reload()
+        elif session_previous_buffer_instance_radius > 0 and int(Ref.world.buffer_instance_radius) != session_previous_buffer_instance_radius:
+            Ref.world.buffer_instance_radius = session_previous_buffer_instance_radius
         session_load_radius_applied = false
         session_previous_instance_radius = -1
+        session_previous_buffer_instance_radius = -1
 
 
 func _get_local_skin_color() -> Color:
@@ -1952,30 +1965,54 @@ func _capture_entity_special_state(entity) -> Dictionary:
         return {}
 
     var scene_path: String = str(entity.scene_file_path)
+    var state_payload: Dictionary = {
+        "visible": bool(entity.visible),
+    }
+
+    if _object_has_property(entity, "state"):
+        state_payload["state"] = int(entity.get("state"))
+
     if scene_path.contains("/entity/mimic/"):
         var copy_id: int = entity.copy_block.id if entity.copy_block != null else 0
-        return {
-            "kind": "mimic",
-            "state": int(entity.state),
-            "copy_id": copy_id,
-            "fast": bool(entity.fast),
-        }
+        state_payload["kind"] = "mimic"
+        state_payload["copy_id"] = copy_id
+        state_payload["fast"] = bool(entity.fast)
 
-    return {}
+    return state_payload
+
+
+func _object_has_property(target: Object, property_name: String) -> bool:
+    if target == null:
+        return false
+    for property_info in target.get_property_list():
+        if str(property_info.get("name", "")) == property_name:
+            return true
+    return false
 
 
 func _apply_entity_special_state(entity, special_state: Dictionary) -> void:
     if entity == null or special_state.is_empty():
         return
 
+    if special_state.has("visible"):
+        entity.visible = bool(special_state.get("visible", true))
+
+    var state_changed: bool = false
+    if special_state.has("state") and _object_has_property(entity, "state"):
+        var incoming_state: int = int(special_state.get("state", entity.get("state")))
+        if int(entity.get("state")) != incoming_state:
+            entity.set("state", incoming_state)
+            state_changed = true
+
     match str(special_state.get("kind", "")):
         "mimic":
-            entity.state = int(special_state.get("state", entity.state))
             entity.fast = bool(special_state.get("fast", entity.fast))
             var copy_id: int = int(special_state.get("copy_id", 0))
             if copy_id > 0:
                 entity.copy_block = ItemMap.map(copy_id)
-            entity.initialize_state()
+
+    if state_changed and entity.has_method("initialize_state"):
+        entity.initialize_state()
 
 
 func _apply_client_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
@@ -2181,24 +2218,25 @@ func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
 
 
 func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw: float, entity_velocity: Vector3) -> void:
+    var predicted_position: Vector3 = entity_position + entity_velocity * WORLD_STATE_INTERVAL * 0.65
     if not bool(entity.get_meta("coop_snapshot_initialized", false)):
-        entity.global_position = entity_position
+        entity.global_position = predicted_position
         entity.set_meta("coop_snapshot_initialized", true)
     else:
-        var distance_error: float = entity.global_position.distance_to(entity_position)
-        if distance_error > 6.0:
-            entity.global_position = entity_position
+        var distance_error: float = entity.global_position.distance_to(predicted_position)
+        if distance_error > 10.0:
+            entity.global_position = predicted_position
         else:
-            entity.global_position = entity.global_position.lerp(entity_position, 0.42)
+            entity.global_position = entity.global_position.lerp(predicted_position, 0.24)
 
     var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
     if rotation_pivot != null:
-        rotation_pivot.rotation.y = lerp_angle(rotation_pivot.rotation.y, entity_yaw, 0.45)
+        rotation_pivot.rotation.y = lerp_angle(rotation_pivot.rotation.y, entity_yaw, 0.28)
     else:
-        entity.rotation.y = lerp_angle(entity.rotation.y, entity_yaw, 0.45)
+        entity.rotation.y = lerp_angle(entity.rotation.y, entity_yaw, 0.28)
     if entity is Entity:
         entity.velocity = entity_velocity
-        entity.movement_velocity = entity.movement_velocity.lerp(Vector3(entity_velocity.x, 0.0, entity_velocity.z), 0.55)
+        entity.movement_velocity = entity.movement_velocity.lerp(Vector3(entity_velocity.x, 0.0, entity_velocity.z), 0.3)
 
 
 func _apply_client_drop_snapshot(dropped_item, item_state, drop_position: Vector3, drop_velocity: Vector3) -> void:
