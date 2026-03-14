@@ -10,6 +10,7 @@ const PERSIST_INTERVAL: float = 1.0
 const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
+const HOST_SESSION_MIN_LOAD_RADIUS: int = 192
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
 
@@ -43,6 +44,8 @@ var handling_client_respawn: bool = false
 var handling_host_respawn: bool = false
 var host_respawning: bool = false
 var last_local_world_authority: bool = true
+var session_load_radius_applied: bool = false
+var session_previous_instance_radius: int = -1
 
 var hud: CanvasLayer
 var overlay: Control
@@ -97,6 +100,7 @@ func _input(event: InputEvent) -> void:
 
 func _physics_process(delta: float) -> void:
     _refresh_world_authority_mode()
+    _refresh_session_load_radius()
 
     if not _has_live_peer():
         _hide_all_markers()
@@ -477,6 +481,15 @@ func broadcast_host_block_break(block_position: Vector3i) -> void:
     sync_break_block.rpc(block_position)
 
 
+func broadcast_host_world_changes(block_changes: Array, fire_changes: Array) -> void:
+    if not _has_live_peer() or not multiplayer.is_server():
+        return
+    if block_changes.is_empty() and fire_changes.is_empty():
+        return
+
+    sync_world_changes.rpc(get_active_dimension_instance_key(), block_changes, fire_changes)
+
+
 func sync_local_entity_attack(_attack_behavior, target, damage_position: Vector3, knockback_strength: float, fly_strength: float) -> bool:
     if not _has_live_peer() or multiplayer.is_server():
         return false
@@ -713,6 +726,26 @@ func _refresh_world_authority_mode() -> void:
         else:
             Ref.entity_spawner.stop_spawning()
     last_local_world_authority = has_authority
+
+
+func _refresh_session_load_radius() -> void:
+    if not _can_sample_player() or not is_instance_valid(Ref.world):
+        return
+
+    if _has_live_peer() and multiplayer.is_server():
+        if not session_load_radius_applied:
+            session_previous_instance_radius = int(Ref.world.instance_radius)
+            session_load_radius_applied = true
+        var target_radius: int = maxi(session_previous_instance_radius, HOST_SESSION_MIN_LOAD_RADIUS)
+        if int(Ref.world.instance_radius) != target_radius:
+            Ref.world.instance_radius = target_radius
+            Ref.world.force_reload()
+    elif session_load_radius_applied:
+        if session_previous_instance_radius > 0 and int(Ref.world.instance_radius) != session_previous_instance_radius:
+            Ref.world.instance_radius = session_previous_instance_radius
+            Ref.world.force_reload()
+        session_load_radius_applied = false
+        session_previous_instance_radius = -1
 
 
 func _get_local_skin_color() -> Color:
@@ -1063,7 +1096,7 @@ func _refresh_markers(states: Dictionary, local_peer_id: int) -> void:
 
     for peer_id in markers.keys().duplicate():
         if not visible_ids.has(peer_id):
-            markers[peer_id].queue_free()
+            markers[peer_id].call_deferred("queue_free")
             markers.erase(peer_id)
             _remove_remote_break_outline(peer_id)
 
@@ -1083,7 +1116,7 @@ func _ensure_marker(peer_id: int) -> Node:
 
 func _clear_markers() -> void:
     for peer_id in markers.keys():
-        markers[peer_id].queue_free()
+        markers[peer_id].call_deferred("queue_free")
     markers.clear()
     _clear_remote_break_outlines()
 
@@ -1136,14 +1169,14 @@ func _remove_remote_break_outline(peer_id: int) -> void:
     if not remote_break_outlines.has(peer_id):
         return
     if is_instance_valid(remote_break_outlines[peer_id]):
-        remote_break_outlines[peer_id].queue_free()
+        remote_break_outlines[peer_id].call_deferred("queue_free")
     remote_break_outlines.erase(peer_id)
 
 
 func _clear_remote_break_outlines() -> void:
     for peer_id in remote_break_outlines.keys():
         if is_instance_valid(remote_break_outlines[peer_id]):
-            remote_break_outlines[peer_id].queue_free()
+            remote_break_outlines[peer_id].call_deferred("queue_free")
     remote_break_outlines.clear()
 
 
@@ -1503,7 +1536,7 @@ func _on_peer_connected(id: int) -> void:
 func _on_peer_disconnected(id: int) -> void:
     peer_states.erase(id)
     if markers.has(id):
-        markers[id].queue_free()
+        markers[id].call_deferred("queue_free")
         markers.erase(id)
     _remove_remote_break_outline(id)
     status_message = "Peer %s disconnected" % id
@@ -1530,6 +1563,28 @@ func _on_server_disconnected() -> void:
     status_message = "Server disconnected"
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
+    _kick_client_to_main_menu.call_deferred()
+
+
+func _kick_client_to_main_menu() -> void:
+    if multiplayer.is_server() or not is_instance_valid(Ref.main) or not Ref.main.loaded:
+        return
+
+    await Ref.trans.open()
+    Ref.audio_manager.play_song(Ref.main.main_menu_music, 100)
+
+    var main_menu = Ref.main.get_node_or_null("%MainMenu")
+    var game_menu = Ref.main.get_node_or_null("%GameMenu")
+    if main_menu != null:
+        main_menu.open()
+    if game_menu != null:
+        game_menu.close()
+
+    await Ref.main.quit_game(false, false)
+    await Ref.trans.close()
+
+    if main_menu != null:
+        main_menu.activate()
 
 
 func _teleport_local_player_near(target_position: Vector3) -> void:
@@ -1782,7 +1837,7 @@ func _prune_unsynced_client_world_nodes() -> void:
         if child is Entity or child is DroppedItem:
             var uuid: String = _get_sync_uuid(child)
             if uuid == "":
-                child.queue_free()
+                child.call_deferred("queue_free")
 
 
 func _capture_host_entity_snapshots() -> Array:
@@ -1867,7 +1922,7 @@ func _apply_client_entity_snapshots(entity_snapshots: Array) -> void:
             entity = _find_existing_entity_by_uuid(uuid)
 
         if is_instance_valid(entity) and str(entity.scene_file_path) != scene_path:
-            entity.queue_free()
+            entity.call_deferred("queue_free")
             entity = null
 
         if not is_instance_valid(entity):
@@ -1883,7 +1938,7 @@ func _apply_client_entity_snapshots(entity_snapshots: Array) -> void:
         if visible_uuids.has(uuid):
             continue
         if is_instance_valid(synced_entities[uuid]):
-            synced_entities[uuid].queue_free()
+            synced_entities[uuid].call_deferred("queue_free")
         synced_entities.erase(uuid)
 
     _remove_unlisted_client_entities(visible_uuids)
@@ -1912,7 +1967,7 @@ func _apply_client_drop_snapshots(drop_snapshots: Array) -> void:
             continue
 
         if is_instance_valid(dropped_item) and dropped_item.item != null and int(dropped_item.item.id) != int(item_state.id):
-            dropped_item.queue_free()
+            dropped_item.call_deferred("queue_free")
             dropped_item = null
 
         if not is_instance_valid(dropped_item):
@@ -1928,7 +1983,7 @@ func _apply_client_drop_snapshots(drop_snapshots: Array) -> void:
         if visible_uuids.has(uuid):
             continue
         if is_instance_valid(synced_dropped_items[uuid]):
-            synced_dropped_items[uuid].queue_free()
+            synced_dropped_items[uuid].call_deferred("queue_free")
         synced_dropped_items.erase(uuid)
 
     _remove_unlisted_client_drops(visible_uuids)
@@ -1993,7 +2048,7 @@ func _remove_unlisted_client_entities(visible_uuids: Dictionary) -> void:
             continue
         var uuid: String = _get_sync_uuid(child)
         if uuid == "" or not visible_uuids.has(uuid):
-            child.queue_free()
+            child.call_deferred("queue_free")
 
 
 func _remove_unlisted_client_drops(visible_uuids: Dictionary) -> void:
@@ -2002,7 +2057,7 @@ func _remove_unlisted_client_drops(visible_uuids: Dictionary) -> void:
             continue
         var uuid: String = _get_sync_uuid(child)
         if uuid == "" or not visible_uuids.has(uuid):
-            child.queue_free()
+            child.call_deferred("queue_free")
 
 
 func _configure_client_synced_entity(entity, uuid: String) -> void:
@@ -2109,6 +2164,29 @@ func _apply_network_break(block_position: Vector3i) -> void:
     if block.id == 0 and block.internal_name != "cutscene block":
         return
     Ref.world.break_block_at(block_position, true, false)
+
+
+func _apply_network_block_changes(changes: Array) -> void:
+    if not is_instance_valid(Ref.world):
+        return
+
+    for entry in changes:
+        if not (entry is Array) or entry.size() < 2:
+            continue
+        var block_position: Vector3i = entry[0]
+        var block_id: int = int(entry[1])
+        if not Ref.world.is_position_loaded(block_position):
+            continue
+
+        var current_block = Ref.world.get_block_type_at(block_position)
+        if block_id <= 0:
+            if current_block.id == 0 and current_block.internal_name != "cutscene block":
+                continue
+            Ref.world.break_block_at(block_position, true, false)
+        else:
+            if current_block.id == block_id:
+                continue
+            Ref.world.place_block_at(block_position, ItemMap.map(block_id), true, true)
 
 
 func _apply_network_water_cells(changes: Array) -> void:
@@ -2464,6 +2542,20 @@ func sync_fire_cell(block_position: Vector3i, fire_level: int) -> void:
     if multiplayer.is_server():
         return
     _apply_network_fire_cell(block_position, fire_level)
+
+
+@rpc("authority", "call_remote", "reliable")
+func sync_world_changes(dimension_instance_key: String, block_changes: Array, fire_changes: Array) -> void:
+    if multiplayer.is_server():
+        return
+    if dimension_instance_key != get_active_dimension_instance_key():
+        return
+
+    _apply_network_block_changes(block_changes)
+    for entry in fire_changes:
+        if not (entry is Array) or entry.size() < 2:
+            continue
+        _apply_network_fire_cell(entry[0], int(entry[1]))
 
 
 @rpc("any_peer", "call_remote", "reliable")
