@@ -5,10 +5,11 @@ const DEFAULT_AVATAR_ID: String = "default_blocky"
 const AVATAR_SCENE: String = "res://coop_mod/avatar_assets/rigged_default/low_poly_character.glb"
 const VISUAL_SMOOTHNESS: float = 14.0
 const MAX_ANIMATED_SPEED: float = 4.5
-const HIDE_NEAR_DISTANCE: float = 1.05
+const HIDE_NEAR_DISTANCE: float = 0.45
 const TARGET_AVATAR_HEIGHT: float = 2.05
 const GROUND_OFFSET: float = -0.01
 const MOVE_ANIM_THRESHOLD: float = 0.08
+const HELD_ITEM_REBUILD_DELAY: float = 0.08
 const RIGHT_HAND_BONE: String = "mixamorig_RightHand_022"
 const HIPS_BONE: String = "mixamorig_Hips_01"
 const SPINE_BONE_LOW: String = "mixamorig_Spine_02"
@@ -111,6 +112,8 @@ var action_cycle: float = 0.0
 var imported_avatar_bounds: AABB = AABB(Vector3.ZERO, Vector3.ONE)
 var imported_skin_shader: Shader
 var imported_base_bone_rotations: Dictionary = {}
+var held_item_rebuild_pending: bool = false
+var held_item_rebuild_timer: float = 0.0
 
 
 func _ready() -> void:
@@ -123,6 +126,12 @@ func _ready() -> void:
 func _process(delta: float) -> void:
     if visual_root == null or not visible:
         return
+
+    if held_item_rebuild_pending:
+        held_item_rebuild_timer = maxf(held_item_rebuild_timer - delta, 0.0)
+        if held_item_rebuild_timer <= 0.0:
+            held_item_rebuild_pending = false
+            _rebuild_held_item_visual()
 
     var blend: float = clampf(delta * VISUAL_SMOOTHNESS, 0.0, 1.0)
     visual_position = visual_position.lerp(target_position, blend)
@@ -185,7 +194,8 @@ func set_held_item_id(new_held_item_id: int) -> void:
         return
 
     target_held_item_id = new_held_item_id
-    _rebuild_held_item_visual()
+    held_item_rebuild_pending = true
+    held_item_rebuild_timer = HELD_ITEM_REBUILD_DELAY
 
 
 func set_skin_color(new_skin_color: Color) -> void:
@@ -260,6 +270,8 @@ func _try_build_imported_avatar() -> bool:
     avatar_mesh_instance = null
     avatar_hand_attachment = null
     held_item_visual = null
+    held_item_rebuild_pending = false
+    held_item_rebuild_timer = 0.0
     imported_anim_name = ""
     imported_base_bone_rotations.clear()
 
@@ -736,15 +748,17 @@ func _rebuild_held_item_visual() -> void:
 
     held_item_visual = Node3D.new()
     avatar_hand_attachment.add_child(held_item_visual)
-    held_item_visual.position = Vector3(0.02, 0.07, 0.0)
+    held_item_visual.position = Vector3(0.07, 0.03, -0.05)
+    held_item_visual.rotation_degrees = Vector3(8.0, -32.0, -84.0)
+    held_item_visual.scale = Vector3.ONE * 1.35
 
     if item is Block and not item.foliage and not item.override_icon and item.texture != null:
         var block_mesh := MeshInstance3D.new()
         var cube := BoxMesh.new()
-        cube.size = Vector3(0.14, 0.14, 0.14)
+        cube.size = Vector3(0.2, 0.2, 0.2)
         block_mesh.mesh = cube
         block_mesh.material_override = _make_textured_material(item.texture)
-        block_mesh.rotation_degrees = Vector3(-10.0, 22.0, 0.0)
+        block_mesh.rotation_degrees = Vector3(-14.0, 20.0, 8.0)
         held_item_visual.add_child(block_mesh)
         return
 
@@ -752,9 +766,9 @@ func _rebuild_held_item_visual() -> void:
     var slab := BoxMesh.new()
     var item_name: String = str(item.internal_name)
     var is_long_item: bool = item_name.contains("sword") or item_name.contains("pick") or item_name.contains("axe") or item_name.contains("shovel") or item_name.contains("wand") or item_name.contains("hook") or item_name.contains("knife")
-    slab.size = Vector3(0.08, 0.24 if is_long_item else 0.15, 0.025)
+    slab.size = Vector3(0.11, 0.34 if is_long_item else 0.21, 0.03)
     item_mesh.mesh = slab
-    item_mesh.rotation_degrees = Vector3(0.0, 0.0, 10.0)
+    item_mesh.rotation_degrees = Vector3(0.0, 0.0, 14.0)
     if item.icon != null:
         item_mesh.material_override = _make_textured_material(item.icon)
     else:

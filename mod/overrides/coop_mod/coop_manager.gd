@@ -4,9 +4,11 @@ extends Node
 const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_CLIENTS: int = 4
-const SEND_INTERVAL: float = 0.05
-const WORLD_STATE_INTERVAL: float = 0.04
+const SEND_INTERVAL: float = 0.025
+const WORLD_STATE_INTERVAL: float = 0.03
 const PERSIST_INTERVAL: float = 1.0
+const AUTOSAVE_INTERVAL: float = 12.0
+const HOST_TIMEOUT_SECONDS: float = 6.0
 const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
@@ -28,6 +30,7 @@ var markers: Dictionary = {}
 var send_timer: float = 0.0
 var world_state_timer: float = 0.0
 var persist_timer: float = 0.0
+var autosave_timer: float = 0.0
 var status_message: String = "Idle"
 var panel_visible: bool = false
 var restore_capture_on_close: bool = false
@@ -51,6 +54,10 @@ var session_previous_instance_radius: int = -1
 var session_previous_buffer_instance_radius: int = -1
 var local_quit_in_progress: bool = false
 var guest_persistent_ready: bool = false
+var autosave_in_progress: bool = false
+var last_host_contact_time: int = 0
+var last_sent_client_state_hash: int = 0
+var client_state_heartbeat_timer: float = 0.0
 
 var hud: CanvasLayer
 var overlay: Control
@@ -118,12 +125,27 @@ func _physics_process(delta: float) -> void:
     send_timer += delta
     world_state_timer += delta
     persist_timer += delta
+    autosave_timer += delta
+    client_state_heartbeat_timer += delta
     if multiplayer.is_server() and world_state_timer >= WORLD_STATE_INTERVAL:
         world_state_timer = 0.0
         server_world_state.rpc(_capture_host_entity_snapshots(), _capture_host_drop_snapshots())
     elif not multiplayer.is_server() and client_world_sync_ready and guest_persistent_ready and persist_timer >= PERSIST_INTERVAL:
         persist_timer = 0.0
         _send_persistent_state_to_host()
+
+    if multiplayer.is_server() and autosave_timer >= AUTOSAVE_INTERVAL:
+        autosave_timer = 0.0
+        _autosave_host_world_if_needed()
+
+    if _has_host_timed_out():
+        disconnect_session(false)
+        status_message = "Host connection lost"
+        print("[lucid-blocks-coop] host heartbeat timed out")
+        _update_status_text()
+        if not local_quit_in_progress:
+            _kick_client_to_main_menu.call_deferred()
+        return
 
     if send_timer < SEND_INTERVAL:
         return
@@ -135,29 +157,33 @@ func _physics_process(delta: float) -> void:
         _refresh_markers(peer_states, multiplayer.get_unique_id())
         server_snapshot.rpc(_serialize_peer_states())
     else:
-        submit_client_state.rpc_id(
-            1,
-            local_state.get("active", false),
-            local_state.get("dimension", -1),
-            str(local_state.get("dimension_instance_key", "")),
-            str(local_state.get("pocket_owner_key", "")),
-            local_state.get("position", Vector3.ZERO),
-            local_state.get("yaw", 0.0),
-            local_state.get("pitch", 0.0),
-            local_state.get("crouching", false),
-            local_state.get("grounded", true),
-            local_state.get("move_speed", 0.0),
-            local_state.get("held_item_id", -1),
-            local_state.get("action_state", 0),
-            str(local_state.get("name", "guest")),
-            str(local_state.get("player_key", "")),
-            str(local_state.get("avatar_id", DEFAULT_AVATAR_ID)),
-            local_state.get("skin_color", Color.WHITE),
-            bool(local_state.get("breaking", false)),
-            local_state.get("break_position", Vector3i.ZERO),
-            int(local_state.get("break_block_id", 0)),
-            float(local_state.get("break_progress", 0.0))
-        )
+        var state_hash: int = _hash_client_state(local_state)
+        if state_hash != last_sent_client_state_hash or client_state_heartbeat_timer >= 0.25:
+            last_sent_client_state_hash = state_hash
+            client_state_heartbeat_timer = 0.0
+            submit_client_state.rpc_id(
+                1,
+                local_state.get("active", false),
+                local_state.get("dimension", -1),
+                str(local_state.get("dimension_instance_key", "")),
+                str(local_state.get("pocket_owner_key", "")),
+                local_state.get("position", Vector3.ZERO),
+                local_state.get("yaw", 0.0),
+                local_state.get("pitch", 0.0),
+                local_state.get("crouching", false),
+                local_state.get("grounded", true),
+                local_state.get("move_speed", 0.0),
+                local_state.get("held_item_id", -1),
+                local_state.get("action_state", 0),
+                str(local_state.get("name", "guest")),
+                str(local_state.get("player_key", "")),
+                str(local_state.get("avatar_id", DEFAULT_AVATAR_ID)),
+                local_state.get("skin_color", Color.WHITE),
+                bool(local_state.get("breaking", false)),
+                local_state.get("break_position", Vector3i.ZERO),
+                int(local_state.get("break_block_id", 0)),
+                float(local_state.get("break_progress", 0.0))
+            )
 
 
 func toggle_panel(force_visible: Variant = null) -> void:
@@ -192,6 +218,10 @@ func host_session() -> void:
 
     local_quit_in_progress = false
     guest_persistent_ready = true
+    last_host_contact_time = Time.get_ticks_msec()
+    autosave_timer = 0.0
+    client_state_heartbeat_timer = 0.0
+    last_sent_client_state_hash = 0
     _apply_ui_to_config()
     disconnect_session(false)
 
@@ -213,6 +243,10 @@ func host_session() -> void:
 func join_session() -> void:
     local_quit_in_progress = false
     guest_persistent_ready = false
+    last_host_contact_time = 0
+    autosave_timer = 0.0
+    client_state_heartbeat_timer = 0.0
+    last_sent_client_state_hash = 0
     _apply_ui_to_config()
     disconnect_session(false)
 
@@ -246,10 +280,14 @@ func disconnect_session(announce: bool = true) -> void:
     send_timer = 0.0
     world_state_timer = 0.0
     persist_timer = 0.0
+    autosave_timer = 0.0
+    client_state_heartbeat_timer = 0.0
     synced_entities.clear()
     synced_dropped_items.clear()
     client_world_sync_ready = false
     guest_persistent_ready = false
+    last_host_contact_time = 0
+    last_sent_client_state_hash = 0
 
     if announce:
         status_message = "Disconnected"
@@ -466,9 +504,8 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
 
     if inventory != null:
         inventory.change_amount(inventory_index, -1)
+    _apply_network_place(block_position, block_id)
     request_place_block.rpc_id(1, block_position, block_id)
-    status_message = "Requested place at %s" % block_position
-    _update_status_text()
     return true
 
 
@@ -483,6 +520,7 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
         return false
 
     _apply_client_break_feedback(break_behavior, block_position)
+    _apply_network_break(block_position)
     request_break_block.rpc_id(
         1,
         block_position,
@@ -492,8 +530,6 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
         bool(break_behavior.meat),
         bool(break_behavior.plant)
     )
-    status_message = "Requested break at %s" % block_position
-    _update_status_text()
     return true
 
 
@@ -523,6 +559,8 @@ func sync_local_entity_attack(_attack_behavior, target, damage_position: Vector3
     var target_uuid: String = _get_sync_uuid(target)
     if target_uuid == "":
         return false
+
+    _play_client_entity_hit_feedback(target, Ref.player, damage_position, 0, Ref.player.global_position)
 
     var held_item_state = Ref.player.held_item_inventory.items[Ref.player.held_item_index]
     if held_item_state != null and ItemMap.map(held_item_state.id).max_durability > 0:
@@ -604,6 +642,33 @@ func sync_local_foliage_break(block_position: Vector3i) -> bool:
 
 func _can_share_loaded_world() -> bool:
     return is_instance_valid(Ref.main) and is_instance_valid(Ref.world) and Ref.main.loaded and Ref.world.load_enabled and Ref.save_file_manager.loaded_file_register != null and Ref.save_file_manager.loaded_file != null
+
+
+func _mark_host_contact() -> void:
+    last_host_contact_time = Time.get_ticks_msec()
+
+
+func _has_host_timed_out() -> bool:
+    if multiplayer.is_server() or not _has_live_peer() or receiving_host_world:
+        return false
+    if last_host_contact_time <= 0:
+        return false
+    return (Time.get_ticks_msec() - last_host_contact_time) > int(HOST_TIMEOUT_SECONDS * 1000.0)
+
+
+func _autosave_host_world_if_needed() -> void:
+    if autosave_in_progress or not multiplayer.is_server() or not _can_share_loaded_world():
+        return
+    _run_host_autosave.call_deferred()
+
+
+func _run_host_autosave() -> void:
+    if autosave_in_progress or not multiplayer.is_server() or not _can_share_loaded_world():
+        return
+
+    autosave_in_progress = true
+    await Ref.save_file_manager.save_file(true)
+    autosave_in_progress = false
 
 
 func _capture_local_state() -> Dictionary:
@@ -750,6 +815,62 @@ func _refresh_world_authority_mode() -> void:
     last_local_world_authority = has_authority
 
 
+func _get_same_instance_session_positions() -> Array:
+    var positions: Array = []
+    if not _can_sample_player():
+        return positions
+
+    positions.append(Ref.player.global_position)
+    if not multiplayer.is_server() or not _has_live_peer():
+        return positions
+
+    var active_instance_key: String = get_active_dimension_instance_key()
+    for peer_id in peer_states.keys():
+        var state: Dictionary = peer_states[peer_id]
+        if not bool(state.get("active", false)):
+            continue
+        if str(state.get("dimension_instance_key", "")) != active_instance_key:
+            continue
+        positions.append(state.get("position", Ref.player.global_position))
+
+    return positions
+
+
+func get_world_load_center(default_center: Vector3) -> Vector3:
+    if not multiplayer.is_server() or not _has_live_peer():
+        return default_center
+
+    var positions: Array = _get_same_instance_session_positions()
+    if positions.size() <= 1:
+        return default_center
+
+    var min_corner: Vector3 = positions[0]
+    var max_corner: Vector3 = positions[0]
+    for position in positions:
+        min_corner = min_corner.min(position)
+        max_corner = max_corner.max(position)
+
+    return (min_corner + max_corner) * 0.5
+
+
+func get_world_load_radius_target(default_radius: int) -> int:
+    var target_radius: int = maxi(default_radius, HOST_SESSION_MIN_LOAD_RADIUS)
+    if not multiplayer.is_server() or not _has_live_peer():
+        return target_radius
+
+    var positions: Array = _get_same_instance_session_positions()
+    if positions.size() <= 1:
+        return target_radius
+
+    var center: Vector3 = get_world_load_center(Ref.player.global_position)
+    var farthest_distance: float = 0.0
+    for position in positions:
+        farthest_distance = maxf(farthest_distance, center.distance_to(position))
+
+    var snapped_radius: int = int(ceil((farthest_distance + HOST_SESSION_EDGE_BUFFER) / float(HOST_SESSION_RADIUS_STEP))) * HOST_SESSION_RADIUS_STEP
+    return maxi(target_radius, snapped_radius)
+
+
 func _refresh_session_load_radius() -> void:
     if not _can_sample_player() or not is_instance_valid(Ref.world):
         return
@@ -760,20 +881,7 @@ func _refresh_session_load_radius() -> void:
             session_previous_buffer_instance_radius = int(Ref.world.buffer_instance_radius)
             session_load_radius_applied = true
 
-        var target_radius: int = maxi(session_previous_instance_radius, HOST_SESSION_MIN_LOAD_RADIUS)
-        var active_instance_key: String = get_active_dimension_instance_key()
-        var farthest_distance: float = 0.0
-        for peer_id in peer_states.keys():
-            var state: Dictionary = peer_states[peer_id]
-            if not bool(state.get("active", false)):
-                continue
-            if str(state.get("dimension_instance_key", "")) != active_instance_key:
-                continue
-            farthest_distance = maxf(farthest_distance, Ref.player.global_position.distance_to(state.get("position", Ref.player.global_position)))
-
-        if farthest_distance > 0.0:
-            var snapped_radius: int = int(ceil((farthest_distance + HOST_SESSION_EDGE_BUFFER) / float(HOST_SESSION_RADIUS_STEP))) * HOST_SESSION_RADIUS_STEP
-            target_radius = maxi(target_radius, snapped_radius)
+        var target_radius: int = get_world_load_radius_target(session_previous_instance_radius)
 
         var target_buffer_radius: int = maxi(session_previous_buffer_instance_radius, target_radius + 256)
 
@@ -826,6 +934,32 @@ func _get_local_break_state() -> Dictionary:
     state["break_block_id"] = int(break_behavior.block.id)
     state["break_progress"] = clampf(float(break_behavior.progress) / break_goal, 0.0, 1.0)
     return state
+
+
+func _hash_client_state(local_state: Dictionary) -> int:
+    var position: Vector3 = local_state.get("position", Vector3.ZERO)
+    var break_position: Vector3i = local_state.get("break_position", Vector3i.ZERO)
+    return hash([
+        bool(local_state.get("active", false)),
+        int(local_state.get("dimension", -1)),
+        str(local_state.get("dimension_instance_key", "")),
+        int(round(position.x * 20.0)),
+        int(round(position.y * 20.0)),
+        int(round(position.z * 20.0)),
+        int(round(float(local_state.get("yaw", 0.0)) * 100.0)),
+        int(round(float(local_state.get("pitch", 0.0)) * 100.0)),
+        bool(local_state.get("crouching", false)),
+        bool(local_state.get("grounded", true)),
+        int(round(float(local_state.get("move_speed", 0.0)) * 20.0)),
+        int(local_state.get("held_item_id", -1)),
+        int(local_state.get("action_state", 0)),
+        bool(local_state.get("breaking", false)),
+        break_position.x,
+        break_position.y,
+        break_position.z,
+        int(local_state.get("break_block_id", 0)),
+        int(round(float(local_state.get("break_progress", 0.0)) * 50.0)),
+    ])
 
 
 func _get_local_attack_damage() -> int:
@@ -1597,6 +1731,7 @@ func _on_peer_disconnected(id: int) -> void:
 
 func _on_connected_to_server() -> void:
     guest_persistent_ready = false
+    _mark_host_contact()
     status_message = "Connected as peer %s, waiting for host world" % multiplayer.get_unique_id()
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
@@ -1867,40 +2002,26 @@ func _prepare_client_world_sync() -> void:
         client_world_sync_ready = true
         return
 
-    _prune_unsynced_client_world_nodes()
-    _register_existing_client_world_sync_nodes()
+    _disable_client_local_preserve_entity_loading()
+    _clear_client_world_entities_and_drops()
     client_world_sync_ready = true
 
 
-func _register_existing_client_world_sync_nodes() -> void:
+func _disable_client_local_preserve_entity_loading() -> void:
+    if Ref.preserve_node_manager == null:
+        return
+    Ref.preserve_node_manager.chunk_to_uuid_map.clear()
+
+
+func _clear_client_world_entities_and_drops() -> void:
     synced_entities.clear()
     synced_dropped_items.clear()
 
     for child in get_tree().get_root().get_children():
         if child is Player:
             continue
-        if child is Entity:
-            var entity_uuid: String = _get_sync_uuid(child)
-            if entity_uuid == "":
-                continue
-            synced_entities[entity_uuid] = child
-            _configure_client_synced_entity(child, entity_uuid)
-        elif child is DroppedItem:
-            var drop_uuid: String = _get_sync_uuid(child)
-            if drop_uuid == "":
-                continue
-            synced_dropped_items[drop_uuid] = child
-            _configure_client_synced_drop(child, drop_uuid)
-
-
-func _prune_unsynced_client_world_nodes() -> void:
-    for child in get_tree().get_root().get_children():
-        if child is Player:
-            continue
         if child is Entity or child is DroppedItem:
-            var uuid: String = _get_sync_uuid(child)
-            if uuid == "":
-                child.call_deferred("queue_free")
+            child.call_deferred("queue_free")
 
 
 func _capture_host_entity_snapshots() -> Array:
@@ -2202,8 +2323,9 @@ func _configure_client_synced_entity(entity, uuid: String) -> void:
     if entity is Entity:
         entity.disabled = false
         entity.invincible = true
-    entity.set_physics_process(true)
-    entity.set_process(true)
+    entity.set_physics_process(false)
+    entity.set_process(false)
+    _disable_client_entity_runtime(entity)
 
 
 func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
@@ -2215,6 +2337,22 @@ func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
         dropped_item.disabled = true
         dropped_item.can_merge = false
     dropped_item.set_physics_process(false)
+
+
+func _disable_client_entity_runtime(root: Node) -> void:
+    for child in root.get_children():
+        if child is Timer:
+            (child as Timer).stop()
+            child.set_process(false)
+            child.set_physics_process(false)
+        elif child is Area3D:
+            (child as Area3D).monitoring = false
+            (child as Area3D).monitorable = false
+        elif child is VisibleOnScreenNotifier3D:
+            child.set_process(false)
+            child.set_physics_process(false)
+
+        _disable_client_entity_runtime(child)
 
 
 func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw: float, entity_velocity: Vector3) -> void:
@@ -2237,6 +2375,42 @@ func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw:
     if entity is Entity:
         entity.velocity = entity_velocity
         entity.movement_velocity = entity.movement_velocity.lerp(Vector3(entity_velocity.x, 0.0, entity_velocity.z), 0.3)
+
+    _update_client_entity_visuals(entity, entity_velocity)
+
+
+func _update_client_entity_visuals(entity, entity_velocity: Vector3) -> void:
+    var animation_tree := _find_first_animation_tree(entity)
+    if animation_tree == null:
+        return
+
+    var horizontal_speed: float = Vector3(entity_velocity.x, 0.0, entity_velocity.z).length()
+    var walk_blend: float = clampf(horizontal_speed / maxf(0.01, float(entity.get("speed")) if _object_has_property(entity, "speed") else 2.0), 0.0, 1.0)
+
+    if animation_tree.has_method("set"):
+        if _animation_tree_has_parameter(animation_tree, "parameters/walk/blend_amount"):
+            animation_tree["parameters/walk/blend_amount"] = walk_blend
+        if _animation_tree_has_parameter(animation_tree, "parameters/fear/blend_amount") and _object_has_property(entity, "state"):
+            var panic_like: bool = int(entity.get("state")) >= 2
+            animation_tree["parameters/fear/blend_amount"] = 1.0 if panic_like else 0.0
+
+
+func _find_first_animation_tree(root: Node) -> AnimationTree:
+    if root is AnimationTree:
+        return root as AnimationTree
+
+    for child in root.get_children():
+        var tree := _find_first_animation_tree(child)
+        if tree != null:
+            return tree
+    return null
+
+
+func _animation_tree_has_parameter(animation_tree: AnimationTree, parameter_path: String) -> bool:
+    for property_info in animation_tree.get_property_list():
+        if str(property_info.get("name", "")) == parameter_path:
+            return true
+    return false
 
 
 func _apply_client_drop_snapshot(dropped_item, item_state, drop_position: Vector3, drop_velocity: Vector3) -> void:
@@ -2297,6 +2471,9 @@ func _play_client_entity_hit_feedback(target, attacker, damage_position: Vector3
 
 func _apply_network_place(block_position: Vector3i, block_id: int) -> void:
     if not is_instance_valid(Ref.world):
+        return
+    var current_block = Ref.world.get_block_type_at(block_position)
+    if current_block != null and int(current_block.id) == block_id:
         return
     Ref.world.place_block_at(block_position, ItemMap.map(block_id), true, true)
 
@@ -2587,6 +2764,7 @@ func request_guest_persistent_state(player_key: String, player_name: String) -> 
 func receive_guest_persistent_state(save_data: Dictionary) -> void:
     if multiplayer.is_server():
         return
+    _mark_host_contact()
     if save_data.is_empty():
         _initialize_new_guest_profile()
     else:
@@ -2635,6 +2813,8 @@ func begin_host_world_snapshot(register_json: String, chunk_count: int, host_pos
     if multiplayer.is_server():
         return
 
+    _mark_host_contact()
+
     incoming_snapshot_register_json = register_json
     incoming_snapshot_chunk_count = chunk_count
     incoming_snapshot_chunks.clear()
@@ -2650,6 +2830,8 @@ func host_world_snapshot_chunk(chunk_index: int, data: PackedByteArray) -> void:
     if multiplayer.is_server() or not receiving_host_world:
         return
 
+    _mark_host_contact()
+
     incoming_snapshot_chunks[chunk_index] = data
     status_message = "Receiving host world (%s/%s)" % [incoming_snapshot_chunks.size(), incoming_snapshot_chunk_count]
     _update_status_text()
@@ -2659,6 +2841,8 @@ func host_world_snapshot_chunk(chunk_index: int, data: PackedByteArray) -> void:
 func finish_host_world_snapshot() -> void:
     if multiplayer.is_server() or not receiving_host_world:
         return
+
+    _mark_host_contact()
 
     _apply_received_host_world.call_deferred()
 
@@ -2686,6 +2870,7 @@ func _relay_world_patch_to_matching_peers(world_patch: Dictionary, excluded_peer
 func sync_place_block(block_position: Vector3i, block_id: int) -> void:
     if multiplayer.is_server():
         return
+    _mark_host_contact()
     _apply_network_place(block_position, block_id)
 
 
@@ -2718,6 +2903,7 @@ func request_water_cells(changes: Array) -> void:
 func sync_water_cells(changes: Array) -> void:
     if multiplayer.is_server():
         return
+    _mark_host_contact()
     _apply_network_water_cells(changes)
 
 
@@ -2734,6 +2920,7 @@ func request_fire_cell(block_position: Vector3i, fire_level: int) -> void:
 func sync_fire_cell(block_position: Vector3i, fire_level: int) -> void:
     if multiplayer.is_server():
         return
+    _mark_host_contact()
     _apply_network_fire_cell(block_position, fire_level)
 
 
@@ -2741,6 +2928,7 @@ func sync_fire_cell(block_position: Vector3i, fire_level: int) -> void:
 func sync_world_changes(dimension_instance_key: String, block_changes: Array, fire_changes: Array) -> void:
     if multiplayer.is_server():
         return
+    _mark_host_contact()
     if dimension_instance_key != get_active_dimension_instance_key():
         return
 
@@ -2773,6 +2961,7 @@ func request_foliage_break(block_position: Vector3i) -> void:
 func sync_break_block(block_position: Vector3i) -> void:
     if multiplayer.is_server():
         return
+    _mark_host_contact()
     _apply_network_break(block_position)
 
 
@@ -2780,6 +2969,7 @@ func sync_break_block(block_position: Vector3i) -> void:
 func server_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
     if multiplayer.is_server() or receiving_host_world or _is_local_world_authority():
         return
+    _mark_host_contact()
     _apply_client_world_state(entity_snapshots, drop_snapshots)
 
 
@@ -2787,6 +2977,8 @@ func server_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
 func receive_picked_item(item_data: PackedInt32Array) -> void:
     if multiplayer.is_server():
         return
+
+    _mark_host_contact() 
 
     var item_state = _deserialize_item_state(item_data)
     if item_state == null or not _can_sample_player():
@@ -2802,6 +2994,8 @@ func sync_entity_hit_feedback(target_uuid: String, damage_position: Vector3, att
     if multiplayer.is_server():
         return
 
+    _mark_host_contact()
+
     var target = _find_client_synced_entity_by_uuid(target_uuid)
     if target == null:
         return
@@ -2814,6 +3008,8 @@ func sync_entity_ignite(target_uuid: String) -> void:
     if multiplayer.is_server():
         return
 
+    _mark_host_contact()
+
     var target = _find_client_synced_entity_by_uuid(target_uuid)
     if target == null or not target.has_node("%Burn"):
         return
@@ -2824,6 +3020,7 @@ func sync_entity_ignite(target_uuid: String) -> void:
 func sync_host_respawn_state(respawning: bool) -> void:
     if multiplayer.is_server():
         return
+    _mark_host_contact()
     host_respawning = respawning
     if respawning:
         status_message = "Host respawning"
@@ -2836,6 +3033,8 @@ func sync_host_respawn_state(respawning: bool) -> void:
 func server_snapshot(snapshot: Array) -> void:
     if multiplayer.is_server():
         return
+
+    _mark_host_contact()
 
     peer_states.clear()
     for entry in snapshot:
