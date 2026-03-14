@@ -6,14 +6,14 @@ const DEFAULT_PORT: int = 24567
 const MAX_CLIENTS: int = 4
 const SEND_INTERVAL: float = 0.025
 const WORLD_STATE_INTERVAL: float = 0.03
-const PERSIST_INTERVAL: float = 1.0
-const AUTOSAVE_INTERVAL: float = 12.0
+const PERSIST_INTERVAL: float = 0.25
+const AUTOSAVE_INTERVAL: float = 6.0
 const HOST_TIMEOUT_SECONDS: float = 6.0
 const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
 const HOST_SESSION_MIN_LOAD_RADIUS: int = 1024
-const HOST_SESSION_EDGE_BUFFER: float = 960.0
+const HOST_SESSION_EDGE_BUFFER: float = 1280.0
 const HOST_SESSION_RADIUS_STEP: int = 256
 const ENTITY_SYNC_RADIUS: float = 144.0
 const DROP_SYNC_RADIUS: float = 96.0
@@ -36,6 +36,9 @@ var autosave_timer: float = 0.0
 var status_message: String = "Idle"
 var panel_visible: bool = false
 var restore_capture_on_close: bool = false
+var restore_panel_movement_enabled: bool = true
+var restore_panel_hotbar_switch: bool = true
+var panel_tree_pause_requested: bool = false
 var receiving_host_world: bool = false
 var incoming_snapshot_register_json: String = ""
 var incoming_snapshot_chunk_count: int = 0
@@ -213,6 +216,14 @@ func toggle_panel(force_visible: Variant = null) -> void:
 
     if panel_visible:
         restore_capture_on_close = MouseHandler.captured
+        if _can_sample_player():
+            restore_panel_movement_enabled = Ref.player.movement_enabled
+            restore_panel_hotbar_switch = Ref.player.can_switch_hotbar
+            Ref.player.consume_actions()
+            Ref.player.movement_enabled = false
+            Ref.player.can_switch_hotbar = false
+            Ref.player.make_invincible_temporary()
+        _begin_tree_pause_for_panel()
         MouseHandler.release()
         _refresh_local_ip_label()
         _sync_inputs_from_config()
@@ -221,6 +232,11 @@ func toggle_panel(force_visible: Variant = null) -> void:
     else:
         _apply_ui_to_config()
         get_viewport().gui_release_focus()
+        if _can_sample_player():
+            Ref.player.consume_actions()
+            Ref.player.movement_enabled = restore_panel_movement_enabled
+            Ref.player.can_switch_hotbar = restore_panel_hotbar_switch
+        _end_tree_pause_for_panel()
         if restore_capture_on_close:
             MouseHandler.capture()
 
@@ -254,6 +270,8 @@ func host_session() -> void:
     peer_states.clear()
     status_message = "Hosting on port %s" % int(config.get("port", DEFAULT_PORT))
     print("[lucid-blocks-coop] %s" % status_message)
+    if panel_visible:
+        toggle_panel(false)
     _update_status_text()
 
 
@@ -281,6 +299,8 @@ func join_session() -> void:
     peer_states.clear()
     status_message = "Joining %s:%s" % [address, port]
     print("[lucid-blocks-coop] %s" % status_message)
+    if panel_visible:
+        toggle_panel(false)
     _update_status_text()
 
 
@@ -322,8 +342,18 @@ func _has_live_peer() -> bool:
     return multiplayer.multiplayer_peer != null and multiplayer.multiplayer_peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
 
 
+func has_connected_remote_peers() -> bool:
+    if not _has_live_peer():
+        return false
+
+    if multiplayer.is_server():
+        return multiplayer.multiplayer_peer.get_peers().size() > 0
+
+    return true
+
+
 func has_active_session() -> bool:
-    return _has_live_peer()
+    return has_connected_remote_peers()
 
 
 func open_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> void:
@@ -529,7 +559,7 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
     return true
 
 
-func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
+func sync_local_block_break(break_behavior, block_position: Vector3i, broken_block_id: int = 0) -> bool:
     if not _has_live_peer():
         return false
     if break_behavior == null or break_behavior.entity != Ref.player:
@@ -544,6 +574,7 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
     request_break_block.rpc_id(
         1,
         block_position,
+        broken_block_id,
         bool(break_behavior.pickaxe),
         bool(break_behavior.axe),
         bool(break_behavior.shovel),
@@ -664,6 +695,22 @@ func _can_share_loaded_world() -> bool:
     return is_instance_valid(Ref.main) and is_instance_valid(Ref.world) and Ref.main.loaded and Ref.world.load_enabled and Ref.save_file_manager.loaded_file_register != null and Ref.save_file_manager.loaded_file != null
 
 
+func _should_pause_tree_for_panel() -> bool:
+    return _can_share_loaded_world() and not _has_live_peer()
+
+
+func _begin_tree_pause_for_panel() -> void:
+    panel_tree_pause_requested = _should_pause_tree_for_panel()
+    if panel_tree_pause_requested:
+        get_tree().paused = true
+
+
+func _end_tree_pause_for_panel() -> void:
+    if panel_tree_pause_requested:
+        get_tree().paused = false
+    panel_tree_pause_requested = false
+
+
 func _mark_host_contact() -> void:
     last_host_contact_time = Time.get_ticks_msec()
 
@@ -718,6 +765,22 @@ func _run_host_autosave() -> void:
     autosave_in_progress = true
     await Ref.save_file_manager.save_file(true)
     autosave_in_progress = false
+
+
+func prepare_for_menu_quit() -> void:
+    if not _has_live_peer():
+        return
+
+    if multiplayer.is_server():
+        host_session_ending.rpc()
+        await get_tree().create_timer(0.6).timeout
+        disconnect_session(false)
+        await get_tree().process_frame
+    else:
+        if guest_persistent_ready:
+            _send_persistent_state_to_host(true)
+        disconnect_session(false)
+        await get_tree().process_frame
 
 
 func _capture_local_state() -> Dictionary:
@@ -919,13 +982,14 @@ func _is_near_any_session_position(world_position: Vector3, positions: Array, ra
 
 
 func get_world_load_radius_target(default_radius: int) -> int:
-    var target_radius: int = maxi(default_radius, HOST_SESSION_MIN_LOAD_RADIUS)
     if not multiplayer.is_server() or not _has_live_peer():
-        return target_radius
+        return default_radius
 
     var positions: Array = _get_same_instance_session_positions()
     if positions.size() <= 1:
-        return target_radius
+        return default_radius
+
+    var target_radius: int = maxi(default_radius, HOST_SESSION_MIN_LOAD_RADIUS)
 
     var center: Vector3 = get_world_load_center(Ref.player.global_position)
     var farthest_distance: float = 0.0
@@ -1193,11 +1257,17 @@ func _resolve_respawn_position() -> Vector3:
         return Vector3(closest_position) + Vector3(0.5, 0.0, 0.5)
 
     var fallback_position: Vector3 = Ref.player.global_position
+    var restore_world_loading: bool = Ref.world.load_enabled
     var found_spawn: bool = await Ref.world.spawn_tester.find_spawn_position(
         Ref.player.global_position if Ref.player.wandering_spirit else Vector3.ZERO,
         Ref.world.current_dimension,
         3.0 if Ref.player.wandering_spirit else 1.0
     )
+    if restore_world_loading:
+        Ref.world.load_enabled = true
+        if not Ref.world.is_all_loaded():
+            await Ref.world.all_loaded
+        await get_tree().process_frame
     return Ref.player.global_position if found_spawn else fallback_position
 
 
@@ -1355,8 +1425,7 @@ func _ensure_marker(peer_id: int) -> Node:
     if markers.has(peer_id):
         return markers[peer_id]
 
-    var marker_script: GDScript = load("res://coop_mod/remote_player_marker.gd")
-    var marker: Node = marker_script.new()
+    var marker: Node = RemotePlayerMarker.new()
     marker.name = "RemotePeer%s" % peer_id
     add_child(marker)
     marker.setup(peer_id)
@@ -1813,8 +1882,23 @@ func _on_connection_failed() -> void:
 
 func _on_local_game_quit() -> void:
     local_quit_in_progress = true
-    if _has_live_peer():
+    if not _has_live_peer():
+        return
+
+    if multiplayer.is_server():
+        _shutdown_host_session_for_local_quit.call_deferred()
+    else:
+        _send_persistent_state_to_host(true)
         disconnect_session(false)
+
+
+func _shutdown_host_session_for_local_quit() -> void:
+    if not _has_live_peer() or not multiplayer.is_server():
+        return
+
+    host_session_ending.rpc()
+    await get_tree().create_timer(0.25, true).timeout
+    disconnect_session(false)
 
 
 func _on_server_disconnected() -> void:
@@ -1824,6 +1908,31 @@ func _on_server_disconnected() -> void:
     _update_status_text()
     if local_quit_in_progress:
         return
+    _kick_client_to_main_menu.call_deferred()
+
+
+@rpc("authority", "call_remote", "reliable")
+func host_world_unavailable(message: String = "Host world is not ready yet") -> void:
+    if multiplayer.is_server():
+        return
+
+    disconnect_session(false)
+    status_message = message
+    print("[lucid-blocks-coop] %s" % status_message)
+    _update_status_text()
+
+
+@rpc("authority", "call_remote", "reliable")
+func host_session_ending() -> void:
+    if multiplayer.is_server():
+        return
+
+    local_quit_in_progress = true
+    if guest_persistent_ready:
+        _send_persistent_state_to_host(true)
+    disconnect_session(false)
+    status_message = "Host ended the session"
+    _update_status_text()
     _kick_client_to_main_menu.call_deferred()
 
 
@@ -1974,7 +2083,7 @@ func _on_player_died_for_coop() -> void:
         _handle_client_player_death.call_deferred()
         return
 
-    if _has_live_peer() and multiplayer.is_server():
+    if multiplayer.is_server() and has_connected_remote_peers():
         _handle_host_player_death.call_deferred()
         return
 
@@ -2880,6 +2989,10 @@ func request_host_world_snapshot() -> void:
     if sender_id <= 0:
         return
 
+    if not _can_share_loaded_world():
+        host_world_unavailable.rpc_id(sender_id, "Host world is not ready yet")
+        return
+
     _send_world_snapshot_to_peer.call_deferred(sender_id)
 
 
@@ -2890,6 +3003,10 @@ func request_dimension_world_snapshot(target_dimension: int, target_pocket_owner
 
     var sender_id: int = multiplayer.get_remote_sender_id()
     if sender_id <= 0:
+        return
+
+    if not _can_share_loaded_world():
+        host_world_unavailable.rpc_id(sender_id, "Host world is not ready yet")
         return
 
     _send_world_snapshot_to_peer.call_deferred(sender_id, target_dimension, target_pocket_owner_key, false)
@@ -2962,7 +3079,7 @@ func sync_place_block(block_position: Vector3i, block_id: int) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_break_block(block_position: Vector3i, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
+func request_break_block(block_position: Vector3i, broken_block_id: int, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
     if not multiplayer.is_server():
         return
 
@@ -2970,7 +3087,9 @@ func request_break_block(block_position: Vector3i, pickaxe: bool, axe: bool, sho
     if sender_id <= 0:
         return
 
-    var broken_block = Ref.world.get_block_type_at(block_position)
+    var broken_block = Ref.world.get_block_type_at(block_position) if Ref.world.is_position_loaded(block_position) else null
+    if (broken_block == null or int(broken_block.id) == 0) and broken_block_id > 0:
+        broken_block = ItemMap.map(broken_block_id)
     _apply_network_break(block_position)
     if broken_block != null:
         _spawn_break_drops_for_block(broken_block, block_position, pickaxe, axe, shovel, meat, plant)

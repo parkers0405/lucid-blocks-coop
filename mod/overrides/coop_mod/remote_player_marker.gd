@@ -1,4 +1,4 @@
-extends Node3D
+class_name RemotePlayerMarker extends Node3D
 
 
 const DEFAULT_AVATAR_ID: String = "default_blocky"

@@ -84,7 +84,7 @@ func break_block_instant(block_position: Vector3i) -> void :
         active_position = block_position
         block = ItemMap.map(Ref.world.get_block_type_at(block_position).id)
 
-        if entity == Ref.player and Ref.coop_manager != null and Ref.coop_manager.sync_local_block_break(self, block_position):
+        if entity == Ref.player and Ref.coop_manager != null and Ref.coop_manager.sync_local_block_break(self, block_position, block.id):
             return
 
         var held_item: ItemState = entity.held_item_inventory.items[entity.held_item_index]
