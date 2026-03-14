@@ -10,7 +10,7 @@ const PERSIST_INTERVAL: float = 1.0
 const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
-const HOST_SESSION_MIN_LOAD_RADIUS: int = 192
+const HOST_SESSION_MIN_LOAD_RADIUS: int = 320
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
 
@@ -46,6 +46,7 @@ var host_respawning: bool = false
 var last_local_world_authority: bool = true
 var session_load_radius_applied: bool = false
 var session_previous_instance_radius: int = -1
+var local_quit_in_progress: bool = false
 
 var hud: CanvasLayer
 var overlay: Control
@@ -65,6 +66,9 @@ func _ready() -> void:
     _load_config()
     _build_hud()
     call_deferred("_install_player_death_hook")
+
+    if is_instance_valid(Ref.main) and not Ref.main.game_quit.is_connected(_on_local_game_quit):
+        Ref.main.game_quit.connect(_on_local_game_quit)
 
     multiplayer.peer_connected.connect(_on_peer_connected)
     multiplayer.peer_disconnected.connect(_on_peer_disconnected)
@@ -182,6 +186,7 @@ func host_session() -> void:
         _update_status_text()
         return
 
+    local_quit_in_progress = false
     _apply_ui_to_config()
     disconnect_session(false)
 
@@ -201,6 +206,7 @@ func host_session() -> void:
 
 
 func join_session() -> void:
+    local_quit_in_progress = false
     _apply_ui_to_config()
     disconnect_session(false)
 
@@ -440,8 +446,6 @@ func _find_peer_state_by_query(query: String) -> Dictionary:
 func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, inventory_index: int) -> bool:
     if not _has_live_peer():
         return false
-    if _is_local_world_authority():
-        return false
 
     if multiplayer.is_server():
         _apply_network_place(block_position, block_id)
@@ -449,6 +453,9 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
             inventory.change_amount(inventory_index, -1)
         sync_place_block.rpc(block_position, block_id)
         return true
+
+    if _is_local_world_authority():
+        return false
 
     if inventory != null:
         inventory.change_amount(inventory_index, -1)
@@ -469,7 +476,15 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
         return false
 
     _apply_client_break_feedback(break_behavior, block_position)
-    request_break_block.rpc_id(1, block_position)
+    request_break_block.rpc_id(
+        1,
+        block_position,
+        bool(break_behavior.pickaxe),
+        bool(break_behavior.axe),
+        bool(break_behavior.shovel),
+        bool(break_behavior.meat),
+        bool(break_behavior.plant)
+    )
     status_message = "Requested break at %s" % block_position
     _update_status_text()
     return true
@@ -1553,9 +1568,16 @@ func _on_connected_to_server() -> void:
 
 func _on_connection_failed() -> void:
     disconnect_session(false)
+    local_quit_in_progress = false
     status_message = "Connection failed"
     push_warning("[lucid-blocks-coop] connection failed")
     _update_status_text()
+
+
+func _on_local_game_quit() -> void:
+    local_quit_in_progress = true
+    if _has_live_peer():
+        disconnect_session(false)
 
 
 func _on_server_disconnected() -> void:
@@ -1563,6 +1585,8 @@ func _on_server_disconnected() -> void:
     status_message = "Server disconnected"
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
+    if local_quit_in_progress:
+        return
     _kick_client_to_main_menu.call_deferred()
 
 
@@ -1585,6 +1609,7 @@ func _kick_client_to_main_menu() -> void:
 
     if main_menu != null:
         main_menu.activate()
+    local_quit_in_progress = false
 
 
 func _teleport_local_player_near(target_position: Vector3) -> void:
@@ -1864,6 +1889,7 @@ func _capture_host_entity_snapshots() -> Array:
             entity.global_position,
             rotation_pivot.rotation.y if rotation_pivot != null else entity.rotation.y,
             entity.velocity,
+            _capture_entity_special_state(entity),
         ])
 
     return snapshots
@@ -1896,6 +1922,37 @@ func _capture_host_drop_snapshots() -> Array:
     return snapshots
 
 
+func _capture_entity_special_state(entity) -> Dictionary:
+    if entity == null:
+        return {}
+
+    var scene_path: String = str(entity.scene_file_path)
+    if scene_path.contains("/entity/mimic/"):
+        var copy_id: int = entity.copy_block.id if entity.copy_block != null else 0
+        return {
+            "kind": "mimic",
+            "state": int(entity.state),
+            "copy_id": copy_id,
+            "fast": bool(entity.fast),
+        }
+
+    return {}
+
+
+func _apply_entity_special_state(entity, special_state: Dictionary) -> void:
+    if entity == null or special_state.is_empty():
+        return
+
+    match str(special_state.get("kind", "")):
+        "mimic":
+            entity.state = int(special_state.get("state", entity.state))
+            entity.fast = bool(special_state.get("fast", entity.fast))
+            var copy_id: int = int(special_state.get("copy_id", 0))
+            if copy_id > 0:
+                entity.copy_block = ItemMap.map(copy_id)
+            entity.initialize_state()
+
+
 func _apply_client_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
     _prepare_client_world_sync()
     _apply_client_entity_snapshots(entity_snapshots)
@@ -1914,6 +1971,7 @@ func _apply_client_entity_snapshots(entity_snapshots: Array) -> void:
         var entity_position: Vector3 = entry[2]
         var entity_yaw: float = float(entry[3])
         var entity_velocity: Vector3 = entry[4]
+        var special_state: Dictionary = entry[5] if entry.size() >= 6 and entry[5] is Dictionary else {}
         if uuid == "" or scene_path == "":
             continue
 
@@ -1933,6 +1991,7 @@ func _apply_client_entity_snapshots(entity_snapshots: Array) -> void:
         synced_entities[uuid] = entity
         visible_uuids[uuid] = true
         _apply_client_entity_snapshot(entity, entity_position, entity_yaw, entity_velocity)
+        _apply_entity_special_state(entity, special_state)
 
     for uuid in synced_entities.keys().duplicate():
         if visible_uuids.has(uuid):
@@ -2224,6 +2283,49 @@ func _spawn_network_item(item_state, block_position: Vector3i) -> void:
     dropped_item.initialize(item_state)
 
 
+func _spawn_break_drops_for_block(block, block_position: Vector3i, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
+    if block == null:
+        return
+    if block.pickaxe_required and not pickaxe:
+        return
+    if block.axe_required and not axe:
+        return
+
+    var to_drop: Array[ItemState] = []
+
+    if block.drop_item == null and block.drop_loot == null:
+        if not block.can_drop:
+            return
+
+        var default_state := ItemState.new()
+        default_state.initialize(block)
+        default_state.count = 1
+        to_drop.append(default_state)
+    if block.drop_item != null:
+        var explicit_state := ItemState.new()
+        explicit_state.initialize(block.drop_item)
+        explicit_state.count = 1
+        to_drop.append(explicit_state)
+    if block.drop_loot != null:
+        to_drop.append_array(block.drop_loot.realize())
+
+    for item_index in range(to_drop.size()):
+        var dropped_state: ItemState = to_drop[item_index]
+        if dropped_state == null:
+            continue
+        var dropped_item = load(DROPPED_ITEM_SCENE_PATH)
+        if not (dropped_item is PackedScene):
+            return
+        var new_item = (dropped_item as PackedScene).instantiate()
+        if new_item == null:
+            continue
+        if to_drop.size() > 1 and new_item is DroppedItem:
+            new_item.delay_merge()
+        get_tree().get_root().add_child(new_item)
+        new_item.global_position = Vector3(block_position)
+        new_item.initialize(dropped_state)
+
+
 func _apply_client_break_feedback(break_behavior, block_position: Vector3i) -> void:
     if break_behavior.entity == null or break_behavior.entity.disabled or not break_behavior.enabled:
         return
@@ -2500,7 +2602,7 @@ func sync_place_block(block_position: Vector3i, block_id: int) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_break_block(block_position: Vector3i) -> void:
+func request_break_block(block_position: Vector3i, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
     if not multiplayer.is_server():
         return
 
@@ -2508,7 +2610,10 @@ func request_break_block(block_position: Vector3i) -> void:
     if sender_id <= 0:
         return
 
+    var broken_block = Ref.world.get_block_type_at(block_position)
     _apply_network_break(block_position)
+    if broken_block != null:
+        _spawn_break_drops_for_block(broken_block, block_position, pickaxe, axe, shovel, meat, plant)
     sync_break_block.rpc(block_position)
 
 
