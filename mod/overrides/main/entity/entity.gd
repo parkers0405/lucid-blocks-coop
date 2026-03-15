@@ -148,6 +148,10 @@ var health: int = 0:
         if health == max_health and can_endure:
             has_endure = true
         if health <= 0 and not dead:
+            if self is Player and Ref.coop_manager != null and Ref.coop_manager.has_active_session():
+                disabled = true
+                Ref.coop_manager.call_deferred("_on_player_died_for_coop")
+                return
             die()
 
 var weight_boost: float = 0.0
@@ -324,9 +328,42 @@ func _should_ignore_visibility_culling() -> bool:
         and Ref.coop_manager.is_position_near_same_instance_player(global_position, process_distance)
 
 
+func _should_disable_server_visibility_culling() -> bool:
+    return Ref.coop_manager != null \
+        and Ref.world != null \
+        and Ref.world.has_method("set_loaded_region_centers") \
+        and multiplayer.is_server() \
+        and Ref.coop_manager.has_connected_remote_peers()
+
+
+func _use_server_session_targeting() -> bool:
+    return Ref.coop_manager != null \
+        and Ref.world != null \
+        and Ref.world.has_method("set_loaded_region_centers") \
+        and multiplayer.is_server() \
+        and Ref.coop_manager.has_connected_remote_peers()
+
+
+func get_session_target_position(default_position: Vector3) -> Vector3:
+    if not _use_server_session_targeting():
+        return default_position
+    return Ref.coop_manager.get_nearest_session_player_position(global_position, default_position)
+
+
+func get_session_target_head_position(default_position: Vector3) -> Vector3:
+    if not _use_server_session_targeting():
+        return default_position
+    return Ref.coop_manager.get_nearest_session_player_head_position(global_position, default_position)
+
+
+func is_session_target_within(radius: float) -> bool:
+    return _use_server_session_targeting() and Ref.coop_manager.is_position_near_same_instance_player(global_position, radius)
+
+
 func _refresh_visibility_enabler_target() -> void:
-    if _should_ignore_visibility_culling() or not disabled_by_visibility:
+    if _should_disable_server_visibility_culling() or _should_ignore_visibility_culling() or not disabled_by_visibility:
         %VisibleOnScreenEnabler3D.enable_node_path = ""
+        disabled = false
     else:
         %VisibleOnScreenEnabler3D.enable_node_path = ".."
 
@@ -798,5 +835,6 @@ func distance_process_check() -> void :
         set_process(false)
 
     elif _should_ignore_visibility_culling() or not disabled_by_visibility or %VisibleOnScreenEnabler3D.is_on_screen():
+        disabled = false
         set_physics_process(true)
         set_process(true)

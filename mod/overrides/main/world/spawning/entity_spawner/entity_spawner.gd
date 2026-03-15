@@ -15,6 +15,7 @@ class_name EntitySpawner extends Node3D
 @export var discovery_base_rate: float = 0.01
 @export var rare_spawn_risk_increase: float = 0.1
 @export var rare_spawn_base_chance: float = 0.1
+const DISCOVERY_SPAWN_COOLDOWN_MSEC: int = 250
 
 @onready var floor_raycast: RayCast3D = %FloorRayCast
 @onready var guard_checker: ShapeCast3D = %GuardChecker
@@ -25,6 +26,7 @@ var entities: Array[Entity] = []
 var can_spawn: bool = false
 
 var last_spawn_position: Vector3
+var last_discovery_spawn_attempt_msec: int = 0
 
 
 func _can_use_multi_region_logic() -> bool:
@@ -46,7 +48,10 @@ func _on_chunk_loaded(chunk_position: Vector3i) -> void :
         return
 
     if _can_use_multi_region_logic() and _get_same_instance_player_count() > 1:
-        return
+        var now_msec: int = Time.get_ticks_msec()
+        if now_msec - last_discovery_spawn_attempt_msec < DISCOVERY_SPAWN_COOLDOWN_MSEC:
+            return
+        last_discovery_spawn_attempt_msec = now_msec
 
     var chunk_center: Vector3 = Vector3(chunk_position) + Vector3(8, 8, 8)
     if not _is_spawn_region_relevant_to_players(chunk_center):
@@ -212,16 +217,17 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
 func _on_timeout(rare: bool = false) -> void :
     var timer: Timer = %RareSpawnTimer if rare else %SpawnTimer
     var spawned: bool = await attempt_spawn(get_player_based_spawn_position(), rare)
+    var player_count: int = _get_same_instance_player_count()
 
     if not spawned:
         timer.start(fail_time)
     else:
         if not rare:
             if Ref.world.is_position_loaded(last_spawn_position) and Ref.world.is_within_structure(last_spawn_position):
-                timer.start(randf_range(min_time, max_time) / Ref.world.get_nearest_structure(last_spawn_position).sp_spawn_rate)
+                timer.start(randf_range(min_time, max_time) / (Ref.world.get_nearest_structure(last_spawn_position).sp_spawn_rate * float(player_count)))
             else:
                 var biome: Biome = Ref.world.generator.get_biome_at_real(last_spawn_position)
-                timer.start(randf_range(min_time, max_time) / (biome.sp_day_spawn_rate if Ref.sun.is_day() else biome.sp_night_spawn_rate))
+                timer.start(randf_range(min_time, max_time) / ((biome.sp_day_spawn_rate if Ref.sun.is_day() else biome.sp_night_spawn_rate) * float(player_count)))
         else:
             risk_factor = 0
             timer.stop()

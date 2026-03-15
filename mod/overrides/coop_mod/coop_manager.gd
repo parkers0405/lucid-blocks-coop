@@ -5,7 +5,7 @@ const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_CLIENTS: int = 4
 const SEND_INTERVAL: float = 0.025
-const WORLD_STATE_INTERVAL: float = 0.03
+const WORLD_STATE_INTERVAL: float = 0.05
 const PERSIST_INTERVAL: float = 0.25
 const AUTOSAVE_INTERVAL: float = 6.0
 const HOST_TIMEOUT_SECONDS: float = 6.0
@@ -13,10 +13,11 @@ const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
 const NATIVE_WORLD_MAX_INSTANCE_RADIUS: int = 96
-const ENTITY_SYNC_RADIUS: float = 144.0
-const DROP_SYNC_RADIUS: float = 96.0
+const ENTITY_SYNC_RADIUS: float = 112.0
+const DROP_SYNC_RADIUS: float = 72.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
+const PLAYER_SCENE_PATH: String = "res://main/entity/player/player.tscn"
 
 
 var config: Dictionary = {
@@ -27,6 +28,7 @@ var config: Dictionary = {
 
 var peer_states: Dictionary = {}
 var markers: Dictionary = {}
+var remote_player_proxies: Dictionary = {}
 var send_timer: float = 0.0
 var world_state_timer: float = 0.0
 var persist_timer: float = 0.0
@@ -121,6 +123,9 @@ func _input(event: InputEvent) -> void:
 
 
 func _physics_process(delta: float) -> void:
+    if hooked_player_death_target != Ref.player:
+        _install_player_death_hook()
+
     _refresh_world_authority_mode()
     _refresh_session_load_radius()
     _flush_pending_remote_world_changes()
@@ -1021,6 +1026,58 @@ func get_nearest_session_player_distance(world_position: Vector3, fallback_dista
     return nearest_distance
 
 
+func get_nearest_session_player_position(world_position: Vector3, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
+    var positions: Array = _get_same_instance_session_positions()
+    if positions.is_empty():
+        return fallback_position
+
+    var nearest_position: Vector3 = positions[0]
+    var nearest_distance: float = world_position.distance_squared_to(nearest_position)
+    for position in positions:
+        var distance_squared: float = world_position.distance_squared_to(position)
+        if distance_squared < nearest_distance:
+            nearest_distance = distance_squared
+            nearest_position = position
+    return nearest_position
+
+
+func _is_peer_state_same_instance(state: Dictionary, active_instance_key: String) -> bool:
+    return bool(state.get("active", false)) and str(state.get("dimension_instance_key", "")) == active_instance_key
+
+
+func get_nearest_session_player_head_position(world_position: Vector3, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
+    var nearest_head_position: Vector3 = fallback_position
+    var nearest_distance: float = INF
+
+    if _can_sample_player():
+        var local_head: Vector3 = Ref.player.head.global_position if is_instance_valid(Ref.player.head) else Ref.player.global_position + Vector3(0, 1.45, 0)
+        nearest_head_position = local_head
+        nearest_distance = world_position.distance_squared_to(Ref.player.global_position)
+
+    if not multiplayer.is_server() or not _has_live_peer():
+        return nearest_head_position
+
+    var active_instance_key: String = get_active_dimension_instance_key()
+    for peer_id in peer_states.keys():
+        var int_peer_id: int = int(peer_id)
+        if int_peer_id == 1:
+            continue
+
+        var state: Dictionary = peer_states[peer_id]
+        if not _is_peer_state_same_instance(state, active_instance_key):
+            continue
+
+        var peer_position: Vector3 = state.get("position", Vector3.ZERO)
+        var distance_squared: float = world_position.distance_squared_to(peer_position)
+        if distance_squared >= nearest_distance:
+            continue
+
+        nearest_distance = distance_squared
+        nearest_head_position = peer_position + Vector3(0, 1.45 if not bool(state.get("crouching", false)) else 1.1, 0)
+
+    return nearest_head_position
+
+
 func is_position_near_same_instance_player(world_position: Vector3, radius: float) -> bool:
     return _is_near_any_session_position(world_position, _get_same_instance_session_positions(), radius)
 
@@ -1440,6 +1497,8 @@ func _refresh_markers(states: Dictionary, local_peer_id: int) -> void:
             markers.erase(peer_id)
             _remove_remote_break_outline(peer_id)
 
+    _refresh_remote_player_proxies(states, local_peer_id)
+
 
 func _ensure_marker(peer_id: int) -> Node:
     if markers.has(peer_id):
@@ -1453,10 +1512,110 @@ func _ensure_marker(peer_id: int) -> Node:
     return marker
 
 
+func _refresh_remote_player_proxies(states: Dictionary, local_peer_id: int) -> void:
+    if not multiplayer.is_server() or not _can_sample_player():
+        _clear_remote_player_proxies()
+        return
+
+    var visible_ids: Dictionary = {}
+    var active_instance_key: String = get_active_dimension_instance_key()
+    for peer_id in states.keys():
+        var int_peer_id: int = int(peer_id)
+        if int_peer_id == local_peer_id:
+            continue
+
+        var state: Dictionary = states[peer_id]
+        if not _is_peer_state_same_instance(state, active_instance_key):
+            continue
+
+        visible_ids[int_peer_id] = true
+        var proxy = _ensure_remote_player_proxy(int_peer_id)
+        if proxy != null:
+            _update_remote_player_proxy(proxy, state)
+
+    for peer_id in remote_player_proxies.keys().duplicate():
+        if visible_ids.has(peer_id):
+            continue
+        _remove_remote_player_proxy(int(peer_id))
+
+
+func _ensure_remote_player_proxy(peer_id: int):
+    if remote_player_proxies.has(peer_id) and is_instance_valid(remote_player_proxies[peer_id]):
+        return remote_player_proxies[peer_id]
+
+    var scene = load(PLAYER_SCENE_PATH)
+    if not (scene is PackedScene):
+        return null
+
+    var proxy = scene.instantiate()
+    if proxy == null:
+        return null
+
+    proxy.name = "RemotePlayerProxy%s" % peer_id
+    proxy.set_meta("coop_remote_player_proxy", true)
+    get_tree().get_root().add_child(proxy)
+
+    proxy.visible = false
+    proxy.movement_enabled = false
+    proxy.invincible = true
+    proxy.invincible_temporary = true
+    proxy.dead = false
+    proxy.disabled = false
+    proxy.set_process(false)
+    proxy.set_physics_process(false)
+    proxy.set_process_input(false)
+    proxy.set_process_unhandled_input(false)
+
+    var camera = proxy.get_node_or_null("%Camera3D")
+    if camera != null:
+        camera.current = false
+
+    var player_hand = proxy.get_node_or_null("%PlayerHand")
+    if player_hand != null:
+        player_hand.visible = false
+
+    remote_player_proxies[peer_id] = proxy
+    return proxy
+
+
+func _update_remote_player_proxy(proxy, state: Dictionary) -> void:
+    if proxy == null:
+        return
+
+    proxy.global_position = state.get("position", Vector3.ZERO)
+    proxy.velocity = Vector3.ZERO
+    proxy.dead = false
+    proxy.disabled = false
+    proxy.visible = false
+    proxy.is_crouching = bool(state.get("crouching", false))
+
+    var rotation_pivot = proxy.get_node_or_null("%RotationPivot") as Node3D
+    if rotation_pivot != null:
+        rotation_pivot.rotation.y = float(state.get("yaw", 0.0))
+
+    var camera = proxy.get_node_or_null("%Camera3D") as Camera3D
+    if camera != null:
+        camera.rotation.x = float(state.get("pitch", 0.0))
+
+
+func _remove_remote_player_proxy(peer_id: int) -> void:
+    if not remote_player_proxies.has(peer_id):
+        return
+    if is_instance_valid(remote_player_proxies[peer_id]):
+        remote_player_proxies[peer_id].call_deferred("queue_free")
+    remote_player_proxies.erase(peer_id)
+
+
+func _clear_remote_player_proxies() -> void:
+    for peer_id in remote_player_proxies.keys().duplicate():
+        _remove_remote_player_proxy(int(peer_id))
+
+
 func _clear_markers() -> void:
     for peer_id in markers.keys():
         markers[peer_id].call_deferred("queue_free")
     markers.clear()
+    _clear_remote_player_proxies()
     _clear_remote_break_outlines()
 
 
@@ -1877,6 +2036,7 @@ func _on_peer_disconnected(id: int) -> void:
     if markers.has(id):
         markers[id].call_deferred("queue_free")
         markers.erase(id)
+    _remove_remote_player_proxy(id)
     _remove_remote_break_outline(id)
     status_message = "Peer %s disconnected" % id
     print("[lucid-blocks-coop] %s" % status_message)
@@ -2554,13 +2714,26 @@ func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
 
 func _disable_client_entity_runtime(root: Node) -> void:
     for child in root.get_children():
-        if child is Timer:
+        if child.name == "Behaviors":
+            child.process_mode = Node.PROCESS_MODE_DISABLED
+            child.set_process(false)
+            child.set_physics_process(false)
+        elif child is Timer:
             (child as Timer).stop()
             child.set_process(false)
             child.set_physics_process(false)
         elif child is Area3D:
             (child as Area3D).monitoring = false
             (child as Area3D).monitorable = false
+            (child as Area3D).collision_layer = 0
+            (child as Area3D).collision_mask = 0
+        elif child is RayCast3D:
+            (child as RayCast3D).enabled = false
+        elif child is ShapeCast3D:
+            (child as ShapeCast3D).enabled = false
+            (child as ShapeCast3D).collision_mask = 0
+        elif child is NavigationAgent3D:
+            (child as NavigationAgent3D).enabled = false
         elif child is VisibleOnScreenNotifier3D:
             child.set_process(false)
             child.set_physics_process(false)
@@ -2876,6 +3049,11 @@ func request_entity_attack(target_uuid: String, damage_position: Vector3, attack
     var target = _find_host_entity_by_uuid(target_uuid)
     if target == null or target.dead or target.direct_damage_cooldown:
         return
+
+    if target.disabled and is_position_near_same_instance_player(target.global_position, get_same_instance_activity_radius()):
+        target.disabled = false
+        target.set_physics_process(true)
+        target.set_process(true)
 
     var actual_damage: int = maxi(1, damage)
     var held_item = ItemMap.map(held_item_id) if held_item_id >= 0 else null

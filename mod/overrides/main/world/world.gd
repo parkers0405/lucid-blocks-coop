@@ -37,6 +37,7 @@ var session_region_last_chunk_centers: Array = []
 var environment_speed_multiplier: float = 1.0
 const SESSION_RADIUS_QUANTUM: int = 16
 const SESSION_ANCHOR_SETTLE_FRAMES: int = 12
+const SESSION_ANCHOR_IDLE_ROTATE_FRAMES: int = 18
 
 
 func _ready() -> void :
@@ -179,6 +180,8 @@ func _get_next_session_anchor_center(active_centers: Array, dirty_indices: Array
         session_region_anchor_hold_frames = SESSION_ANCHOR_SETTLE_FRAMES
         return active_centers[session_region_anchor_index]
 
+    session_region_anchor_index = (session_region_anchor_index + 1) % active_centers.size()
+    session_region_anchor_hold_frames = SESSION_ANCHOR_IDLE_ROTATE_FRAMES
     return active_centers[session_region_anchor_index]
 
 
