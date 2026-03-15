@@ -36,8 +36,8 @@ var session_region_last_chunk_centers: Array = []
 
 var environment_speed_multiplier: float = 1.0
 const SESSION_RADIUS_QUANTUM: int = 16
-const SESSION_ANCHOR_SETTLE_FRAMES: int = 12
-const SESSION_ANCHOR_IDLE_ROTATE_FRAMES: int = 18
+const SESSION_ANCHOR_SETTLE_FRAMES: int = 2
+const SESSION_ANCHOR_IDLE_ROTATE_FRAMES: int = 3
 
 
 func _ready() -> void :

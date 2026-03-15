@@ -255,8 +255,17 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
 
 func _on_timeout(rare: bool = false) -> void :
     var timer: Timer = %RareSpawnTimer if rare else %SpawnTimer
-    var spawned: bool = await attempt_spawn(get_player_based_spawn_position(), rare)
     var player_count: int = _get_same_instance_player_count()
+    var spawned: bool = false
+
+    if _can_use_multi_region_logic() and player_count > 1 and not rare:
+        var positions: Array = Ref.coop_manager.get_same_instance_session_positions()
+        for pos in positions:
+            var spawn_pos: Vector3 = _get_spawn_position_near(pos)
+            if await attempt_spawn(spawn_pos, false):
+                spawned = true
+    else:
+        spawned = await attempt_spawn(get_player_based_spawn_position(), rare)
 
     if not spawned:
         timer.start(maxf(0.15, fail_time / float(player_count)))
@@ -270,6 +279,13 @@ func _on_timeout(rare: bool = false) -> void :
         else:
             risk_factor = 0
             timer.stop()
+
+
+func _get_spawn_position_near(anchor: Vector3) -> Vector3:
+    var spawn_position: Vector3 = Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1))
+    spawn_position = spawn_position.normalized() * randf_range(0.1, 1) * spawn_radius
+    spawn_position += anchor
+    return spawn_position
 
 
 func get_player_based_spawn_position() -> Vector3:

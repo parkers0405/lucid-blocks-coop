@@ -51,6 +51,8 @@ var synced_entities: Dictionary = {}
 var synced_dropped_items: Dictionary = {}
 var client_world_sync_ready: bool = false
 var client_picked_up_drop_uuids: Dictionary = {}
+var client_synced_entity_list: Array = []
+
 var hooked_player_death_target: Node = null
 var handling_client_respawn: bool = false
 var handling_host_respawn: bool = false
@@ -338,6 +340,7 @@ func disconnect_session(announce: bool = true) -> void:
     last_sent_client_state_hash = 0
     client_menu_kick_pending = false
     client_picked_up_drop_uuids.clear()
+    client_synced_entity_list.clear()
     session_role = "none"
     pending_remote_block_changes.clear()
     pending_remote_water_changes.clear()
@@ -598,6 +601,7 @@ func sync_local_block_break(break_behavior, block_position: Vector3i, broken_blo
 
     _apply_client_break_feedback(break_behavior, block_position)
     _apply_network_break(block_position)
+
     request_break_block.rpc_id(
         1,
         block_position,
@@ -609,6 +613,9 @@ func sync_local_block_break(break_behavior, block_position: Vector3i, broken_blo
         bool(break_behavior.plant)
     )
     return true
+
+
+
 
 
 func broadcast_host_block_break(block_position: Vector3i) -> void:
@@ -722,25 +729,20 @@ func sync_local_pickup_item(dropped_item) -> bool:
         return false
     if _is_local_world_authority():
         return false
-    if not (dropped_item is DroppedItem) or dropped_item.item == null:
-        return false
 
     var item_uuid: String = _get_sync_uuid(dropped_item)
     if item_uuid == "":
         item_uuid = _assign_sync_uuid(dropped_item)
 
-    if not _can_sample_player():
-        return false
-
-    var pick_up = Ref.player.get_node_or_null("%PickUpItems") as PickUpItems
-    if pick_up == null:
-        return false
-
     client_picked_up_drop_uuids[item_uuid] = Time.get_ticks_msec()
 
-    pick_up.accept_item(dropped_item.item)
-    dropped_item.collect()
-    dropped_item.queue_free()
+    if dropped_item is DroppedItem and dropped_item.item != null and _can_sample_player():
+        var pick_up = Ref.player.get_node_or_null("%PickUpItems") as PickUpItems
+        if pick_up != null:
+            pick_up.accept_item(dropped_item.item)
+
+    if is_instance_valid(dropped_item):
+        dropped_item.queue_free()
 
     request_pickup_drop.rpc_id(1, item_uuid)
     return true
@@ -2931,6 +2933,8 @@ func _configure_client_synced_entity(entity, uuid: String) -> void:
     entity.set_process(true)
     _strip_client_entity_ai(entity)
     _restore_client_entity_animations(entity)
+    if not client_synced_entity_list.has(entity):
+        client_synced_entity_list.append(entity)
 
 
 func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
@@ -3037,29 +3041,44 @@ func _update_client_entity_visuals(entity, entity_velocity: Vector3) -> void:
 
 
 func _interpolate_client_synced_entities(delta: float) -> void:
-    var blend: float = clampf(delta * 18.0, 0.0, 1.0)
-    for child in get_tree().get_root().get_children():
-        if not (child is Entity) or child is Player:
+    var alive: Array = []
+    for entity in client_synced_entity_list:
+        if not is_instance_valid(entity) or not entity.is_inside_tree():
             continue
-        if not child.has_meta("coop_synced_entity"):
-            continue
-        if not is_instance_valid(child) or not child.is_inside_tree():
-            continue
+        alive.append(entity)
+        _interpolate_one_synced_entity(entity, delta)
+    client_synced_entity_list = alive
 
-        var target_pos: Vector3 = child.get_meta("coop_target_position", child.global_position)
-        var target_yaw: float = child.get_meta("coop_target_yaw", 0.0)
-        var target_vel: Vector3 = child.get_meta("coop_target_velocity", Vector3.ZERO)
 
-        var extrapolated: Vector3 = target_pos + target_vel * delta * 0.5
-        child.global_position = child.global_position.lerp(extrapolated, blend)
+func _interpolate_one_synced_entity(entity, delta: float) -> void:
+    var target_pos: Vector3 = entity.get_meta("coop_target_position", entity.global_position)
+    var target_yaw: float = entity.get_meta("coop_target_yaw", 0.0)
+    var target_vel: Vector3 = entity.get_meta("coop_target_velocity", Vector3.ZERO)
 
-        var rotation_pivot: Node3D = child.get_node_or_null("%RotationPivot") as Node3D
-        if rotation_pivot != null:
-            rotation_pivot.rotation.y = lerp_angle(rotation_pivot.rotation.y, target_yaw, blend)
+    var current_pos: Vector3 = entity.global_position
+    var to_target: Vector3 = target_pos - current_pos
+    var distance_to_target: float = to_target.length()
+    var speed: float = target_vel.length()
+
+    if distance_to_target < 0.01:
+        entity.global_position = current_pos + target_vel * delta
+    elif distance_to_target > 8.0:
+        entity.global_position = target_pos
+    else:
+        var move_speed: float = maxf(speed, distance_to_target / WORLD_STATE_INTERVAL) * delta
+        if move_speed >= distance_to_target:
+            entity.global_position = target_pos + target_vel * delta * 0.3
         else:
-            child.rotation.y = lerp_angle(child.rotation.y, target_yaw, blend)
+            entity.global_position = current_pos + to_target.normalized() * move_speed + target_vel * delta * 0.2
 
-        _update_client_entity_visuals(child, target_vel)
+    var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
+    var yaw_blend: float = clampf(delta * 12.0, 0.0, 1.0)
+    if rotation_pivot != null:
+        rotation_pivot.rotation.y = lerp_angle(rotation_pivot.rotation.y, target_yaw, yaw_blend)
+    else:
+        entity.rotation.y = lerp_angle(entity.rotation.y, target_yaw, yaw_blend)
+
+    _update_client_entity_visuals(entity, target_vel)
 
 
 func _find_first_animation_tree(root: Node) -> AnimationTree:
