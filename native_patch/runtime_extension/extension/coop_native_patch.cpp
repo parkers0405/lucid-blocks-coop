@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -51,10 +54,13 @@ struct NativeChunkCenter {
 };
 
 enum MultiRegionHookId : uint32_t {
-    UPDATE_RADIUS_CHECK_A = 0,
-    UPDATE_RADIUS_CHECK_B = 1,
-    SIMULATE_RADIUS_CHECK_A = 2,
-    SIMULATE_RADIUS_CHECK_B = 3,
+    UPDATE_DECORATION_EVICT = 0,
+    UPDATE_STRUCTURE_EVICT = 1,
+    UPDATE_DECORATION_INIT = 2,
+    UPDATE_RADIUS_CHECK_A = 3,
+    UPDATE_RADIUS_CHECK_B = 4,
+    SIMULATE_RADIUS_CHECK_A = 5,
+    SIMULATE_RADIUS_CHECK_B = 6,
 };
 
 static constexpr PatchSite INSTANCE_RADIUS_CAP_PATCH = {
@@ -84,6 +90,9 @@ static constexpr PatchSite INSTANTIATE_LOOP_END_PATCHES[] = {
 static constexpr uint64_t INSTANTIATE_CHUNKS_FUNCTION_RVA = 0x00058890;
 
 static constexpr MultiRegionHookSite MULTI_REGION_HOOK_SITES[] = {
+    {"update_loaded_region decoration eviction", 0x0005e8ae, 12, 0x0005e9aa, 0x0005e8fb},
+    {"update_loaded_region structure eviction", 0x0005ea7f, 12, 0x0005eaf2, 0x0005eacc},
+    {"update_loaded_region decoration init", 0x0005ef90, 12, 0x0005efd8, 0x0005f004},
     {"update_loaded_region radius check A", 0x0005f15d, 12, 0x0005f29c, 0x0005f1a7},
     {"update_loaded_region radius check B", 0x0005f403, 15, 0x0005f454, 0x0005f5b2},
     {"simulate_dynamic radius check A", 0x0005d5d1, 14, 0x0005d61e, 0x0005d622},
@@ -95,13 +104,22 @@ static constexpr MultiRegionHookSite MULTI_REGION_HOOK_SITES[] = {
 extern "C" {
 void coop_update_radius_hook_1();
 void coop_update_radius_hook_2();
+void coop_update_radius_hook_3();
+void coop_update_radius_hook_4();
+void coop_update_radius_hook_5();
 void coop_simulate_radius_hook_1();
 void coop_simulate_radius_hook_2();
 
+uintptr_t g_coop_update_hook_0_inside = 0;
+uintptr_t g_coop_update_hook_0_outside = 0;
 uintptr_t g_coop_update_hook_1_inside = 0;
 uintptr_t g_coop_update_hook_1_outside = 0;
 uintptr_t g_coop_update_hook_2_inside = 0;
 uintptr_t g_coop_update_hook_2_outside = 0;
+uintptr_t g_coop_update_hook_3_inside = 0;
+uintptr_t g_coop_update_hook_3_outside = 0;
+uintptr_t g_coop_update_hook_4_inside = 0;
+uintptr_t g_coop_update_hook_4_outside = 0;
 uintptr_t g_coop_simulate_hook_1_inside = 0;
 uintptr_t g_coop_simulate_hook_1_outside = 0;
 uintptr_t g_coop_simulate_hook_2_inside = 0;
@@ -111,6 +129,8 @@ uintptr_t g_coop_simulate_hook_2_outside = 0;
 static std::array<NativeChunkCenter, MAX_ACTIVE_REGION_CENTERS> g_active_region_centers = {};
 static uint32_t g_active_region_center_count = 0;
 static bool g_multi_region_hooks_installed = false;
+static std::mutex g_world_center_lock;
+static std::unordered_map<const void *, std::vector<NativeChunkCenter>> g_world_active_region_centers;
 
 template <size_t N>
 static bool has_instruction_prefix(HMODULE module, uint64_t instruction_rva, const std::array<uint8_t, N> &prefix) {
@@ -216,12 +236,18 @@ static bool supports_instantiate_chunks_patch(HMODULE module) {
 }
 
 static bool supports_multi_region_hook_patch(HMODULE module) {
+    static constexpr std::array<uint8_t, 6> update_deco_evict_prefix = {0x8b, 0x87, 0x00, 0x01, 0x00, 0x00};
+    static constexpr std::array<uint8_t, 6> update_struct_evict_prefix = {0x8b, 0x87, 0x00, 0x01, 0x00, 0x00};
+    static constexpr std::array<uint8_t, 6> update_deco_init_prefix = {0x8b, 0x8f, 0x00, 0x01, 0x00, 0x00};
     static constexpr std::array<uint8_t, 6> update_a_prefix = {0x8b, 0x87, 0x00, 0x01, 0x00, 0x00};
     static constexpr std::array<uint8_t, 6> update_b_prefix = {0x8b, 0x87, 0x00, 0x01, 0x00, 0x00};
     static constexpr std::array<uint8_t, 7> simulate_a_prefix = {0x41, 0x8b, 0x86, 0x00, 0x01, 0x00, 0x00};
     static constexpr std::array<uint8_t, 7> simulate_b_prefix = {0x41, 0x8b, 0x86, 0x00, 0x01, 0x00, 0x00};
 
-    return has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_A].patch_rva, update_a_prefix) &&
+    return has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[UPDATE_DECORATION_EVICT].patch_rva, update_deco_evict_prefix) &&
+           has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[UPDATE_STRUCTURE_EVICT].patch_rva, update_struct_evict_prefix) &&
+           has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[UPDATE_DECORATION_INIT].patch_rva, update_deco_init_prefix) &&
+           has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_A].patch_rva, update_a_prefix) &&
            has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_B].patch_rva, update_b_prefix) &&
            has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[SIMULATE_RADIUS_CHECK_A].patch_rva, simulate_a_prefix) &&
            has_instruction_prefix(module, MULTI_REGION_HOOK_SITES[SIMULATE_RADIUS_CHECK_B].patch_rva, simulate_b_prefix);
@@ -344,6 +370,12 @@ static NativeChunkCenter get_world_center_chunk(const void *world) {
 
 static int64_t get_radius_for_hook_site(const void *world, uint32_t site_id) {
     switch (site_id) {
+        case UPDATE_DECORATION_EVICT:
+            return read_i64(world, 0x10) * 2;
+        case UPDATE_STRUCTURE_EVICT:
+            return read_i64(world, 0x10) + 0x300;
+        case UPDATE_DECORATION_INIT:
+            return read_i64(world, 0x10) + CHUNK_AXIS_SIZE;
         case UPDATE_RADIUS_CHECK_A:
         case UPDATE_RADIUS_CHECK_B:
             return read_i64(world, 0x10);
@@ -373,6 +405,9 @@ static NativeChunkCenter get_coordinate_for_hook_site(const void *entry_rsp, con
     const uint8_t *base_pointer = reinterpret_cast<const uint8_t *>(rbp);
 
     switch (site_id) {
+        case UPDATE_DECORATION_EVICT:
+        case UPDATE_STRUCTURE_EVICT:
+        case UPDATE_DECORATION_INIT:
         case UPDATE_RADIUS_CHECK_A:
         case UPDATE_RADIUS_CHECK_B:
             return unpack_coordinate(rsp + 0x58, rsp + 0x60);
@@ -406,6 +441,19 @@ extern "C" bool coop_evaluate_multi_region_radius(const void *world, const void 
     const NativeChunkCenter coordinate = get_coordinate_for_hook_site(entry_rsp, rbp, site_id);
     const int64_t radius = get_radius_for_hook_site(world, site_id);
 
+    {
+        std::lock_guard<std::mutex> lock(g_world_center_lock);
+        auto it = g_world_active_region_centers.find(world);
+        if (it != g_world_active_region_centers.end()) {
+            for (const NativeChunkCenter &center : it->second) {
+                if (is_coordinate_in_radius(coordinate, center, radius)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     const uint32_t active_center_count = g_active_region_center_count;
     if (active_center_count == 0) {
         return is_coordinate_in_radius(coordinate, get_world_center_chunk(world), radius);
@@ -435,6 +483,47 @@ static void store_active_region_centers(const Array &centers) {
     g_active_region_center_count = count;
 }
 
+static void store_world_active_region_centers(const void *world, const Array &centers) {
+    if (world == nullptr) {
+        return;
+    }
+
+    std::vector<NativeChunkCenter> snapped_centers;
+    snapped_centers.reserve(MAX_ACTIVE_REGION_CENTERS);
+    for (int64_t i = 0; i < centers.size() && snapped_centers.size() < MAX_ACTIVE_REGION_CENTERS; i++) {
+        Variant value = centers[i];
+        if (value.get_type() != Variant::VECTOR3) {
+            continue;
+        }
+        const NativeChunkCenter snapped = snap_center_to_chunk(static_cast<Vector3>(value));
+        bool duplicate = false;
+        for (const NativeChunkCenter &existing : snapped_centers) {
+            if (existing.x == snapped.x && existing.y == snapped.y && existing.z == snapped.z) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            snapped_centers.push_back(snapped);
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_world_center_lock);
+    if (snapped_centers.empty()) {
+        g_world_active_region_centers.erase(world);
+    } else {
+        g_world_active_region_centers[world] = std::move(snapped_centers);
+    }
+}
+
+static void clear_world_active_region_centers_internal(const void *world) {
+    if (world == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_world_center_lock);
+    g_world_active_region_centers.erase(world);
+}
+
 static void clear_active_region_centers_internal() {
     g_active_region_center_count = 0;
 }
@@ -448,10 +537,16 @@ static bool install_multi_region_hooks_internal(HMODULE module) {
         return false;
     }
 
-    g_coop_update_hook_1_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_A].inside_target_rva));
-    g_coop_update_hook_1_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_A].outside_target_rva));
-    g_coop_update_hook_2_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_B].inside_target_rva));
-    g_coop_update_hook_2_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_B].outside_target_rva));
+    g_coop_update_hook_0_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_DECORATION_EVICT].inside_target_rva));
+    g_coop_update_hook_0_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_DECORATION_EVICT].outside_target_rva));
+    g_coop_update_hook_1_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_STRUCTURE_EVICT].inside_target_rva));
+    g_coop_update_hook_1_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_STRUCTURE_EVICT].outside_target_rva));
+    g_coop_update_hook_2_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_DECORATION_INIT].inside_target_rva));
+    g_coop_update_hook_2_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_DECORATION_INIT].outside_target_rva));
+    g_coop_update_hook_3_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_A].inside_target_rva));
+    g_coop_update_hook_3_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_A].outside_target_rva));
+    g_coop_update_hook_4_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_B].inside_target_rva));
+    g_coop_update_hook_4_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[UPDATE_RADIUS_CHECK_B].outside_target_rva));
     g_coop_simulate_hook_1_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[SIMULATE_RADIUS_CHECK_A].inside_target_rva));
     g_coop_simulate_hook_1_outside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[SIMULATE_RADIUS_CHECK_A].outside_target_rva));
     g_coop_simulate_hook_2_inside = reinterpret_cast<uintptr_t>(resolve_rva(module, MULTI_REGION_HOOK_SITES[SIMULATE_RADIUS_CHECK_B].inside_target_rva));
@@ -460,11 +555,14 @@ static bool install_multi_region_hooks_internal(HMODULE module) {
     const void *hook_entrypoints[] = {
         reinterpret_cast<const void *>(&coop_update_radius_hook_1),
         reinterpret_cast<const void *>(&coop_update_radius_hook_2),
+        reinterpret_cast<const void *>(&coop_update_radius_hook_3),
+        reinterpret_cast<const void *>(&coop_update_radius_hook_4),
+        reinterpret_cast<const void *>(&coop_update_radius_hook_5),
         reinterpret_cast<const void *>(&coop_simulate_radius_hook_1),
         reinterpret_cast<const void *>(&coop_simulate_radius_hook_2),
     };
 
-    for (size_t i = 0; i < 4; i++) {
+    for (size_t i = 0; i < std::size(MULTI_REGION_HOOK_SITES); i++) {
         const MultiRegionHookSite &site = MULTI_REGION_HOOK_SITES[i];
         if (!write_absolute_jump(resolve_rva(module, site.patch_rva), hook_entrypoints[i], site.patch_length)) {
             return false;
@@ -486,6 +584,8 @@ void CoopNativePatch::_bind_methods() {
     ClassDB::bind_method(D_METHOD("patch_world_streaming_limits", "max_radius", "render_distance"), &CoopNativePatch::patch_world_streaming_limits);
     ClassDB::bind_method(D_METHOD("restore_default_world_streaming_limits"), &CoopNativePatch::restore_default_world_streaming_limits);
     ClassDB::bind_method(D_METHOD("install_multi_region_radius_hooks"), &CoopNativePatch::install_multi_region_radius_hooks);
+    ClassDB::bind_method(D_METHOD("set_world_active_region_centers", "world", "centers"), &CoopNativePatch::set_world_active_region_centers);
+    ClassDB::bind_method(D_METHOD("clear_world_active_region_centers", "world"), &CoopNativePatch::clear_world_active_region_centers);
     ClassDB::bind_method(D_METHOD("set_active_region_centers", "centers"), &CoopNativePatch::set_active_region_centers);
     ClassDB::bind_method(D_METHOD("clear_active_region_centers"), &CoopNativePatch::clear_active_region_centers);
 }
@@ -678,6 +778,27 @@ bool CoopNativePatch::install_multi_region_radius_hooks() {
 
     UtilityFunctions::print("[lucid-blocks-coop] Installed native multi-region radius hooks.");
     return true;
+#endif
+}
+
+void CoopNativePatch::set_world_active_region_centers(Object *world, Array centers) {
+#ifdef _WIN32
+    HMODULE module = get_gdblocks_module();
+    if (module != nullptr && !g_multi_region_hooks_installed) {
+        install_multi_region_hooks_internal(module);
+    }
+    store_world_active_region_centers(world, centers);
+#else
+    (void)world;
+    (void)centers;
+#endif
+}
+
+void CoopNativePatch::clear_world_active_region_centers(Object *world) {
+#ifdef _WIN32
+    clear_world_active_region_centers_internal(world);
+#else
+    (void)world;
 #endif
 }
 

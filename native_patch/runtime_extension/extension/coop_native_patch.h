@@ -20,6 +20,8 @@ public:
     bool patch_world_streaming_limits(int max_radius, int render_distance);
     bool restore_default_world_streaming_limits();
     bool install_multi_region_radius_hooks();
+    void set_world_active_region_centers(Object *world, Array centers);
+    void clear_world_active_region_centers(Object *world);
     void set_active_region_centers(Array centers);
     void clear_active_region_centers();
 };

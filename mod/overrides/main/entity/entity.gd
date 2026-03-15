@@ -290,7 +290,7 @@ func _ready() -> void :
         var count: int = randi_range(swarm_min, swarm_max)
         for i in range(count):
             var new_position: Vector3 = global_position + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)).normalized()
-            if not Ref.world.is_position_loaded(new_position) or Ref.world.is_block_solid_at(new_position):
+            if not is_session_position_loaded(new_position) or Ref.world.is_block_solid_at(new_position):
                 continue
 
             var new_entity: Entity = self.duplicate()
@@ -419,7 +419,7 @@ func _physics_process(delta: float) -> void :
         return
 
 
-    if Ref.world.is_position_loaded( %CenterPoint.global_position) and Ref.world.is_block_solid_at( %CenterPoint.global_position):
+    if is_session_position_loaded(%CenterPoint.global_position) and Ref.world.is_block_solid_at(%CenterPoint.global_position):
         global_position.y += 1.0
 
     if not is_on_floor():
@@ -515,28 +515,28 @@ func default_entity_movement(delta: float, movement_direction: Vector3, horizont
 
 
 func check_water() -> void :
-    head_under_water = (Ref.world.is_position_loaded(head.global_position) and Ref.world.is_under_water(head.global_position))
-    under_water = (Ref.world.is_position_loaded( %CenterPoint.global_position) and Ref.world.is_under_water( %CenterPoint.global_position))
-    feet_under_water = (Ref.world.is_position_loaded(global_position + gravity_direction_multiplier * Vector3(0, 0.05, 0)) and Ref.world.is_under_water(global_position + gravity_direction_multiplier * Vector3(0, 0.05, 0)))
+    head_under_water = (is_session_position_loaded(head.global_position) and Ref.world.is_under_water(head.global_position))
+    under_water = (is_session_position_loaded(%CenterPoint.global_position) and Ref.world.is_under_water(%CenterPoint.global_position))
+    feet_under_water = (is_session_position_loaded(global_position + gravity_direction_multiplier * Vector3(0, 0.05, 0)) and Ref.world.is_under_water(global_position + gravity_direction_multiplier * Vector3(0, 0.05, 0)))
 
 
 func check_fire() -> void :
     var on_fire_check: bool = false
 
     var fire_vec: Vector3 = %CenterPoint.global_position + fire_radius * Vector3(1, 0, 0)
-    on_fire_check = (on_fire_check or (Ref.world.is_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
+    on_fire_check = (on_fire_check or (is_session_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
 
     fire_vec = %CenterPoint.global_position + fire_radius * Vector3(-1, 0, 0)
-    on_fire_check = (on_fire_check or (Ref.world.is_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
+    on_fire_check = (on_fire_check or (is_session_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
 
     fire_vec = %CenterPoint.global_position + fire_radius * Vector3(0, 0, 1)
-    on_fire_check = (on_fire_check or (Ref.world.is_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
+    on_fire_check = (on_fire_check or (is_session_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
 
     fire_vec = %CenterPoint.global_position + fire_radius * Vector3(0, 0, -1)
-    on_fire_check = (on_fire_check or (Ref.world.is_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
+    on_fire_check = (on_fire_check or (is_session_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
 
     fire_vec = %CenterPoint.global_position + fire_radius * Vector3(0, -1, 0)
-    on_fire_check = (on_fire_check or (Ref.world.is_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
+    on_fire_check = (on_fire_check or (is_session_position_loaded(fire_vec) and Ref.world.get_fire_at(fire_vec) > 0))
 
     touching_fire = on_fire_check
 
@@ -844,10 +844,29 @@ func allow_swarm() -> void :
 
 
 func is_future_position_loaded(delta: float) -> bool:
-    return Ref.world.is_position_loaded(global_position + velocity * delta)
+    var future_position: Vector3 = global_position + velocity * delta
+    if Ref.world.is_position_loaded(future_position):
+        return true
+    if _supports_multi_region_session_world() and multiplayer.is_server() and Ref.coop_manager != null and Ref.coop_manager.has_connected_remote_peers():
+        return Ref.coop_manager.is_position_near_same_instance_player(future_position, process_distance)
+    return false
+
+
+func is_session_position_loaded(world_position: Vector3) -> bool:
+    if Ref.world.is_position_loaded(world_position):
+        return true
+    if _supports_multi_region_session_world() and multiplayer.is_server() and Ref.coop_manager != null and Ref.coop_manager.has_connected_remote_peers():
+        return Ref.coop_manager.is_position_near_same_instance_player(world_position, process_distance)
+    return false
 
 
 func distance_process_check() -> void :
+    if _should_disable_server_visibility_culling():
+        disabled = false
+        set_physics_process(true)
+        set_process(true)
+        return
+
     var distance: float = Ref.player.global_position.distance_to(global_position)
     if Ref.coop_manager != null and _supports_multi_region_session_world():
         distance = Ref.coop_manager.get_nearest_session_player_distance(global_position, distance)

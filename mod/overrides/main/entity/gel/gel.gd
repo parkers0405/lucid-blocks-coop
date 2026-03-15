@@ -118,7 +118,7 @@ func _physics_process(delta: float) -> void :
         first_frame = false
         return
 
-    if not update_positions() or not Ref.world.is_position_loaded(global_position):
+    if not update_positions() or not is_session_position_loaded(global_position):
         softbody.process_mode = Node.PROCESS_MODE_DISABLED
         return
 
@@ -137,7 +137,7 @@ func _physics_process(delta: float) -> void :
     knockback_process(delta)
     rope_process(delta)
 
-    if Ref.world.is_position_loaded(%CenterPoint.global_position) and Ref.world.is_block_solid_at(%CenterPoint.global_position):
+    if is_session_position_loaded(%CenterPoint.global_position) and Ref.world.is_block_solid_at(%CenterPoint.global_position):
         global_position.y += 1.0
 
     if knockback_velocity.length() > 0.1:
@@ -204,7 +204,7 @@ func update_positions() -> bool:
     if not softbody.process_mode == PROCESS_MODE_DISABLED:
         approx_position = get_softbody_approximate_position()
         last_softbody_position = approx_position
-    var approx_position_loaded: bool = Ref.world.is_position_loaded(approx_position)
+    var approx_position_loaded: bool = is_session_position_loaded(approx_position)
     if approx_position_loaded:
         global_position = approx_position
     return approx_position_loaded

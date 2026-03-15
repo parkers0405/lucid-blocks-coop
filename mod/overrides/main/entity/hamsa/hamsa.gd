@@ -75,7 +75,7 @@ func _on_idle_timeout() -> void :
     %IdleTimer.start(randf_range(idle_time_min, idle_time_max))
 
 func _physics_process(delta: float) -> void :
-    if dead or disabled or not Ref.world.is_position_loaded(global_position):
+    if dead or disabled or not is_session_position_loaded(global_position):
         return
     distance_process_check()
     if state == CHASE:
@@ -87,7 +87,7 @@ func _physics_process(delta: float) -> void :
             return
         var center: Vector3 = _get_target_head_position()
 
-        if Ref.world.is_position_loaded(global_position + global_position.direction_to(center) * delta * speed):
+        if is_session_position_loaded(global_position + global_position.direction_to(center) * delta * speed):
             global_position += global_position.direction_to(center) * delta * speed
 
 
@@ -110,7 +110,7 @@ func teleport(final: bool) -> bool:
     spawn_position = spawn_position.normalized() * randf_range(0.1, 1) * teleport_radius
     spawn_position += _get_target_position()
 
-    if Ref.world.is_position_loaded(spawn_position) and Ref.world.is_block_solid_at(spawn_position):
+    if is_session_position_loaded(spawn_position) and Ref.world.is_block_solid_at(spawn_position):
         return false
 
     %SpawnRay.global_position = spawn_position

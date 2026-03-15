@@ -154,7 +154,7 @@ func flush_deleted_entities() -> void :
 
 
 func _physics_process(delta: float) -> void :
-    if disabled or not Ref.world.is_position_loaded(global_position):
+    if disabled or not is_session_position_loaded(global_position):
         return
     super._physics_process(delta)
     if is_future_position_loaded(delta):
@@ -245,7 +245,7 @@ func get_interact_data() -> Dictionary:
         var collider: Object = interact_ray.get_collider()
         if not (collider.owner is Ball or collider.owner is Heart or collider.owner is Entity):
             var target_position: Vector3 = (interact_ray.get_collision_point() - interact_ray.get_collision_normal() * 0.5).floor()
-            if Ref.world.is_position_loaded(target_position) and Ref.world.is_block_solid_at(target_position):
+            if is_session_position_loaded(target_position) and Ref.world.is_block_solid_at(target_position):
                 data.target_position = target_position
                 data.target_position_adjacent = data.target_position + interact_ray.get_collision_normal()
 

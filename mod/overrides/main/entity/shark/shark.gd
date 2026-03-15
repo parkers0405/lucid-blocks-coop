@@ -40,7 +40,7 @@ func _get_target_entity():
 
 
 func _physics_process(delta: float) -> void :
-    if disabled or not Ref.world.is_position_loaded(global_position):
+    if disabled or not is_session_position_loaded(global_position):
         return
     super._physics_process(delta)
     if is_future_position_loaded(delta):

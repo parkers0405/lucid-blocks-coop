@@ -181,7 +181,7 @@ func _process(delta: float) -> void :
     if Ref.main.debug and Input.is_action_just_pressed("debug_jump"):
         global_position.y += 256 if not is_crouching else -256
 
-    if not Ref.world.is_position_loaded(global_position):
+    if not is_session_position_loaded(global_position):
         return
 
 
@@ -222,7 +222,7 @@ func _physics_process(delta: float) -> void :
 
     gravity_direction_multiplier = -1 if Ref.main.upside_down else 1
 
-    if disabled or not Ref.world.is_position_loaded(global_position):
+    if disabled or not is_session_position_loaded(global_position):
         return
 
     update_structure()

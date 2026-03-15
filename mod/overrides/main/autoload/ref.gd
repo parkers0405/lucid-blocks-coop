@@ -96,36 +96,37 @@ func _apply_native_patch_config(config_path: String) -> void:
     if coop_native_patch == null:
         return
 
-    if not FileAccess.file_exists(config_path):
-        return
+    # Always enable native patching with expanded limits for coop.
+    # Default pool: 192 render distance supports two player bubbles at full 96 radius.
+    var instance_radius_cap: int = 192
+    var render_distance: int = 192
 
-    var config_file := FileAccess.open(config_path, FileAccess.READ)
-    if config_file == null:
-        push_error("[lucid-blocks-coop] Failed to open native patch config: %s" % config_path)
-        return
+    # If a config file exists, allow it to override (but we always enable).
+    if FileAccess.file_exists(config_path):
+        var config_file := FileAccess.open(config_path, FileAccess.READ)
+        if config_file != null:
+            var parsed = JSON.parse_string(config_file.get_as_text())
+            if typeof(parsed) == TYPE_DICTIONARY:
+                var config: Dictionary = parsed
+                instance_radius_cap = maxi(instance_radius_cap, int(config.get("instance_radius_cap", instance_radius_cap)))
+                render_distance = maxi(render_distance, int(config.get("instantiate_chunks_render_distance", render_distance)))
 
-    var parsed = JSON.parse_string(config_file.get_as_text())
-    if typeof(parsed) != TYPE_DICTIONARY:
-        push_error("[lucid-blocks-coop] Native patch config must be a JSON object: %s" % config_path)
-        return
-
-    var config: Dictionary = parsed
-    if not bool(config.get("enabled", false)):
-        return
+    # Ensure render_distance >= instance_radius_cap and is chunk-aligned.
+    render_distance = maxi(render_distance, instance_radius_cap)
+    if render_distance % 16 != 0:
+        render_distance = (int(render_distance / 16) + 1) * 16
 
     if not coop_native_patch.has_method("patch_world_streaming_limits"):
         push_error("[lucid-blocks-coop] Loaded native patch extension is missing patch_world_streaming_limits")
         return
 
-    var instance_radius_cap := int(config.get("instance_radius_cap", 96))
-    var render_distance := int(config.get("instantiate_chunks_render_distance", 96))
     var ok := bool(coop_native_patch.call("patch_world_streaming_limits", instance_radius_cap, render_distance))
     if ok and coop_native_patch.has_method("install_multi_region_radius_hooks"):
         var hook_ok := bool(coop_native_patch.call("install_multi_region_radius_hooks"))
         print("[lucid-blocks-coop] Native multi-region hook install=%s" % str(hook_ok))
 
     print(
-        "[lucid-blocks-coop] Native patch config applied=%s cap=%d render_distance=%d" % [
+        "[lucid-blocks-coop] Native patch applied=%s cap=%d render_distance=%d" % [
             str(ok),
             instance_radius_cap,
             render_distance,

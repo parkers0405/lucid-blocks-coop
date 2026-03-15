@@ -58,7 +58,7 @@ func _detect(delta: float) -> void :
 
     if not can_fly:
 
-        if Ref.world.is_position_loaded(above_point) and not Ref.world.is_block_solid_at(above_point) and not Ref.world.is_under_water(above_point):
+        if is_session_position_loaded(above_point) and not Ref.world.is_block_solid_at(above_point) and not Ref.world.is_under_water(above_point):
             acceleration += (Vector3(0, -1, 0) * delta * 12.0 * (0.1 + Vector3(0, 1, 0).dot(movement_velocity.normalized())))
     else:
 
@@ -75,7 +75,7 @@ func clean_up_boids() -> void :
 
 
 func _physics_process(delta: float) -> void :
-    if disabled or not Ref.world.is_position_loaded(global_position):
+    if disabled or not is_session_position_loaded(global_position):
         return
     super._physics_process(delta)
     if is_future_position_loaded(delta):

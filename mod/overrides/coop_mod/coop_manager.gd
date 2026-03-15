@@ -12,7 +12,7 @@ const HOST_TIMEOUT_SECONDS: float = 6.0
 const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
-const NATIVE_WORLD_MAX_INSTANCE_RADIUS: int = 96
+const NATIVE_WORLD_MAX_INSTANCE_RADIUS: int = 192
 const ENTITY_SYNC_RADIUS: float = 144.0
 const DROP_SYNC_RADIUS: float = 96.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
@@ -51,7 +51,9 @@ var synced_entities: Dictionary = {}
 var synced_dropped_items: Dictionary = {}
 var client_world_sync_ready: bool = false
 var client_picked_up_drop_uuids: Dictionary = {}
+var client_recent_synced_drop_uuids: Dictionary = {}
 var client_synced_entity_list: Array = []
+var host_known_drop_uuids: Dictionary = {}
 
 var hooked_player_death_target: Node = null
 var handling_client_respawn: bool = false
@@ -91,6 +93,11 @@ func _ready() -> void:
     _load_config()
     _build_hud()
     call_deferred("_install_player_death_hook")
+
+    var root = get_tree().get_root()
+    if root != null:
+        root.child_entered_tree.connect(_on_root_child_entered)
+        root.child_exiting_tree.connect(_on_root_child_exiting)
 
     if is_instance_valid(Ref.main) and not Ref.main.game_quit.is_connected(_on_local_game_quit):
         Ref.main.game_quit.connect(_on_local_game_quit)
@@ -159,7 +166,7 @@ func _physics_process(delta: float) -> void:
             server_world_state.rpc_id(
                 int_peer_id,
                 _capture_host_entity_snapshots(peer_state.get("position", Ref.player.global_position)),
-                _capture_host_drop_snapshots(peer_state.get("position", Ref.player.global_position))
+                []
             )
     elif not multiplayer.is_server() and client_world_sync_ready and guest_persistent_ready and persist_timer >= PERSIST_INTERVAL:
         persist_timer = 0.0
@@ -340,7 +347,9 @@ func disconnect_session(announce: bool = true) -> void:
     last_sent_client_state_hash = 0
     client_menu_kick_pending = false
     client_picked_up_drop_uuids.clear()
+    client_recent_synced_drop_uuids.clear()
     client_synced_entity_list.clear()
+    host_known_drop_uuids.clear()
     session_role = "none"
     pending_remote_block_changes.clear()
     pending_remote_water_changes.clear()
@@ -736,12 +745,9 @@ func sync_local_pickup_item(dropped_item) -> bool:
 
     client_picked_up_drop_uuids[item_uuid] = Time.get_ticks_msec()
 
-    if dropped_item is DroppedItem and dropped_item.item != null and _can_sample_player():
-        var pick_up = Ref.player.get_node_or_null("%PickUpItems") as PickUpItems
-        if pick_up != null:
-            pick_up.accept_item(dropped_item.item)
-
     if is_instance_valid(dropped_item):
+        if dropped_item.has_method("collect"):
+            dropped_item.collect()
         dropped_item.queue_free()
 
     request_pickup_drop.rpc_id(1, item_uuid)
@@ -1442,6 +1448,32 @@ func _teleport_local_player_exact(target_position: Vector3) -> void:
 
     Ref.player.global_position = target_position
     _reset_local_player_motion()
+
+
+func _prepare_respawn_destination(target_position: Vector3) -> Vector3:
+    if not _can_sample_player():
+        return target_position
+
+    var test_position: Vector3 = target_position
+    if is_instance_valid(Ref.world):
+        Ref.world.load_enabled = true
+        Ref.player.global_position = target_position + Vector3(0.0, 24.0, 0.0)
+
+        # Wait for chunk loading with a timeout so we don't hang forever
+        var wait_frames: int = 0
+        while not Ref.world.is_all_loaded() and wait_frames < 120:
+            await get_tree().process_frame
+            wait_frames += 1
+        await get_tree().process_frame
+
+        # Try to snap to ground if the position is loaded
+        if Ref.world.is_position_loaded(target_position):
+            if Ref.world.spawn_tester != null and Ref.world.spawn_tester.has_method("snap_to_ground"):
+                if Ref.world.spawn_tester.snap_to_ground():
+                    test_position = Ref.player.global_position
+
+    _reset_local_player_motion()
+    return test_position
 
 
 func _resolve_respawn_position() -> Vector3:
@@ -2468,7 +2500,7 @@ func _handle_host_player_death() -> void:
     if Ref.sun.target_time_scale < 1.0:
         Ref.sun.set_time_scale(1.0)
 
-    var respawn_position: Vector3 = _resolve_respawn_position()
+    var respawn_position: Vector3 = await _prepare_respawn_destination(_resolve_respawn_position())
 
     await get_tree().create_timer(1.0, true).timeout
     if _can_sample_player():
@@ -2581,6 +2613,43 @@ func _prepare_client_world_sync() -> void:
     _disable_client_local_preserve_entity_loading()
     _clear_client_world_entities_and_drops()
     client_world_sync_ready = true
+
+
+func _on_root_child_entered(node: Node) -> void:
+    if not multiplayer.is_server() or not _has_live_peer() or not (node is DroppedItem):
+        return
+    var existing_uuid: String = _get_sync_uuid(node)
+    if existing_uuid != "" and host_known_drop_uuids.has(existing_uuid):
+        return
+    node.call_deferred("set_meta", "coop_host_drop_seen", true)
+    call_deferred("_broadcast_drop_from_node", node)
+
+
+func _on_root_child_exiting(node: Node) -> void:
+    if not multiplayer.is_server() or not _has_live_peer() or not (node is DroppedItem):
+        return
+    var drop_uuid: String = _get_sync_uuid(node)
+    if drop_uuid == "" or not host_known_drop_uuids.has(drop_uuid):
+        return
+    host_known_drop_uuids.erase(drop_uuid)
+    sync_remove_drop.rpc(drop_uuid)
+
+
+func _broadcast_drop_from_node(node: Node) -> void:
+    if not multiplayer.is_server() or not _has_live_peer() or not is_instance_valid(node) or not (node is DroppedItem):
+        return
+
+    var dropped_item := node as DroppedItem
+    if dropped_item.item == null:
+        await get_tree().process_frame
+        if not is_instance_valid(dropped_item) or dropped_item.item == null:
+            return
+
+    var drop_uuid: String = _assign_sync_uuid(dropped_item)
+    if drop_uuid == "":
+        return
+    host_known_drop_uuids[drop_uuid] = true
+    _broadcast_drop_spawn(drop_uuid, dropped_item.global_position, dropped_item.velocity, dropped_item.item)
 
 
 func _disable_client_local_preserve_entity_loading() -> void:
@@ -2737,7 +2806,8 @@ func _apply_entity_special_state(entity, special_state: Dictionary) -> void:
 func _apply_client_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
     _prepare_client_world_sync()
     _apply_client_entity_snapshots(entity_snapshots)
-    _apply_client_drop_snapshots(drop_snapshots)
+    if not drop_snapshots.is_empty():
+        _apply_client_drop_snapshots(drop_snapshots)
 
 
 func _apply_client_entity_snapshots(entity_snapshots: Array) -> void:
@@ -2864,9 +2934,6 @@ func _spawn_client_synced_drop(uuid: String, item_state):
     if dropped_item == null:
         return null
 
-    if dropped_item is DroppedItem:
-        dropped_item.disabled = true
-
     get_tree().get_root().add_child(dropped_item)
     if Ref.preserve_node_manager != null:
         Ref.preserve_node_manager.node_to_uuid_map[dropped_item] = uuid
@@ -2916,6 +2983,10 @@ func _remove_unlisted_client_drops(visible_uuids: Dictionary) -> void:
         if not (child is DroppedItem):
             continue
         var uuid: String = _get_sync_uuid(child)
+        if client_recent_synced_drop_uuids.has(uuid):
+            if Time.get_ticks_msec() - int(client_recent_synced_drop_uuids[uuid]) < 1000:
+                continue
+            client_recent_synced_drop_uuids.erase(uuid)
         if uuid == "" or not visible_uuids.has(uuid):
             child.call_deferred("queue_free")
 
@@ -2943,9 +3014,10 @@ func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
     dropped_item.set_meta("coop_uuid", uuid)
     dropped_item.set_meta("coop_synced_drop", true)
     if dropped_item is DroppedItem:
-        dropped_item.disabled = true
+        dropped_item.disabled = false
         dropped_item.can_merge = false
-    dropped_item.set_physics_process(false)
+        dropped_item.can_collect = true
+    dropped_item.set_physics_process(true)
 
 
 func _strip_client_entity_ai(root: Node) -> void:
@@ -3276,9 +3348,45 @@ func _spawn_network_item(item_state, block_position: Vector3i) -> void:
         return
 
     get_tree().get_root().add_child(dropped_item)
-    _assign_sync_uuid(dropped_item)
+    var drop_uuid: String = _assign_sync_uuid(dropped_item)
+    host_known_drop_uuids[drop_uuid] = true
     dropped_item.global_position = Vector3(block_position)
     dropped_item.initialize(item_state)
+    _broadcast_drop_spawn(drop_uuid, dropped_item.global_position, dropped_item.velocity, item_state)
+
+
+func _spawn_and_broadcast_drop(item_state, spawn_position: Vector3, launch_velocity: Vector3 = Vector3.ZERO, delay_collect: bool = false, delay_merge: bool = false) -> void:
+    if item_state == null:
+        return
+
+    var scene = load(DROPPED_ITEM_SCENE_PATH)
+    if not (scene is PackedScene):
+        return
+
+    var dropped_item = (scene as PackedScene).instantiate()
+    if dropped_item == null:
+        return
+
+    get_tree().get_root().add_child(dropped_item)
+    var drop_uuid: String = _assign_sync_uuid(dropped_item)
+    host_known_drop_uuids[drop_uuid] = true
+    if delay_merge and dropped_item is DroppedItem:
+        dropped_item.delay_merge()
+    if delay_collect and dropped_item is DroppedItem:
+        dropped_item.delay_collect()
+
+    dropped_item.global_position = spawn_position
+    dropped_item.initialize(item_state)
+    if dropped_item is DroppedItem and dropped_item.state != DroppedItem.SWIM:
+        dropped_item.velocity = launch_velocity
+
+    _broadcast_drop_spawn(drop_uuid, dropped_item.global_position, dropped_item.velocity, item_state)
+
+
+func _broadcast_drop_spawn(drop_uuid: String, spawn_position: Vector3, launch_velocity: Vector3, item_state) -> void:
+    if drop_uuid == "" or not _has_live_peer() or not multiplayer.is_server() or item_state == null:
+        return
+    sync_spawn_drop.rpc(drop_uuid, spawn_position, launch_velocity, _serialize_item_state(item_state))
 
 
 func _spawn_break_drops_for_block(block, block_position: Vector3i, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
@@ -3311,18 +3419,13 @@ func _spawn_break_drops_for_block(block, block_position: Vector3i, pickaxe: bool
         var dropped_state: ItemState = to_drop[item_index]
         if dropped_state == null:
             continue
-        var dropped_item = load(DROPPED_ITEM_SCENE_PATH)
-        if not (dropped_item is PackedScene):
-            return
-        var new_item = (dropped_item as PackedScene).instantiate()
-        if new_item == null:
-            continue
-        if to_drop.size() > 1 and new_item is DroppedItem:
-            new_item.delay_merge()
-        get_tree().get_root().add_child(new_item)
-        _assign_sync_uuid(new_item)
-        new_item.global_position = Vector3(block_position)
-        new_item.initialize(dropped_state)
+        _spawn_and_broadcast_drop(
+            dropped_state,
+            Vector3(block_position),
+            Vector3.ZERO,
+            false,
+            to_drop.size() > 1
+        )
 
 
 func _apply_client_break_feedback(break_behavior, block_position: Vector3i) -> void:
@@ -3459,21 +3562,7 @@ func request_drop_item(item_data: PackedInt32Array, spawn_position: Vector3, lau
     if item_state == null:
         return
 
-    var scene = load(DROPPED_ITEM_SCENE_PATH)
-    if not (scene is PackedScene):
-        return
-
-    var dropped_item = scene.instantiate()
-    if dropped_item == null:
-        return
-
-    get_tree().get_root().add_child(dropped_item)
-    _assign_sync_uuid(dropped_item)
-    dropped_item.delay_collect()
-    dropped_item.global_position = spawn_position
-    dropped_item.initialize(item_state)
-    dropped_item.global_position = spawn_position
-    dropped_item.velocity = launch_velocity
+    _spawn_and_broadcast_drop(item_state, spawn_position, launch_velocity, true, false)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -3491,6 +3580,7 @@ func request_pickup_drop(item_uuid: String) -> void:
 
     var item_data: PackedInt32Array = _serialize_item_state(dropped_item.item)
     dropped_item.collect()
+    sync_remove_drop.rpc(item_uuid)
     receive_picked_item.rpc_id(sender_id, item_data)
 
 
@@ -3731,6 +3821,40 @@ func sync_break_block(block_position: Vector3i) -> void:
     _apply_network_break(block_position)
 
 
+@rpc("authority", "call_remote", "reliable")
+func sync_spawn_drop(drop_uuid: String, spawn_position: Vector3, launch_velocity: Vector3, item_data: PackedInt32Array) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+
+    var item_state = _deserialize_item_state(item_data)
+    if item_state == null:
+        return
+
+    var dropped_item = _find_existing_drop_by_uuid(drop_uuid)
+    if dropped_item == null:
+        dropped_item = _spawn_client_synced_drop(drop_uuid, item_state)
+    if dropped_item == null:
+        return
+
+    synced_dropped_items[drop_uuid] = dropped_item
+    client_recent_synced_drop_uuids[drop_uuid] = Time.get_ticks_msec()
+    _apply_client_drop_snapshot(dropped_item, item_state, spawn_position, launch_velocity)
+
+
+@rpc("authority", "call_remote", "reliable")
+func sync_remove_drop(drop_uuid: String) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+
+    var dropped_item = _find_existing_drop_by_uuid(drop_uuid)
+    if dropped_item != null:
+        dropped_item.queue_free()
+    synced_dropped_items.erase(drop_uuid)
+    client_recent_synced_drop_uuids.erase(drop_uuid)
+
+
 @rpc("authority", "call_remote", "unreliable")
 func server_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
     if multiplayer.is_server() or receiving_host_world or _is_local_world_authority():
@@ -3753,6 +3877,34 @@ func receive_picked_item(item_data: PackedInt32Array) -> void:
     var pickup_behavior = Ref.player.get_node_or_null("%PickUpItems")
     if pickup_behavior != null:
         pickup_behavior.accept_item(item_state, true)
+
+
+@rpc("authority", "call_remote", "reliable")
+func send_hate_reward(amount: int) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+    if not _can_sample_player():
+        return
+    Ref.player.hate += amount
+
+
+@rpc("authority", "call_remote", "reliable")
+func send_plot_increment(plot_key: String, amount: int) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+    if Ref.plot_manager == null:
+        return
+    Ref.plot_manager.set_plot_data(plot_key, Ref.plot_manager.get_plot_data(plot_key, 0) + amount)
+
+
+@rpc("authority", "call_remote", "reliable")
+func send_achievement_unlock(achievement_id: String) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+    Steamworks.set_achievement(achievement_id)
 
 
 @rpc("authority", "call_remote", "reliable")

@@ -52,7 +52,7 @@ func _get_target_head_position() -> Vector3:
 
 
 func _process(delta: float) -> void :
-    if disabled or not Ref.world.is_position_loaded(global_position):
+    if disabled or not is_session_position_loaded(global_position):
         return
 
     distance_process_check()
@@ -61,7 +61,7 @@ func _process(delta: float) -> void :
         var center: Vector3 = _get_target_position()
         var target_position: Vector3 = center + offset
         var new_global_position = lerp(global_position, target_position, delta * move_speed)
-        if Ref.world.is_position_loaded(new_global_position):
+        if is_session_position_loaded(new_global_position):
             global_position = new_global_position
         SpatialMath.look_at(self, _get_target_head_position())
 

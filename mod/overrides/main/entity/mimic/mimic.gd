@@ -24,7 +24,7 @@ var fast: bool = false
 func _ready() -> void :
     super._ready()
     transform.origin = transform.origin.floor() + Vector3(0.5, 0, 0.5)
-    while Ref.world.is_position_loaded(transform.origin.floor()) and Ref.world.is_block_solid_at(transform.origin.floor()):
+    while is_session_position_loaded(transform.origin.floor()) and Ref.world.is_block_solid_at(transform.origin.floor()):
         transform.origin.y += 1
     copy_block = capture_block()
 
@@ -80,7 +80,7 @@ func thrust(target_direction: Vector3) -> void :
 
 func capture_block() -> Block:
     var block_position: Vector3 = global_position.floor() - Vector3(0, 1, 0)
-    if not Ref.world.is_position_loaded(block_position) or not Ref.world.is_block_solid_at(block_position):
+    if not is_session_position_loaded(block_position) or not Ref.world.is_block_solid_at(block_position):
         return default_block
     var block_type: Block = Ref.world.get_block_type_at(block_position)
     if block_type.internal_name == "cutscene block" or block_type.internal_name == "respawn block" or block_type.textureless:
@@ -137,7 +137,7 @@ func preserve_load(file: SaveFile, uuid: String) -> void :
 
 
 func _physics_process(delta: float) -> void :
-    if disabled or not Ref.world.is_position_loaded(global_position):
+    if disabled or not is_session_position_loaded(global_position):
         return
     distance_process_check()
 
@@ -171,7 +171,7 @@ func _physics_process(delta: float) -> void :
         desired_velocity.x = dir.x * speed * (fast_multiplier if fast else 1.0)
         desired_velocity.z = dir.z * speed * (fast_multiplier if fast else 1.0)
     else:
-        while Ref.world.is_position_loaded(global_position) and Ref.world.is_block_solid_at(global_position):
+        while is_session_position_loaded(global_position) and Ref.world.is_block_solid_at(global_position):
             global_position.y += 1
 
 
