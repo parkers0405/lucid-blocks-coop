@@ -13,8 +13,8 @@ const PANEL_WIDTH: float = 224.0
 const SNAPSHOT_CHUNK_SIZE: int = 60000
 const DEFAULT_AVATAR_ID: String = "default_blocky"
 const NATIVE_WORLD_MAX_INSTANCE_RADIUS: int = 96
-const ENTITY_SYNC_RADIUS: float = 112.0
-const DROP_SYNC_RADIUS: float = 72.0
+const ENTITY_SYNC_RADIUS: float = 144.0
+const DROP_SYNC_RADIUS: float = 96.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
 const PLAYER_SCENE_PATH: String = "res://main/entity/player/player.tscn"
@@ -50,6 +50,7 @@ var remote_break_outlines: Dictionary = {}
 var synced_entities: Dictionary = {}
 var synced_dropped_items: Dictionary = {}
 var client_world_sync_ready: bool = false
+var client_picked_up_drop_uuids: Dictionary = {}
 var hooked_player_death_target: Node = null
 var handling_client_respawn: bool = false
 var handling_host_respawn: bool = false
@@ -59,6 +60,8 @@ var session_load_radius_applied: bool = false
 var session_previous_instance_radius: int = -1
 var session_previous_buffer_instance_radius: int = -1
 var local_quit_in_progress: bool = false
+var client_menu_kick_pending: bool = false
+var session_role: String = "none"
 var guest_persistent_ready: bool = false
 var autosave_in_progress: bool = false
 var last_host_contact_time: int = 0
@@ -129,6 +132,8 @@ func _physics_process(delta: float) -> void:
     _refresh_world_authority_mode()
     _refresh_session_load_radius()
     _flush_pending_remote_world_changes()
+    if not multiplayer.is_server() and client_world_sync_ready:
+        _interpolate_client_synced_entities(delta)
 
     if not _has_live_peer():
         _hide_all_markers()
@@ -253,14 +258,15 @@ func host_session() -> void:
         _update_status_text()
         return
 
+    _apply_ui_to_config()
+    disconnect_session(false)
     local_quit_in_progress = false
+    session_role = "host"
     guest_persistent_ready = true
     last_host_contact_time = Time.get_ticks_msec()
     autosave_timer = 0.0
     client_state_heartbeat_timer = 0.0
     last_sent_client_state_hash = 0
-    _apply_ui_to_config()
-    disconnect_session(false)
 
     var peer: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
     var err: Error = peer.create_server(int(config.get("port", DEFAULT_PORT)), MAX_CLIENTS)
@@ -280,14 +286,15 @@ func host_session() -> void:
 
 
 func join_session() -> void:
+    _apply_ui_to_config()
+    disconnect_session(false)
     local_quit_in_progress = false
+    session_role = "client"
     guest_persistent_ready = false
     last_host_contact_time = 0
     autosave_timer = 0.0
     client_state_heartbeat_timer = 0.0
     last_sent_client_state_hash = 0
-    _apply_ui_to_config()
-    disconnect_session(false)
 
     var address: String = str(config.get("address", "127.0.0.1")).strip_edges()
     var port: int = int(config.get("port", DEFAULT_PORT))
@@ -329,6 +336,9 @@ func disconnect_session(announce: bool = true) -> void:
     guest_persistent_ready = false
     last_host_contact_time = 0
     last_sent_client_state_hash = 0
+    client_menu_kick_pending = false
+    client_picked_up_drop_uuids.clear()
+    session_role = "none"
     pending_remote_block_changes.clear()
     pending_remote_water_changes.clear()
     pending_remote_fire_changes.clear()
@@ -358,6 +368,19 @@ func has_connected_remote_peers() -> bool:
 
 func has_active_session() -> bool:
     return has_connected_remote_peers()
+
+
+func is_death_override_active() -> bool:
+    return session_role != "none" and multiplayer.multiplayer_peer != null and not (multiplayer.multiplayer_peer is OfflineMultiplayerPeer)
+
+
+func request_player_death_intercept(_player: Entity = null) -> bool:
+    if not is_death_override_active():
+        return false
+
+    local_quit_in_progress = false
+    print("[lucid-blocks-coop] intercepting coop player death role=%s server=%s peers=%s" % [session_role, str(multiplayer.is_server()), multiplayer.multiplayer_peer.get_peers().size() if multiplayer.multiplayer_peer != null and multiplayer.multiplayer_peer.has_method("get_peers") else -1])
+    return true
 
 
 func open_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> void:
@@ -613,9 +636,20 @@ func sync_local_entity_attack(_attack_behavior, target, damage_position: Vector3
 
     var target_uuid: String = _get_sync_uuid(target)
     if target_uuid == "":
-        return false
+        target_uuid = _assign_sync_uuid(target)
 
-    _play_client_entity_hit_feedback(target, Ref.player, damage_position, 0, Ref.player.global_position)
+    var predicted_damage: int = _get_local_attack_damage()
+    _play_client_entity_hit_feedback(target, Ref.player, damage_position, predicted_damage, Ref.player.global_position)
+
+    var horizontal_kb: Vector3 = target.global_position - Ref.player.global_position
+    horizontal_kb.y = 0.0
+    if not horizontal_kb.is_zero_approx():
+        horizontal_kb = horizontal_kb.normalized()
+    target.knockback_velocity += 0.45 * Ref.player.velocity + horizontal_kb * knockback_strength
+    target.knockback_velocity.y += knockback_strength * target.jump_modifier * fly_strength * (0.5 if not target.is_on_floor() else 1.0)
+
+    if _get_local_attack_fire_aspect() and target.has_node("%Burn"):
+        target.get_node("%Burn").ignite()
 
     var held_item_state = Ref.player.held_item_inventory.items[Ref.player.held_item_index]
     if held_item_state != null and ItemMap.map(held_item_state.id).max_durability > 0:
@@ -624,14 +658,37 @@ func sync_local_entity_attack(_attack_behavior, target, damage_position: Vector3
     request_entity_attack.rpc_id(
         1,
         target_uuid,
+        str(target.scene_file_path),
+        target.global_position,
         damage_position,
         Ref.player.global_position,
         Ref.player.velocity,
         held_item_state.id if held_item_state != null else -1,
-        _get_local_attack_damage(),
+        predicted_damage,
         _get_local_attack_fire_aspect(),
         knockback_strength,
         fly_strength
+    )
+    return true
+
+
+func sync_host_attack_on_remote_player(attacker: Entity, target, damage_position: Vector3, damage: int, knockback_strength: float, fly_strength: float, fire_aspect: bool) -> bool:
+    if not multiplayer.is_server() or not _has_live_peer() or not is_remote_player_proxy(target):
+        return false
+
+    var peer_id: int = get_remote_player_proxy_peer_id(target)
+    if peer_id <= 1:
+        return false
+
+    receive_remote_player_attack.rpc_id(
+        peer_id,
+        attacker.global_position if is_instance_valid(attacker) else Vector3.ZERO,
+        attacker.velocity if is_instance_valid(attacker) else Vector3.ZERO,
+        damage_position,
+        maxi(1, damage),
+        knockback_strength,
+        fly_strength,
+        fire_aspect
     )
     return true
 
@@ -665,10 +722,25 @@ func sync_local_pickup_item(dropped_item) -> bool:
         return false
     if _is_local_world_authority():
         return false
+    if not (dropped_item is DroppedItem) or dropped_item.item == null:
+        return false
 
     var item_uuid: String = _get_sync_uuid(dropped_item)
     if item_uuid == "":
+        item_uuid = _assign_sync_uuid(dropped_item)
+
+    if not _can_sample_player():
         return false
+
+    var pick_up = Ref.player.get_node_or_null("%PickUpItems") as PickUpItems
+    if pick_up == null:
+        return false
+
+    client_picked_up_drop_uuids[item_uuid] = Time.get_ticks_msec()
+
+    pick_up.accept_item(dropped_item.item)
+    dropped_item.collect()
+    dropped_item.queue_free()
 
     request_pickup_drop.rpc_id(1, item_uuid)
     return true
@@ -1093,6 +1165,54 @@ func get_next_same_instance_spawn_anchor(default_position: Vector3) -> Vector3:
     return anchor
 
 
+func get_nearest_session_player_entity(world_position: Vector3, fallback = null):
+    var nearest = fallback
+    var nearest_distance_squared: float = INF
+
+    if is_instance_valid(Ref.player) and not Ref.player.dead and Ref.player.is_inside_tree():
+        nearest = Ref.player
+        nearest_distance_squared = world_position.distance_squared_to(Ref.player.global_position)
+
+    if not multiplayer.is_server() or not _has_live_peer():
+        return nearest
+
+    var active_instance_key: String = get_active_dimension_instance_key()
+    for peer_id in remote_player_proxies.keys():
+        var proxy = remote_player_proxies[peer_id]
+        if not is_instance_valid(proxy) or proxy.dead or not proxy.is_inside_tree():
+            continue
+
+        var state: Dictionary = peer_states.get(peer_id, {})
+        if not _is_peer_state_same_instance(state, active_instance_key):
+            continue
+
+        var distance_squared: float = world_position.distance_squared_to(proxy.global_position)
+        if distance_squared >= nearest_distance_squared:
+            continue
+
+        nearest = proxy
+        nearest_distance_squared = distance_squared
+
+    return nearest
+
+
+func is_remote_player_proxy(node) -> bool:
+    return is_instance_valid(node) and node.has_meta("coop_remote_player_proxy")
+
+
+func get_remote_player_proxy_peer_id(node) -> int:
+    if not is_remote_player_proxy(node):
+        return -1
+    return int(node.get_meta("coop_remote_player_proxy_peer_id", -1))
+
+
+func get_remote_player_proxy(peer_id: int):
+    if not remote_player_proxies.has(peer_id):
+        return null
+    var proxy = remote_player_proxies[peer_id]
+    return proxy if is_instance_valid(proxy) else null
+
+
 func _refresh_session_load_radius() -> void:
     if not _can_sample_player() or not is_instance_valid(Ref.world):
         return
@@ -1331,21 +1451,14 @@ func _resolve_respawn_position() -> Vector3:
         for position in Ref.world.respawn_positions:
             if position.distance_to(Ref.player.global_position) < closest_position.distance_to(Ref.player.global_position):
                 closest_position = position
-        return Vector3(closest_position) + Vector3(0.5, 0.0, 0.5)
+        return Vector3(closest_position) + Vector3(0.5, 1.0, 0.5)
 
-    var fallback_position: Vector3 = Ref.player.global_position
-    var restore_world_loading: bool = Ref.world.load_enabled
-    var found_spawn: bool = await Ref.world.spawn_tester.find_spawn_position(
-        Ref.player.global_position if Ref.player.wandering_spirit else Vector3.ZERO,
-        Ref.world.current_dimension,
-        3.0 if Ref.player.wandering_spirit else 1.0
-    )
-    if restore_world_loading:
-        Ref.world.load_enabled = true
-        if not Ref.world.is_all_loaded():
-            await Ref.world.all_loaded
-        await get_tree().process_frame
-    return Ref.player.global_position if found_spawn else fallback_position
+    if Ref.save_file_manager != null and Ref.save_file_manager.loaded_file != null:
+        var spawn_data = Ref.save_file_manager.loaded_file.get_data("spawn_position", null)
+        if spawn_data is Vector3:
+            return spawn_data + Vector3(0.0, 1.0, 0.0)
+
+    return Vector3(0.0, 80.0, 0.0)
 
 
 func _broadcast_local_state_now() -> void:
@@ -1553,10 +1666,12 @@ func _ensure_remote_player_proxy(peer_id: int):
 
     proxy.name = "RemotePlayerProxy%s" % peer_id
     proxy.set_meta("coop_remote_player_proxy", true)
+    proxy.set_meta("coop_remote_player_proxy_peer_id", peer_id)
     get_tree().get_root().add_child(proxy)
 
     proxy.visible = false
     proxy.movement_enabled = false
+    proxy.can_switch_hotbar = false
     proxy.invincible = true
     proxy.invincible_temporary = true
     proxy.dead = false
@@ -1574,12 +1689,29 @@ func _ensure_remote_player_proxy(peer_id: int):
     if player_hand != null:
         player_hand.visible = false
 
+    var pick_up_items = proxy.get_node_or_null("%PickUpItems")
+    if pick_up_items != null:
+        pick_up_items.enabled = false
+
+    var break_blocks = proxy.get_node_or_null("%BreakBlocks")
+    if break_blocks != null:
+        break_blocks.enabled = false
+
+    for child in proxy.get_children():
+        if child is CollisionShape3D:
+            child.disabled = false
+    var interact_area = proxy.get_node_or_null("%InteractArea3D")
+    if interact_area != null:
+        for child in interact_area.get_children():
+            if child is CollisionShape3D:
+                child.disabled = false
+
     remote_player_proxies[peer_id] = proxy
     return proxy
 
 
 func _update_remote_player_proxy(proxy, state: Dictionary) -> void:
-    if proxy == null:
+    if proxy == null or not is_instance_valid(proxy) or not proxy.is_inside_tree():
         return
 
     proxy.global_position = state.get("position", Vector3.ZERO)
@@ -1596,6 +1728,16 @@ func _update_remote_player_proxy(proxy, state: Dictionary) -> void:
     var camera = proxy.get_node_or_null("%Camera3D") as Camera3D
     if camera != null:
         camera.rotation.x = float(state.get("pitch", 0.0))
+
+    if proxy.has_method("check_water"):
+        proxy.check_water()
+
+    if proxy is Node3D:
+        proxy.force_update_transform()
+    if rotation_pivot != null:
+        rotation_pivot.force_update_transform()
+    if camera != null:
+        camera.force_update_transform()
 
 
 func _remove_remote_player_proxy(peer_id: int) -> void:
@@ -1707,7 +1849,7 @@ func _build_hud() -> void:
     death_fade.anchor_bottom = 1.0
     death_fade.offset_right = 0.0
     death_fade.offset_bottom = 0.0
-    death_fade.color = Color(0.12, 0.0, 0.0, 0.55)
+    death_fade.color = Color(0.15, 0.0, 0.0, 0.72)
     death_overlay.add_child(death_fade)
 
     var death_center := CenterContainer.new()
@@ -1734,16 +1876,17 @@ func _build_hud() -> void:
     death_margin.add_child(death_column)
 
     death_overlay_title = Label.new()
-    death_overlay_title.text = "YOU DIED"
+    death_overlay_title.text = "You Died!"
     death_overlay_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-    death_overlay_title.add_theme_font_size_override("font_size", 24)
-    death_overlay_title.add_theme_color_override("font_color", Color(0.94, 0.42, 0.42))
+    death_overlay_title.add_theme_font_size_override("font_size", 42)
+    death_overlay_title.add_theme_color_override("font_color", Color(0.95, 0.25, 0.25))
     death_column.add_child(death_overlay_title)
 
     death_overlay_subtitle = Label.new()
     death_overlay_subtitle.text = "Respawning..."
     death_overlay_subtitle.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-    death_overlay_subtitle.add_theme_font_size_override("font_size", 11)
+    death_overlay_subtitle.add_theme_font_size_override("font_size", 14)
+    death_overlay_subtitle.add_theme_color_override("font_color", Color(0.85, 0.85, 0.85))
     death_column.add_child(death_overlay_subtitle)
 
     panel = PanelContainer.new()
@@ -2061,6 +2204,10 @@ func _on_connection_failed() -> void:
 
 
 func _on_local_game_quit() -> void:
+    if _should_ignore_local_game_quit():
+        local_quit_in_progress = false
+        return
+
     local_quit_in_progress = true
     if not _has_live_peer():
         return
@@ -2070,6 +2217,14 @@ func _on_local_game_quit() -> void:
     else:
         _send_persistent_state_to_host(true)
         disconnect_session(false)
+
+
+func _should_ignore_local_game_quit() -> bool:
+    if not is_death_override_active():
+        return false
+    if handling_host_respawn or handling_client_respawn or host_respawning:
+        return true
+    return _can_sample_player() and Ref.player.health <= 0
 
 
 func _shutdown_host_session_for_local_quit() -> void:
@@ -2086,9 +2241,7 @@ func _on_server_disconnected() -> void:
     status_message = "Server disconnected"
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
-    if local_quit_in_progress:
-        return
-    _kick_client_to_main_menu.call_deferred()
+    _queue_client_main_menu_kick()
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -2100,6 +2253,7 @@ func host_world_unavailable(message: String = "Host world is not ready yet") -> 
     status_message = message
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
+    _queue_client_main_menu_kick()
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -2113,11 +2267,19 @@ func host_session_ending() -> void:
     disconnect_session(false)
     status_message = "Host ended the session"
     _update_status_text()
+    _queue_client_main_menu_kick()
+
+
+func _queue_client_main_menu_kick() -> void:
+    if multiplayer.is_server() or client_menu_kick_pending:
+        return
+    client_menu_kick_pending = true
     _kick_client_to_main_menu.call_deferred()
 
 
 func _kick_client_to_main_menu() -> void:
     if multiplayer.is_server() or not is_instance_valid(Ref.main) or not Ref.main.loaded:
+        client_menu_kick_pending = false
         return
 
     await Ref.trans.open()
@@ -2136,6 +2298,7 @@ func _kick_client_to_main_menu() -> void:
     if main_menu != null:
         main_menu.activate()
     local_quit_in_progress = false
+    client_menu_kick_pending = false
 
 
 func _teleport_local_player_near(target_position: Vector3) -> void:
@@ -2263,11 +2426,16 @@ func _install_player_death_hook() -> void:
 
 
 func _on_player_died_for_coop() -> void:
+    if handling_host_respawn or handling_client_respawn:
+        return
+
     if _has_live_peer() and not multiplayer.is_server():
+        handling_client_respawn = true
         _handle_client_player_death.call_deferred()
         return
 
-    if multiplayer.is_server() and has_connected_remote_peers():
+    if multiplayer.is_server() and is_death_override_active():
+        handling_host_respawn = true
         _handle_host_player_death.call_deferred()
         return
 
@@ -2276,31 +2444,50 @@ func _on_player_died_for_coop() -> void:
 
 
 func _handle_host_player_death() -> void:
-    if handling_host_respawn or not _can_sample_player():
+    if not _can_sample_player():
+        handling_host_respawn = false
         return
 
-    handling_host_respawn = true
     sync_host_respawn_state.rpc(true)
     host_respawning = true
 
     Steamworks.increment_statistic("death_count")
     Steamworks.set_achievement("DEATH")
     _stop_local_player_actions()
+    _reset_local_player_motion()
     if panel_visible:
         toggle_panel(false)
 
     Ref.player.disabled = true
-    _set_death_overlay_visible(true, "Respawning at spawn point...")
+    Ref.player.movement_enabled = false
+    _set_death_overlay_visible(true, "Respawning in 3...")
     _broadcast_local_state_now()
 
-    var respawn_position: Vector3 = await _resolve_respawn_position()
-    await get_tree().create_timer(1.35, false).timeout
+    if Ref.sun.target_time_scale < 1.0:
+        Ref.sun.set_time_scale(1.0)
+
+    var respawn_position: Vector3 = _resolve_respawn_position()
+
+    await get_tree().create_timer(1.0, true).timeout
+    if _can_sample_player():
+        _set_death_overlay_visible(true, "Respawning in 2...")
+    await get_tree().create_timer(1.0, true).timeout
+    if _can_sample_player():
+        _set_death_overlay_visible(true, "Respawning in 1...")
+    await get_tree().create_timer(1.0, true).timeout
+
+    if not _can_sample_player():
+        handling_host_respawn = false
+        host_respawning = false
+        return
 
     Ref.player.revive()
     Ref.player.dead = false
     Ref.player.disabled = false
+    Ref.player.movement_enabled = true
     Ref.player.make_invincible_temporary()
     _teleport_local_player_exact(respawn_position)
+    _reset_local_player_motion()
     Ref.player.consume_actions()
     _set_death_overlay_visible(false)
 
@@ -2324,27 +2511,45 @@ func _resync_host_world_to_clients() -> void:
 
 
 func _handle_client_player_death() -> void:
-    if handling_client_respawn or not _can_sample_player():
+    if not _can_sample_player():
+        handling_client_respawn = false
         return
 
-    handling_client_respawn = true
     Steamworks.increment_statistic("death_count")
     Steamworks.set_achievement("DEATH")
     _stop_local_player_actions()
+    _reset_local_player_motion()
     if panel_visible:
         toggle_panel(false)
 
     Ref.player.disabled = true
-    _set_death_overlay_visible(true, "Respawning near host...")
-    await get_tree().create_timer(1.0, false).timeout
+    Ref.player.movement_enabled = false
+    _set_death_overlay_visible(true, "You Died! Respawning in 3...")
+
+    if Ref.sun.target_time_scale < 1.0:
+        Ref.sun.set_time_scale(1.0)
+
+    await get_tree().create_timer(1.0, true).timeout
+    if _can_sample_player():
+        _set_death_overlay_visible(true, "You Died! Respawning in 2...")
+    await get_tree().create_timer(1.0, true).timeout
+    if _can_sample_player():
+        _set_death_overlay_visible(true, "You Died! Respawning in 1...")
+    await get_tree().create_timer(1.0, true).timeout
+
+    if not _can_sample_player():
+        handling_client_respawn = false
+        return
 
     Ref.player.dead = false
     Ref.player.disabled = false
+    Ref.player.movement_enabled = true
     Ref.player.revive()
     Ref.player.make_invincible_temporary()
     
     var respawn_anchor: Vector3 = peer_states.get(1, {}).get("position", Ref.player.global_position)
     _teleport_local_player_near(respawn_anchor)
+    _reset_local_player_motion()
     Ref.player.consume_actions()
     _set_death_overlay_visible(false)
     _send_persistent_state_to_host()
@@ -2403,12 +2608,14 @@ func _capture_host_entity_snapshots(focus_position: Vector3) -> Array:
             continue
 
         var entity := child as Entity
-        if not is_instance_valid(entity) or entity.dead:
+        if not is_instance_valid(entity) or entity.dead or not entity.is_inside_tree():
             continue
         if entity.global_position.distance_squared_to(focus_position) > ENTITY_SYNC_RADIUS * ENTITY_SYNC_RADIUS:
             continue
 
         var uuid: String = _get_sync_uuid(entity)
+        if uuid == "":
+            uuid = _assign_sync_uuid(entity)
         if uuid == "" or entity.scene_file_path == "":
             continue
 
@@ -2442,6 +2649,8 @@ func _capture_host_drop_snapshots(focus_position: Vector3) -> Array:
 
         var uuid: String = _get_sync_uuid(dropped_item)
         if uuid == "":
+            uuid = _assign_sync_uuid(dropped_item)
+        if uuid == "":
             continue
 
         snapshots.append([
@@ -2461,6 +2670,9 @@ func _capture_entity_special_state(entity) -> Dictionary:
     var scene_path: String = str(entity.scene_file_path)
     var state_payload: Dictionary = {
         "visible": bool(entity.visible),
+        "health": int(entity.health),
+        "max_health": int(entity.max_health),
+        "dead": bool(entity.dead),
     }
 
     if _object_has_property(entity, "state"):
@@ -2490,6 +2702,17 @@ func _apply_entity_special_state(entity, special_state: Dictionary) -> void:
 
     if special_state.has("visible"):
         entity.visible = bool(special_state.get("visible", true))
+
+    if special_state.has("max_health") and _object_has_property(entity, "max_health"):
+        entity.set("max_health", int(special_state.get("max_health", entity.get("max_health"))))
+
+    if special_state.has("health") and _object_has_property(entity, "health"):
+        var incoming_health: int = int(special_state.get("health", entity.get("health")))
+        entity.set("health", incoming_health)
+
+    if special_state.has("dead") and bool(special_state.get("dead", false)):
+        if _object_has_property(entity, "dead") and not entity.dead:
+            entity.dead = true
 
     var state_changed: bool = false
     if special_state.has("state") and _object_has_property(entity, "state"):
@@ -2573,6 +2796,9 @@ func _apply_client_drop_snapshots(drop_snapshots: Array) -> void:
         if uuid == "" or item_data.is_empty():
             continue
 
+        if client_picked_up_drop_uuids.has(uuid):
+            continue
+
         var dropped_item = synced_dropped_items.get(uuid, null)
         if not is_instance_valid(dropped_item):
             dropped_item = _find_existing_drop_by_uuid(uuid)
@@ -2602,6 +2828,10 @@ func _apply_client_drop_snapshots(drop_snapshots: Array) -> void:
         synced_dropped_items.erase(uuid)
 
     _remove_unlisted_client_drops(visible_uuids)
+
+    for picked_uuid in client_picked_up_drop_uuids.keys().duplicate():
+        if not visible_uuids.has(picked_uuid):
+            client_picked_up_drop_uuids.erase(picked_uuid)
 
 
 func _spawn_client_synced_entity(uuid: String, scene_path: String):
@@ -2695,10 +2925,12 @@ func _configure_client_synced_entity(entity, uuid: String) -> void:
     entity.set_meta("coop_synced_entity", true)
     if entity is Entity:
         entity.disabled = false
-        entity.invincible = true
+        entity.invincible = false
+        entity.invincible_temporary = false
     entity.set_physics_process(false)
-    entity.set_process(false)
-    _disable_client_entity_runtime(entity)
+    entity.set_process(true)
+    _strip_client_entity_ai(entity)
+    _restore_client_entity_animations(entity)
 
 
 func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
@@ -2712,55 +2944,78 @@ func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
     dropped_item.set_physics_process(false)
 
 
-func _disable_client_entity_runtime(root: Node) -> void:
-    for child in root.get_children():
-        if child.name == "Behaviors":
-            child.process_mode = Node.PROCESS_MODE_DISABLED
-            child.set_process(false)
-            child.set_physics_process(false)
-        elif child is Timer:
-            (child as Timer).stop()
-            child.set_process(false)
-            child.set_physics_process(false)
-        elif child is Area3D:
-            (child as Area3D).monitoring = false
-            (child as Area3D).monitorable = false
-            (child as Area3D).collision_layer = 0
-            (child as Area3D).collision_mask = 0
+func _strip_client_entity_ai(root: Node) -> void:
+    var behaviors = root.get_node_or_null("Behaviors")
+    if behaviors != null:
+        behaviors.process_mode = Node.PROCESS_MODE_DISABLED
+
+    _strip_ai_recursive(root)
+
+
+func _strip_ai_recursive(node: Node) -> void:
+    for child in node.get_children():
+        if child is AnimationPlayer or child is AnimationTree or child is Skeleton3D or child is MeshInstance3D:
+            pass
+        elif child is CollisionShape3D or child is CollisionPolygon3D:
+            pass
+        elif child.name == "Behaviors":
+            pass
         elif child is RayCast3D:
             (child as RayCast3D).enabled = false
         elif child is ShapeCast3D:
             (child as ShapeCast3D).enabled = false
-            (child as ShapeCast3D).collision_mask = 0
         elif child is NavigationAgent3D:
             (child as NavigationAgent3D).enabled = false
-        elif child is VisibleOnScreenNotifier3D:
-            child.set_process(false)
-            child.set_physics_process(false)
+        elif child is Area3D:
+            (child as Area3D).monitoring = false
+            (child as Area3D).monitorable = false
+        elif child is Timer:
+            if child.name != "DirectDamageTimer" and child.name != "InvincibleTimer":
+                (child as Timer).stop()
+        elif child is VisibleOnScreenNotifier3D or child is VisibleOnScreenEnabler3D:
+            pass
+        else:
+            _strip_ai_recursive(child)
 
-        _disable_client_entity_runtime(child)
+
+func _restore_client_entity_animations(entity) -> void:
+    if entity == null:
+        return
+    _set_animation_nodes_active(entity)
+
+
+func _set_animation_nodes_active(node: Node) -> void:
+    if node is AnimationTree:
+        (node as AnimationTree).active = true
+        node.process_mode = Node.PROCESS_MODE_ALWAYS
+    elif node is AnimationPlayer:
+        node.process_mode = Node.PROCESS_MODE_ALWAYS
+    elif node is MeshInstance3D or node is Skeleton3D:
+        node.process_mode = Node.PROCESS_MODE_INHERIT
+    for child in node.get_children():
+        _set_animation_nodes_active(child)
 
 
 func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw: float, entity_velocity: Vector3) -> void:
-    var predicted_position: Vector3 = entity_position + entity_velocity * WORLD_STATE_INTERVAL * 0.65
+    if not is_instance_valid(entity) or not entity.is_inside_tree():
+        return
+
+    var predicted_position: Vector3 = entity_position + entity_velocity * WORLD_STATE_INTERVAL * 0.5
     if not bool(entity.get_meta("coop_snapshot_initialized", false)):
         entity.global_position = predicted_position
         entity.set_meta("coop_snapshot_initialized", true)
     else:
         var distance_error: float = entity.global_position.distance_to(predicted_position)
-        if distance_error > 10.0:
+        if distance_error > 8.0:
             entity.global_position = predicted_position
-        else:
-            entity.global_position = entity.global_position.lerp(predicted_position, 0.24)
 
-    var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
-    if rotation_pivot != null:
-        rotation_pivot.rotation.y = lerp_angle(rotation_pivot.rotation.y, entity_yaw, 0.28)
-    else:
-        entity.rotation.y = lerp_angle(entity.rotation.y, entity_yaw, 0.28)
+    entity.set_meta("coop_target_position", predicted_position)
+    entity.set_meta("coop_target_yaw", entity_yaw)
+    entity.set_meta("coop_target_velocity", entity_velocity)
+
     if entity is Entity:
         entity.velocity = entity_velocity
-        entity.movement_velocity = entity.movement_velocity.lerp(Vector3(entity_velocity.x, 0.0, entity_velocity.z), 0.3)
+        entity.movement_velocity = Vector3(entity_velocity.x, 0.0, entity_velocity.z)
 
     _update_client_entity_visuals(entity, entity_velocity)
 
@@ -2779,6 +3034,32 @@ func _update_client_entity_visuals(entity, entity_velocity: Vector3) -> void:
         if _animation_tree_has_parameter(animation_tree, "parameters/fear/blend_amount") and _object_has_property(entity, "state"):
             var panic_like: bool = int(entity.get("state")) >= 2
             animation_tree["parameters/fear/blend_amount"] = 1.0 if panic_like else 0.0
+
+
+func _interpolate_client_synced_entities(delta: float) -> void:
+    var blend: float = clampf(delta * 18.0, 0.0, 1.0)
+    for child in get_tree().get_root().get_children():
+        if not (child is Entity) or child is Player:
+            continue
+        if not child.has_meta("coop_synced_entity"):
+            continue
+        if not is_instance_valid(child) or not child.is_inside_tree():
+            continue
+
+        var target_pos: Vector3 = child.get_meta("coop_target_position", child.global_position)
+        var target_yaw: float = child.get_meta("coop_target_yaw", 0.0)
+        var target_vel: Vector3 = child.get_meta("coop_target_velocity", Vector3.ZERO)
+
+        var extrapolated: Vector3 = target_pos + target_vel * delta * 0.5
+        child.global_position = child.global_position.lerp(extrapolated, blend)
+
+        var rotation_pivot: Node3D = child.get_node_or_null("%RotationPivot") as Node3D
+        if rotation_pivot != null:
+            rotation_pivot.rotation.y = lerp_angle(rotation_pivot.rotation.y, target_yaw, blend)
+        else:
+            child.rotation.y = lerp_angle(child.rotation.y, target_yaw, blend)
+
+        _update_client_entity_visuals(child, target_vel)
 
 
 func _find_first_animation_tree(root: Node) -> AnimationTree:
@@ -2822,6 +3103,34 @@ func _find_host_entity_by_uuid(uuid: String):
     return null
 
 
+func _find_host_entity_by_scene_and_position(scene_path: String, world_position: Vector3, max_distance: float = 6.0):
+    var nearest = null
+    var nearest_distance_squared: float = max_distance * max_distance
+    for child in get_tree().get_root().get_children():
+        if not (child is Entity) or child is Player or not child.is_inside_tree():
+            continue
+        if scene_path != "" and str(child.scene_file_path) != scene_path:
+            continue
+
+        var distance_squared: float = child.global_position.distance_squared_to(world_position)
+        if distance_squared > nearest_distance_squared:
+            continue
+
+        nearest = child
+        nearest_distance_squared = distance_squared
+    return nearest
+
+
+func _force_session_entity_active(target) -> void:
+    if target == null:
+        return
+    target.disabled = false
+    target.set_physics_process(true)
+    target.set_process(true)
+    if target.has_method("_on_distance_check_timeout"):
+        target._on_distance_check_timeout()
+
+
 func _find_host_drop_by_uuid(uuid: String):
     for child in get_tree().get_root().get_children():
         if child is DroppedItem and _get_sync_uuid(child) == uuid:
@@ -2839,8 +3148,10 @@ func _play_client_entity_hit_feedback(target, attacker, damage_position: Vector3
     if target == null or not is_instance_valid(target) or target.dead:
         return
 
+    var previous_disabled: bool = target.disabled
     var previous_invincible: bool = target.invincible
     var previous_invincible_temporary: bool = target.invincible_temporary
+    target.disabled = false
     target.invincible = false
     target.invincible_temporary = false
 
@@ -2853,6 +3164,7 @@ func _play_client_entity_hit_feedback(target, attacker, damage_position: Vector3
 
     target.invincible = previous_invincible
     target.invincible_temporary = previous_invincible_temporary
+    target.disabled = previous_disabled
 
 
 func _apply_network_place(block_position: Vector3i, block_id: int) -> void:
@@ -3042,18 +3354,23 @@ func submit_client_state(active: bool, dimension: int, dimension_instance_key: S
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_entity_attack(target_uuid: String, damage_position: Vector3, attacker_position: Vector3, attacker_velocity: Vector3, held_item_id: int, damage: int, fire_aspect: bool, knockback_strength: float, fly_strength: float) -> void:
+func request_entity_attack(target_uuid: String, target_scene_path: String, target_position: Vector3, damage_position: Vector3, attacker_position: Vector3, attacker_velocity: Vector3, held_item_id: int, damage: int, fire_aspect: bool, knockback_strength: float, fly_strength: float) -> void:
     if not multiplayer.is_server():
         return
 
+    var sender_id: int = multiplayer.get_remote_sender_id()
     var target = _find_host_entity_by_uuid(target_uuid)
+    if target == null:
+        target = _find_host_entity_by_scene_and_position(target_scene_path, target_position)
     if target == null or target.dead or target.direct_damage_cooldown:
+        if target == null:
+            print("[lucid-blocks-coop] request_entity_attack target not found uuid=%s scene=%s pos=%s" % [target_uuid, target_scene_path, str(target_position)])
         return
 
-    if target.disabled and is_position_near_same_instance_player(target.global_position, get_same_instance_activity_radius()):
-        target.disabled = false
-        target.set_physics_process(true)
-        target.set_process(true)
+    if target.disabled:
+        _force_session_entity_active(target)
+
+    var attacker = get_remote_player_proxy(sender_id)
 
     var actual_damage: int = maxi(1, damage)
     var held_item = ItemMap.map(held_item_id) if held_item_id >= 0 else null
@@ -3078,7 +3395,7 @@ func request_entity_attack(target_uuid: String, damage_position: Vector3, attack
 
     target.knockback_velocity += 0.45 * attacker_velocity + horizontal_kb * knockback_strength
     target.knockback_velocity.y += knockback_strength * target.jump_modifier * fly_strength * (0.5 if not target.is_on_floor() else 1.0)
-    target.attacked(null, actual_damage)
+    target.attacked(attacker, actual_damage)
 
     if fire_aspect and target.has_node("%Burn"):
         target.get_node("%Burn").ignite()
@@ -3087,7 +3404,18 @@ func request_entity_attack(target_uuid: String, damage_position: Vector3, attack
         var target_to_attacker: Vector3 = (attacker_position - target.global_position).normalized()
         target.get_node("%Bleed").bleed(damage_position, target_to_attacker, actual_damage)
 
-    sync_entity_hit_feedback.rpc(target_uuid, damage_position, attacker_position, actual_damage)
+    for peer_id in peer_states.keys():
+        var int_peer_id: int = int(peer_id)
+        if int_peer_id == 1 or int_peer_id == sender_id:
+            continue
+        sync_entity_hit_feedback.rpc_id(int_peer_id, target_uuid, damage_position, attacker_position, actual_damage)
+
+    if fire_aspect:
+        for peer_id in peer_states.keys():
+            var int_peer_id: int = int(peer_id)
+            if int_peer_id == 1:
+                continue
+            sync_entity_ignite.rpc_id(int_peer_id, target_uuid)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -3408,6 +3736,18 @@ func receive_picked_item(item_data: PackedInt32Array) -> void:
         pickup_behavior.accept_item(item_state, true)
 
 
+@rpc("authority", "call_remote", "reliable")
+func send_tiamana_reward(amount: int) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+    if not _can_sample_player():
+        return
+    var level_node = Ref.player.get_node_or_null("%Level")
+    if level_node != null and level_node.has_method("give_tiamana"):
+        level_node.give_tiamana(amount, 1)
+
+
 @rpc("authority", "call_remote", "unreliable")
 func sync_entity_hit_feedback(target_uuid: String, damage_position: Vector3, attacker_position: Vector3, damage: int) -> void:
     if multiplayer.is_server():
@@ -3420,6 +3760,30 @@ func sync_entity_hit_feedback(target_uuid: String, damage_position: Vector3, att
         return
 
     _play_client_entity_hit_feedback(target, Ref.player, damage_position, damage, attacker_position)
+
+
+@rpc("authority", "call_remote", "unreliable")
+func receive_remote_player_attack(attacker_position: Vector3, attacker_velocity: Vector3, damage_position: Vector3, damage: int, knockback_strength: float, fly_strength: float, fire_aspect: bool) -> void:
+    if multiplayer.is_server():
+        return
+
+    _mark_host_contact()
+
+    if not _can_sample_player() or Ref.player.dead or Ref.player.disabled or Ref.player.direct_damage_cooldown:
+        return
+
+    var horizontal_kb: Vector3 = Ref.player.global_position - attacker_position
+    horizontal_kb.y = 0.0
+    if not horizontal_kb.is_zero_approx():
+        horizontal_kb = horizontal_kb.normalized()
+
+    Ref.player.knockback_velocity += 0.45 * attacker_velocity + horizontal_kb * knockback_strength
+    Ref.player.knockback_velocity.y += knockback_strength * Ref.player.jump_modifier * fly_strength * (0.5 if not Ref.player.is_on_floor() else 1.0)
+
+    Ref.player.attacked(null, maxi(1, damage))
+
+    if fire_aspect and Ref.player.has_node("%Burn"):
+        Ref.player.get_node("%Burn").ignite()
 
 
 @rpc("authority", "call_remote", "reliable")

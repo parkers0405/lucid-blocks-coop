@@ -35,6 +35,17 @@ func attack(target: Entity, damage_position: Vector3, knockback_strength: float 
         @warning_ignore("narrowing_conversion")
         actual_damage *= 2.5
 
+    if Ref.coop_manager != null and Ref.coop_manager.is_remote_player_proxy(target):
+        target.direct_damage_cooldown = true
+        var direct_damage_timer = target.get_node_or_null("%DirectDamageTimer") as Timer
+        if direct_damage_timer != null:
+            direct_damage_timer.start()
+
+        if Ref.coop_manager.sync_host_attack_on_remote_player(entity, target, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect):
+            if entity.held_item != null and entity.held_item.item is Tool:
+                entity.decrease_held_item_durability(1)
+            return true
+
     var health_before: int = target.health
     target.knockback_velocity += 0.45 * entity.velocity + horizontal_kb * knockback_strength
     target.knockback_velocity.y += (knockback_strength * target.jump_modifier * fly_strength * (0.5 if not target.is_on_floor() else 1.0))

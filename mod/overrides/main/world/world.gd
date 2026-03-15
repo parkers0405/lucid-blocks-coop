@@ -92,7 +92,7 @@ func _physics_process(_delta: float) -> void :
     if load_enabled:
         even = not even
         var load_center: Vector3 = Ref.player.global_position
-        if _should_use_host_multi_region_loading() and has_method("set_loaded_region_centers") and Ref.coop_manager != null:
+        if _should_use_host_multi_region_loading() and Ref.coop_manager != null:
             var session_positions: Array = Ref.coop_manager.get_same_instance_session_positions()
             if not session_positions.is_empty():
                 call("set_loaded_region_centers", session_positions)
@@ -103,6 +103,8 @@ func _physics_process(_delta: float) -> void :
                 Ref.coop_native_patch.call("clear_active_region_centers")
             if Ref.coop_manager != null:
                 load_center = Ref.coop_manager.get_world_load_center(load_center)
+                if not multiplayer.is_server() and Ref.coop_manager.has_active_session():
+                    _clamp_client_instance_radius()
             set_loaded_region_center(load_center)
 
         if simulate_enabled and not get_tree().paused and simulate_frame and not (even and Ref.sun.target_time_scale < 1.0):
@@ -115,6 +117,15 @@ func set_loaded_region_centers(centers: Array) -> void:
     for center in centers:
         if center is Vector3:
             active_centers.append(center)
+
+    if not supports_coop_multi_region_loading():
+        if Ref.coop_native_patch != null and Ref.coop_native_patch.has_method("clear_active_region_centers"):
+            Ref.coop_native_patch.call("clear_active_region_centers")
+        var fallback_center: Vector3 = Ref.player.global_position
+        if Ref.coop_manager != null:
+            fallback_center = Ref.coop_manager.get_world_load_center(fallback_center)
+        set_loaded_region_center(fallback_center)
+        return
 
     var dirty_indices: Array = _update_session_region_tracking(active_centers)
 
@@ -144,8 +155,34 @@ func set_loaded_region_centers(centers: Array) -> void:
     set_loaded_region_center(_get_next_session_anchor_center(active_centers, dirty_indices))
 
 
+func supports_coop_multi_region_loading() -> bool:
+    if Ref.coop_native_patch == null or not Ref.coop_native_patch.has_method("get_status"):
+        return false
+
+    var status: Variant = Ref.coop_native_patch.call("get_status")
+    if not (status is Dictionary):
+        return false
+
+    return bool(status.get("module_loaded", false)) \
+        and bool(status.get("multi_region_hooks_installed", false))
+
+
+func _clamp_client_instance_radius() -> void:
+    var user_distance: int = 80
+    if Ref.save_file_manager != null and Ref.save_file_manager.settings_file != null:
+        user_distance = maxi(48, int(Ref.save_file_manager.settings_file.get_data("render_distance", 80.0)))
+    user_distance = mini(user_distance, 96)
+    if instance_radius > user_distance:
+        instance_radius = user_distance
+
+
 func _should_use_host_multi_region_loading() -> bool:
-    return multiplayer != null and multiplayer.has_multiplayer_peer() and multiplayer.is_server()
+    return multiplayer != null \
+        and multiplayer.has_multiplayer_peer() \
+        and multiplayer.is_server() \
+        and Ref.coop_manager != null \
+        and Ref.coop_manager.has_connected_remote_peers() \
+        and supports_coop_multi_region_loading()
 
 
 func _get_session_base_instance_radius() -> int:

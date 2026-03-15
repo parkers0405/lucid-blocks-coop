@@ -73,7 +73,7 @@ class_name Entity extends CharacterBody3D
 
 var process_distance: float = 0.0:
     get:
-        if Ref.coop_manager != null and Ref.world != null and Ref.world.has_method("set_loaded_region_centers"):
+        if _supports_multi_region_session_world():
             return Ref.coop_manager.get_same_instance_activity_radius()
         return Ref.world.instance_radius - 16
 
@@ -148,9 +148,7 @@ var health: int = 0:
         if health == max_health and can_endure:
             has_endure = true
         if health <= 0 and not dead:
-            if self is Player and Ref.coop_manager != null and Ref.coop_manager.has_active_session():
-                disabled = true
-                Ref.coop_manager.call_deferred("_on_player_died_for_coop")
+            if _request_coop_player_death_intercept():
                 return
             die()
 
@@ -159,6 +157,9 @@ var invincible: bool = false
 var invincible_temporary: bool = false
 var dead: bool = false:
     set(val):
+        if val and not dead:
+            if _request_coop_player_death_intercept():
+                return
         dead = val
         if dead:
             died.emit()
@@ -321,8 +322,7 @@ func _on_distance_check_timeout() -> void :
 
 func _should_ignore_visibility_culling() -> bool:
     return Ref.coop_manager != null \
-        and Ref.world != null \
-        and Ref.world.has_method("set_loaded_region_centers") \
+        and _supports_multi_region_session_world() \
         and multiplayer.is_server() \
         and Ref.coop_manager.has_connected_remote_peers() \
         and Ref.coop_manager.is_position_near_same_instance_player(global_position, process_distance)
@@ -330,18 +330,35 @@ func _should_ignore_visibility_culling() -> bool:
 
 func _should_disable_server_visibility_culling() -> bool:
     return Ref.coop_manager != null \
-        and Ref.world != null \
-        and Ref.world.has_method("set_loaded_region_centers") \
+        and _supports_multi_region_session_world() \
         and multiplayer.is_server() \
         and Ref.coop_manager.has_connected_remote_peers()
 
 
 func _use_server_session_targeting() -> bool:
     return Ref.coop_manager != null \
-        and Ref.world != null \
-        and Ref.world.has_method("set_loaded_region_centers") \
+        and _supports_multi_region_session_world() \
         and multiplayer.is_server() \
         and Ref.coop_manager.has_connected_remote_peers()
+
+
+func _supports_multi_region_session_world() -> bool:
+    return Ref.world != null \
+        and Ref.world.has_method("supports_coop_multi_region_loading") \
+        and bool(Ref.world.call("supports_coop_multi_region_loading"))
+
+
+func _request_coop_player_death_intercept() -> bool:
+    if not (self is Player and not dead and Ref.coop_manager != null and Ref.coop_manager.is_death_override_active()):
+        return false
+    if Ref.coop_manager.handling_host_respawn or Ref.coop_manager.handling_client_respawn:
+        return true
+    if not Ref.coop_manager.request_player_death_intercept(self):
+        return false
+
+    disabled = true
+    Ref.coop_manager._on_player_died_for_coop()
+    return true
 
 
 func get_session_target_position(default_position: Vector3) -> Vector3:
@@ -631,6 +648,10 @@ func die() -> void :
 
     if last_attacker == Ref.player:
         Ref.player.get_node("%Level").give_tiamana(tiamana_drop, Level.TiamanaSource.CUTSCENE)
+    elif last_attacker is Player and Ref.coop_manager != null and Ref.coop_manager.is_remote_player_proxy(last_attacker):
+        var proxy_peer_id: int = Ref.coop_manager.get_remote_player_proxy_peer_id(last_attacker)
+        if proxy_peer_id > 1:
+            Ref.coop_manager.send_tiamana_reward.rpc_id(proxy_peer_id, tiamana_drop)
 
 
     remove_from_group("preserve_but_delete_on_unload")
@@ -828,7 +849,7 @@ func is_future_position_loaded(delta: float) -> bool:
 
 func distance_process_check() -> void :
     var distance: float = Ref.player.global_position.distance_to(global_position)
-    if Ref.coop_manager != null and Ref.world != null and Ref.world.has_method("set_loaded_region_centers"):
+    if Ref.coop_manager != null and _supports_multi_region_session_world():
         distance = Ref.coop_manager.get_nearest_session_player_distance(global_position, distance)
     if distance >= process_distance:
         set_physics_process(false)

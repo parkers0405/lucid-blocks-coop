@@ -174,8 +174,8 @@ func _physics_process(delta: float) -> void :
             for entity in nearby_entities:
                 if not is_instance_valid(entity) or entity.dead or entity.disabled:
                     continue
-                if entity == Ref.player:
-                    nearby = Ref.player
+                if entity == Ref.player or (entity is Player and Ref.coop_manager != null and Ref.coop_manager.is_remote_player_proxy(entity)):
+                    nearby = entity
                     break
                 if nearby == null or entity.global_position.distance_squared_to(global_position) < nearby.global_position.distance_squared_to(global_position):
                     nearby = entity

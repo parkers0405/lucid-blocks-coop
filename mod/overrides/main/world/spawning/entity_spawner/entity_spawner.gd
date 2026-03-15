@@ -15,7 +15,7 @@ class_name EntitySpawner extends Node3D
 @export var discovery_base_rate: float = 0.01
 @export var rare_spawn_risk_increase: float = 0.1
 @export var rare_spawn_base_chance: float = 0.1
-const DISCOVERY_SPAWN_COOLDOWN_MSEC: int = 250
+const DISCOVERY_SPAWN_COOLDOWN_MSEC: int = 0
 
 @onready var floor_raycast: RayCast3D = %FloorRayCast
 @onready var guard_checker: ShapeCast3D = %GuardChecker
@@ -30,7 +30,10 @@ var last_discovery_spawn_attempt_msec: int = 0
 
 
 func _can_use_multi_region_logic() -> bool:
-    return Ref.coop_manager != null and Ref.world != null and Ref.world.has_method("set_loaded_region_centers")
+    return Ref.coop_manager != null \
+        and Ref.world != null \
+        and Ref.world.has_method("supports_coop_multi_region_loading") \
+        and bool(Ref.world.call("supports_coop_multi_region_loading"))
 
 
 func _ready() -> void :
@@ -49,7 +52,7 @@ func _on_chunk_loaded(chunk_position: Vector3i) -> void :
 
     if _can_use_multi_region_logic() and _get_same_instance_player_count() > 1:
         var now_msec: int = Time.get_ticks_msec()
-        if now_msec - last_discovery_spawn_attempt_msec < DISCOVERY_SPAWN_COOLDOWN_MSEC:
+        if DISCOVERY_SPAWN_COOLDOWN_MSEC > 0 and now_msec - last_discovery_spawn_attempt_msec < DISCOVERY_SPAWN_COOLDOWN_MSEC:
             return
         last_discovery_spawn_attempt_msec = now_msec
 
@@ -85,14 +88,22 @@ func _on_days_elapsed_changed(_day_count: int) -> void :
 
 func _on_child_entered_tree(node: Node) -> void :
     if node is Entity and not node is Player:
+        if _can_use_multi_region_logic() and not bool(node.get_meta("coop_runtime_spawned", false)):
+            return
         entities.append(node as Entity)
 
 
 func flush_deleted_entities() -> void :
     var new_entities: Array[Entity] = []
+    var seen_ids: Dictionary = {}
     for entity in entities:
-        if is_instance_valid(entity):
-            new_entities.append(entity)
+        if not is_instance_valid(entity):
+            continue
+        var instance_id: int = entity.get_instance_id()
+        if seen_ids.has(instance_id):
+            continue
+        seen_ids[instance_id] = true
+        new_entities.append(entity)
     entities = new_entities
 
 
@@ -103,7 +114,27 @@ func _get_same_instance_player_count() -> int:
 
 
 func _get_spawn_cap() -> int:
-    return max_spawns * _get_same_instance_player_count()
+    var player_count: int = _get_same_instance_player_count()
+    if _can_use_multi_region_logic() and player_count > 1:
+        return max_spawns * player_count * 2
+    return max_spawns * player_count
+
+
+func _get_nearby_spawn_count(spawn_position: Vector3, radius: float) -> int:
+    var radius_squared: float = radius * radius
+    var nearby_count: int = 0
+    for entity in entities:
+        if not is_instance_valid(entity) or entity.dead:
+            continue
+        if entity.global_position.distance_squared_to(spawn_position) <= radius_squared:
+            nearby_count += 1
+    return nearby_count
+
+
+func _get_spawn_budget_count(spawn_position: Vector3) -> int:
+    if not _can_use_multi_region_logic() or _get_same_instance_player_count() <= 1:
+        return len(entities)
+    return _get_nearby_spawn_count(spawn_position, _get_spawn_interest_radius())
 
 
 func _get_spawn_interest_radius() -> float:
@@ -136,10 +167,17 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
     flush_deleted_entities()
 
     var player_count: int = _get_same_instance_player_count()
-    if randf() < clamp((float(len(entities)) / float(player_count)) * soft_limit_growth, 0.0, 0.9):
+    var spawn_budget_count: int = _get_spawn_budget_count(spawn_position)
+    if randf() < clamp((float(spawn_budget_count) / float(player_count)) * soft_limit_growth, 0.0, 0.9):
         return false
     if len(entities) >= _get_spawn_cap():
         return false
+
+    if _can_use_multi_region_logic() and player_count > 1:
+        var local_spawn_cap: int = max_spawns
+        if spawn_budget_count >= local_spawn_cap:
+            return false
+
     if not Ref.world.is_position_loaded(spawn_position) or Ref.world.get_block_type_at(spawn_position).id != 0:
         return false
 
@@ -205,6 +243,7 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
 
     entity.transform.origin = spawn_position
     entity.allow_swarm()
+    entity.set_meta("coop_runtime_spawned", true)
     get_tree().get_root().add_child(entity)
 
     entities.append(entity)
@@ -220,7 +259,7 @@ func _on_timeout(rare: bool = false) -> void :
     var player_count: int = _get_same_instance_player_count()
 
     if not spawned:
-        timer.start(fail_time)
+        timer.start(maxf(0.15, fail_time / float(player_count)))
     else:
         if not rare:
             if Ref.world.is_position_loaded(last_spawn_position) and Ref.world.is_within_structure(last_spawn_position):
