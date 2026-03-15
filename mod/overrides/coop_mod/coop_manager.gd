@@ -81,8 +81,7 @@ var panel: PanelContainer
 var death_overlay: Control
 var death_overlay_title: Label
 var death_overlay_subtitle: Label
-var player_pips_bar: HBoxContainer
-var player_pip_nodes: Dictionary = {}
+
 var local_ip_label: Label
 var status_label: Label
 var address_input: LineEdit
@@ -1618,64 +1617,8 @@ func _serialize_peer_states() -> Array:
     return snapshot
 
 
-const PLAYER_PIP_COLORS: Array = [
-    Color(0.2, 0.85, 1.0),   # cyan
-    Color(1.0, 0.65, 0.0),   # orange
-    Color(0.55, 1.0, 0.3),   # green
-    Color(1.0, 0.35, 0.55),  # pink
-    Color(0.7, 0.5, 1.0),    # purple
-    Color(1.0, 1.0, 0.3),    # yellow
-    Color(1.0, 1.0, 1.0),    # white
-    Color(0.6, 0.6, 0.6),    # gray
-]
-
-
 func _update_player_indicator() -> void:
-    if player_pips_bar == null:
-        return
-
-    if not _has_live_peer() or not _can_sample_player() or peer_states.size() < 2:
-        player_pips_bar.visible = false
-        return
-
-    player_pips_bar.visible = true
-    var my_peer_id: int = multiplayer.get_unique_id()
-    var color_index: int = 0
-
-    # Track which pips are still active
-    var active_peer_ids: Dictionary = {}
-
-    for peer_id in peer_states.keys():
-        var int_peer_id: int = int(peer_id)
-        var state: Dictionary = peer_states[peer_id]
-        if not bool(state.get("active", false)):
-            continue
-
-        active_peer_ids[int_peer_id] = true
-        var pip_color: Color = PLAYER_PIP_COLORS[color_index % PLAYER_PIP_COLORS.size()]
-        color_index += 1
-
-        if not player_pip_nodes.has(int_peer_id):
-            var pip: ColorRect = ColorRect.new()
-            pip.custom_minimum_size = Vector2(10, 10)
-            pip.mouse_filter = Control.MOUSE_FILTER_IGNORE
-            player_pips_bar.add_child(pip)
-            player_pip_nodes[int_peer_id] = pip
-
-        var pip: ColorRect = player_pip_nodes[int_peer_id]
-        if int_peer_id == my_peer_id:
-            # Local player pip is a filled square
-            pip.color = pip_color
-        else:
-            # Remote player pip - slightly transparent
-            pip.color = Color(pip_color.r, pip_color.g, pip_color.b, 0.85)
-
-    # Remove pips for disconnected players
-    for existing_peer_id in player_pip_nodes.keys().duplicate():
-        if not active_peer_ids.has(existing_peer_id):
-            if is_instance_valid(player_pip_nodes[existing_peer_id]):
-                player_pip_nodes[existing_peer_id].queue_free()
-            player_pip_nodes.erase(existing_peer_id)
+    pass
 
 
 func _refresh_markers(states: Dictionary, local_peer_id: int) -> void:
@@ -1997,20 +1940,7 @@ func _build_hud() -> void:
     death_overlay_subtitle.add_theme_color_override("font_color", Color(0.85, 0.85, 0.85))
     death_column.add_child(death_overlay_subtitle)
 
-    # Player pip indicators - small colored circles above the hotbar, Minecraft 1.21+ style
-    player_pips_bar = HBoxContainer.new()
-    player_pips_bar.anchor_left = 0.5
-    player_pips_bar.anchor_right = 0.5
-    player_pips_bar.anchor_top = 1.0
-    player_pips_bar.anchor_bottom = 1.0
-    player_pips_bar.offset_top = -68.0
-    player_pips_bar.offset_bottom = -56.0
-    player_pips_bar.offset_left = -60.0
-    player_pips_bar.offset_right = 60.0
-    player_pips_bar.alignment = BoxContainer.ALIGNMENT_CENTER
-    player_pips_bar.add_theme_constant_override("separation", 4)
-    player_pips_bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
-    overlay.add_child(player_pips_bar)
+
 
     panel = PanelContainer.new()
     panel.visible = false

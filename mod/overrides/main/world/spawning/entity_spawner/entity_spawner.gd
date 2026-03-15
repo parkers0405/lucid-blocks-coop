@@ -61,7 +61,7 @@ func _on_chunk_loaded(chunk_position: Vector3i) -> void :
         return
 
     var spawn_position: Vector3 = Vector3(chunk_position) + Vector3(randf_range(0, 16), randf_range(0, 16), randf_range(0, 16))
-    if not Ref.world.is_position_loaded(spawn_position):
+    if not _is_spawn_position_loaded(spawn_position):
         return
 
     var structure: Structure = Ref.world.get_nearest_structure(spawn_position)
@@ -143,6 +143,18 @@ func _get_spawn_interest_radius() -> float:
     return maxf(spawn_radius + 24.0, Ref.coop_manager.get_same_instance_activity_radius(spawn_radius) + 16.0)
 
 
+func _is_spawn_position_loaded(pos: Vector3) -> bool:
+    # In coop with multi-region, the center_chunk alternates between players.
+    # is_position_loaded may fail on frames where center is on the other player.
+    # Check the native world first, then fall back to session-aware check.
+    if Ref.world.is_position_loaded(pos):
+        return true
+    # If the position is near any session player, treat it as loadable
+    if _can_use_multi_region_logic() and _get_same_instance_player_count() > 1:
+        return Ref.coop_manager.is_position_near_same_instance_player(pos, spawn_radius + 16.0)
+    return false
+
+
 func _is_spawn_region_relevant_to_players(spawn_position: Vector3) -> bool:
     if not _can_use_multi_region_logic():
         return true
@@ -174,11 +186,11 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
         return false
 
     if _can_use_multi_region_logic() and player_count > 1:
-        var local_spawn_cap: int = max_spawns
+        var local_spawn_cap: int = max_spawns * 2
         if spawn_budget_count >= local_spawn_cap:
             return false
 
-    if not Ref.world.is_position_loaded(spawn_position) or Ref.world.get_block_type_at(spawn_position).id != 0:
+    if not _is_spawn_position_loaded(spawn_position) or Ref.world.get_block_type_at(spawn_position).id != 0:
         return false
 
     var structure: Structure = Ref.world.get_nearest_structure(spawn_position)
@@ -214,7 +226,7 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
             return false
 
         spawn_position = floor_raycast.get_collision_point()
-        if not Ref.world.is_position_loaded(spawn_position + Vector3(0, 0.1, 0)) or Ref.world.is_under_water(spawn_position + Vector3(0, 0.1, 0)):
+        if not _is_spawn_position_loaded(spawn_position + Vector3(0, 0.1, 0)) or Ref.world.is_under_water(spawn_position + Vector3(0, 0.1, 0)):
             entity.queue_free()
             return false
 
@@ -271,7 +283,7 @@ func _on_timeout(rare: bool = false) -> void :
         timer.start(maxf(0.15, fail_time / float(player_count)))
     else:
         if not rare:
-            if Ref.world.is_position_loaded(last_spawn_position) and Ref.world.is_within_structure(last_spawn_position):
+            if _is_spawn_position_loaded(last_spawn_position) and Ref.world.is_within_structure(last_spawn_position):
                 timer.start(randf_range(min_time, max_time) / (Ref.world.get_nearest_structure(last_spawn_position).sp_spawn_rate * float(player_count)))
             else:
                 var biome: Biome = Ref.world.generator.get_biome_at_real(last_spawn_position)
