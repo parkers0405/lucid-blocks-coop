@@ -12,11 +12,11 @@ func can_currently_interact(interactor: Entity) -> bool:
 		return false
 	if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(global_position):
 		return false
-	# Allow any player entity to interact, not just Ref.player (host).
-	# In coop, Ref.player is always the local player. The guest's Ref.player
-	# is the guest themselves, so this check naturally works for both.
-	if player_interact_only and not (interactor is Player):
-		return false
+	# Allow any player entity to interact, not just the host's Ref.player.
+	# Check if the interactor is the local player OR a remote player proxy.
+	if player_interact_only:
+		if interactor != Ref.player and not interactor.has_meta("coop_remote_player_proxy"):
+			return false
 	return true
 
 
