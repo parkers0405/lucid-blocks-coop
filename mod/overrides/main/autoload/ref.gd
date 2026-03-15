@@ -96,10 +96,11 @@ func _apply_native_patch_config(config_path: String) -> void:
     if coop_native_patch == null:
         return
 
-    # Always enable native patching with expanded limits for coop.
-    # Default pool: 192 render distance supports two player bubbles at full 96 radius.
-    var instance_radius_cap: int = 192
-    var render_distance: int = 192
+    # Enable native patching. Keep render distance at 96 (default pool size)
+    # to avoid save data bloat. The native hooks handle multi-center awareness
+    # without needing a larger pool — the frame rotation discovers chunks.
+    var instance_radius_cap: int = 96
+    var render_distance: int = 96
 
     # If a config file exists, allow it to override (but we always enable).
     if FileAccess.file_exists(config_path):
