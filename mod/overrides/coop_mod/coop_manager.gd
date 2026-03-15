@@ -1351,6 +1351,8 @@ func _store_guest_persistent_state(player_key: String, player_name: String, save
 
     Ref.save_file_manager.loaded_file.set_data("coop/players/%s/name" % player_key, player_name, true)
     Ref.save_file_manager.loaded_file.set_data("coop/players/%s/save_data" % player_key, save_data.duplicate_deep(), true)
+    # Reset autosave timer so the next autosave cycle writes this to disk promptly
+    autosave_timer = maxf(autosave_timer, AUTOSAVE_INTERVAL - 1.0)
 
 
 func _get_guest_persistent_state(player_key: String) -> Dictionary:
@@ -1715,6 +1717,14 @@ func _ensure_remote_player_proxy(peer_id: int):
     proxy.set_process_input(false)
     proxy.set_process_unhandled_input(false)
 
+    # Remove all collision so the proxy doesn't physically block the host.
+    # The proxy only exists as a target node for mob AI / attack RPC lookups.
+    proxy.collision_layer = 0
+    proxy.collision_mask = 0
+    for child in proxy.get_children():
+        if child is CollisionShape3D:
+            child.disabled = true
+
     var camera = proxy.get_node_or_null("%Camera3D")
     if camera != null:
         camera.current = false
@@ -1731,14 +1741,13 @@ func _ensure_remote_player_proxy(peer_id: int):
     if break_blocks != null:
         break_blocks.enabled = false
 
-    for child in proxy.get_children():
-        if child is CollisionShape3D:
-            child.disabled = false
     var interact_area = proxy.get_node_or_null("%InteractArea3D")
     if interact_area != null:
+        interact_area.monitoring = false
+        interact_area.monitorable = false
         for child in interact_area.get_children():
             if child is CollisionShape3D:
-                child.disabled = false
+                child.disabled = true
 
     remote_player_proxies[peer_id] = proxy
     return proxy
@@ -2218,6 +2227,10 @@ func _on_peer_disconnected(id: int) -> void:
     status_message = "Peer %s disconnected" % id
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
+
+    # Force-save host world so guest persistent state is written to disk
+    if multiplayer.is_server() and _can_share_loaded_world():
+        _autosave_host_world_if_needed()
 
 
 func _on_connected_to_server() -> void:
