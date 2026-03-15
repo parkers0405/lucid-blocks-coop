@@ -1,0 +1,9 @@
+[configuration]
+
+entry_symbol = "coop_native_patch_init"
+compatibility_minimum = "4.6"
+reloadable = false
+
+[libraries]
+
+windows.release.x86_64 = "libcoopnativepatch.windows.template_release.double.x86_64.dll"

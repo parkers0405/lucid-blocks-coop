@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "instance_radius_cap": 192,
+  "instantiate_chunks_render_distance": 192
+}
