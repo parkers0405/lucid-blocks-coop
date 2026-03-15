@@ -1,0 +1,3 @@
+[submodule "native_patch/runtime_extension/godot-cpp"]
+	path = native_patch/runtime_extension/godot-cpp
+	url = https://github.com/godotengine/godot-cpp.git
