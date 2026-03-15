@@ -675,4 +675,9 @@ func get_interact_data(skip_look: bool = false) -> Dictionary:
                         data.target_position = target_position
                         data.target_position_adjacent = (data.target_position + %InteractRayCast3D.get_collision_normal())
 
+    if not ("target" in data) and Ref.coop_manager != null:
+        var synced_target = Ref.coop_manager.get_client_synced_entity_for_interact(data.interact_begin, data.interact_end)
+        if is_instance_valid(synced_target) and not synced_target.disabled and not synced_target.dead:
+            data.target = synced_target
+
     return data

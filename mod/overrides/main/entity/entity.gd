@@ -868,13 +868,19 @@ func distance_process_check() -> void :
         return
 
     var distance: float = Ref.player.global_position.distance_to(global_position)
+    var near_remote_player: bool = false
     if Ref.coop_manager != null and _supports_multi_region_session_world():
-        distance = Ref.coop_manager.get_nearest_session_player_distance(global_position, distance)
+        var session_distance: float = Ref.coop_manager.get_nearest_session_player_distance(global_position, distance)
+        # If mob is closer to a remote player than to host, it's near a remote player
+        if session_distance < distance:
+            near_remote_player = true
+        distance = session_distance
     if distance >= process_distance:
         set_physics_process(false)
         set_process(false)
-
-    elif _should_ignore_visibility_culling() or not disabled_by_visibility or %VisibleOnScreenEnabler3D.is_on_screen():
+    elif near_remote_player or _should_ignore_visibility_culling() or not disabled_by_visibility or %VisibleOnScreenEnabler3D.is_on_screen():
+        # Skip visibility culling for mobs near a remote player — they're off
+        # the host's screen but must stay active for the guest's gameplay.
         disabled = false
         set_physics_process(true)
         set_process(true)

@@ -5,7 +5,7 @@ const DEFAULT_AVATAR_ID: String = "default_blocky"
 const AVATAR_SCENE: String = "res://coop_mod/avatar_assets/rigged_default/low_poly_character.glb"
 const VISUAL_SMOOTHNESS: float = 14.0
 const MAX_ANIMATED_SPEED: float = 4.5
-const HIDE_NEAR_DISTANCE: float = 0.45
+const HIDE_NEAR_DISTANCE: float = 1.8
 const TARGET_AVATAR_HEIGHT: float = 2.05
 const GROUND_OFFSET: float = -0.01
 const MOVE_ANIM_THRESHOLD: float = 0.08
@@ -168,7 +168,10 @@ func _process(delta: float) -> void:
         label.position = Vector3(0.0, _get_label_height() - 0.08 * crouch_amount, 0.0)
 
     if is_instance_valid(Ref.player_camera):
-        visual_root.visible = global_position.distance_to(Ref.player_camera.global_position) > HIDE_NEAR_DISTANCE
+        var far_enough: bool = global_position.distance_to(Ref.player_camera.global_position) > HIDE_NEAR_DISTANCE
+        visual_root.visible = far_enough
+        if held_item_visual != null:
+            held_item_visual.visible = far_enough
     else:
         visual_root.visible = true
 

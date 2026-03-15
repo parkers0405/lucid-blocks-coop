@@ -113,11 +113,43 @@ func _get_same_instance_player_count() -> int:
     return maxi(1, int(Ref.coop_manager.get_same_instance_session_player_count()))
 
 
+func _get_spawn_group_anchors() -> Array:
+    if not _can_use_multi_region_logic() or _get_same_instance_player_count() <= 1:
+        return [Ref.player.global_position]
+
+    var raw_positions: Array = Ref.coop_manager.get_same_instance_session_positions()
+    var grouped_positions: Array = []
+    var merge_distance: float = maxf(spawn_radius, near_distance) * 1.5
+    var merge_distance_squared: float = merge_distance * merge_distance
+
+    for raw_position in raw_positions:
+        if not (raw_position is Vector3):
+            continue
+        var position: Vector3 = raw_position
+        var merged: bool = false
+        for i in range(grouped_positions.size()):
+            var existing: Vector3 = grouped_positions[i]
+            if existing.distance_squared_to(position) <= merge_distance_squared:
+                grouped_positions[i] = existing.lerp(position, 0.5)
+                merged = true
+                break
+        if not merged:
+            grouped_positions.append(position)
+
+    if grouped_positions.is_empty():
+        grouped_positions.append(Ref.player.global_position)
+    return grouped_positions
+
+
+func _get_spawn_group_count() -> int:
+    return maxi(1, _get_spawn_group_anchors().size())
+
+
 func _get_spawn_cap() -> int:
-    var player_count: int = _get_same_instance_player_count()
-    if _can_use_multi_region_logic() and player_count > 1:
-        return max_spawns * player_count * 2
-    return max_spawns * player_count
+    var group_count: int = _get_spawn_group_count()
+    if _can_use_multi_region_logic() and _get_same_instance_player_count() > 1:
+        return max_spawns * group_count * 2
+    return max_spawns * group_count
 
 
 func _get_nearby_spawn_count(spawn_position: Vector3, radius: float) -> int:
@@ -132,7 +164,7 @@ func _get_nearby_spawn_count(spawn_position: Vector3, radius: float) -> int:
 
 
 func _get_spawn_budget_count(spawn_position: Vector3) -> int:
-    if not _can_use_multi_region_logic() or _get_same_instance_player_count() <= 1:
+    if not _can_use_multi_region_logic() or _get_spawn_group_count() <= 1:
         return len(entities)
     return _get_nearby_spawn_count(spawn_position, _get_spawn_interest_radius())
 
@@ -178,14 +210,14 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
         return false
     flush_deleted_entities()
 
-    var player_count: int = _get_same_instance_player_count()
+    var player_count: int = _get_spawn_group_count()
     var spawn_budget_count: int = _get_spawn_budget_count(spawn_position)
     if randf() < clamp((float(spawn_budget_count) / float(player_count)) * soft_limit_growth, 0.0, 0.9):
         return false
     if len(entities) >= _get_spawn_cap():
         return false
 
-    if _can_use_multi_region_logic() and player_count > 1:
+    if _can_use_multi_region_logic() and _get_same_instance_player_count() > 1:
         var local_spawn_cap: int = max_spawns * 2
         if spawn_budget_count >= local_spawn_cap:
             return false
@@ -267,11 +299,11 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
 
 func _on_timeout(rare: bool = false) -> void :
     var timer: Timer = %RareSpawnTimer if rare else %SpawnTimer
-    var player_count: int = _get_same_instance_player_count()
+    var player_count: int = _get_spawn_group_count()
     var spawned: bool = false
 
-    if _can_use_multi_region_logic() and player_count > 1 and not rare:
-        var positions: Array = Ref.coop_manager.get_same_instance_session_positions()
+    if _can_use_multi_region_logic() and _get_same_instance_player_count() > 1 and not rare:
+        var positions: Array = _get_spawn_group_anchors()
         for pos in positions:
             var spawn_pos: Vector3 = _get_spawn_position_near(pos)
             if await attempt_spawn(spawn_pos, false):

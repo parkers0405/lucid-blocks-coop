@@ -74,6 +74,9 @@ var client_state_heartbeat_timer: float = 0.0
 var pending_remote_block_changes: Dictionary = {}
 var pending_remote_water_changes: Dictionary = {}
 var pending_remote_fire_changes: Dictionary = {}
+var host_world_state_sequence: int = 0
+var client_last_world_state_sequence: int = -1
+var host_entity_update_counter: int = 0
 
 var hud: CanvasLayer
 var overlay: Control
@@ -157,6 +160,7 @@ func _physics_process(delta: float) -> void:
     client_state_heartbeat_timer += delta
     if multiplayer.is_server() and world_state_timer >= WORLD_STATE_INTERVAL:
         world_state_timer = 0.0
+        host_world_state_sequence += 1
         for peer_id in peer_states.keys():
             var int_peer_id: int = int(peer_id)
             if int_peer_id == 1:
@@ -164,10 +168,12 @@ func _physics_process(delta: float) -> void:
             var peer_state: Dictionary = peer_states[peer_id]
             if not bool(peer_state.get("active", false)):
                 continue
+            var peer_focus_position: Vector3 = peer_state.get("position", Ref.player.global_position)
             server_world_state.rpc_id(
                 int_peer_id,
-                _capture_host_entity_snapshots(peer_state.get("position", Ref.player.global_position)),
-                []
+                host_world_state_sequence,
+                _capture_host_entity_snapshots(peer_focus_position),
+                _capture_host_drop_snapshots(peer_focus_position)
             )
     elif not multiplayer.is_server() and client_world_sync_ready and guest_persistent_ready and persist_timer >= PERSIST_INTERVAL:
         persist_timer = 0.0
@@ -595,7 +601,6 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
 
     if inventory != null:
         inventory.change_amount(inventory_index, -1)
-    _apply_network_place(block_position, block_id)
     request_place_block.rpc_id(1, block_position, block_id)
     return true
 
@@ -654,7 +659,8 @@ func sync_local_entity_attack(_attack_behavior, target, damage_position: Vector3
 
     var target_uuid: String = _get_sync_uuid(target)
     if target_uuid == "":
-        target_uuid = _assign_sync_uuid(target)
+        print("[lucid-blocks-coop] sync_local_entity_attack missing target uuid")
+        return false
 
     var predicted_damage: int = _get_local_attack_damage()
     _play_client_entity_hit_feedback(target, Ref.player, damage_position, predicted_damage, Ref.player.global_position)
@@ -676,8 +682,6 @@ func sync_local_entity_attack(_attack_behavior, target, damage_position: Vector3
     request_entity_attack.rpc_id(
         1,
         target_uuid,
-        str(target.scene_file_path),
-        target.global_position,
         damage_position,
         Ref.player.global_position,
         Ref.player.velocity,
@@ -2371,22 +2375,34 @@ func _teleport_local_player_near(target_position: Vector3) -> void:
 
 func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, target_pocket_owner_key: String = "", follow_host_position: bool = true) -> void:
     if not _can_share_loaded_world():
+        print("[lucid-blocks-coop] Cannot share world - not ready")
         return
 
     status_message = "Sending world to peer %s" % peer_id
+    print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
 
+    print("[lucid-blocks-coop] Saving file before snapshot...")
     await Ref.save_file_manager.save_file(false)
+    print("[lucid-blocks-coop] Save complete, building snapshot...")
 
     var register_data: Dictionary = Ref.save_file_manager.loaded_file_register.data.duplicate_deep()
     var actual_dimension: int = target_dimension if target_dimension >= 0 else int(Ref.world.current_dimension)
     register_data["dimension"] = actual_dimension
     register_data["pocket_owner_key"] = target_pocket_owner_key if actual_dimension == int(LucidBlocksWorld.Dimension.POCKET) else ""
 
+    print("[lucid-blocks-coop] Serializing register data...")
     var register_json: String = JSON.stringify(JSON.from_native(register_data))
+    print("[lucid-blocks-coop] Register JSON size: %d" % register_json.length())
+
+    print("[lucid-blocks-coop] Serializing save data (keys: %d)..." % Ref.save_file_manager.loaded_file.data.size())
     var save_json: String = JSON.stringify(JSON.from_native(Ref.save_file_manager.loaded_file.data))
+    print("[lucid-blocks-coop] Save JSON size: %d" % save_json.length())
+
+    print("[lucid-blocks-coop] Compressing...")
     var save_buffer: PackedByteArray = save_json.to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)
     var chunk_count: int = maxi(1, int(ceil(float(save_buffer.size()) / float(SNAPSHOT_CHUNK_SIZE))))
+    print("[lucid-blocks-coop] Compressed size: %d, chunks: %d" % [save_buffer.size(), chunk_count])
 
     begin_host_world_snapshot.rpc_id(peer_id, register_json, chunk_count, Ref.player.global_position, follow_host_position)
     for chunk_index in range(chunk_count):
@@ -2395,6 +2411,7 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
         host_world_snapshot_chunk.rpc_id(peer_id, chunk_index, save_buffer.slice(start, end))
     finish_host_world_snapshot.rpc_id(peer_id)
 
+    print("[lucid-blocks-coop] Snapshot sent to peer %s (%d chunks)" % [peer_id, chunk_count])
     status_message = "Peer %s joined host world" % peer_id
     _update_status_text()
 
@@ -2684,6 +2701,7 @@ func _disable_client_local_preserve_entity_loading() -> void:
 func _clear_client_world_entities_and_drops() -> void:
     synced_entities.clear()
     synced_dropped_items.clear()
+    client_last_world_state_sequence = -1
 
     for child in get_tree().get_root().get_children():
         if child is Player:
@@ -2713,9 +2731,12 @@ func _capture_host_entity_snapshots(focus_position: Vector3) -> Array:
         if uuid == "" or entity.scene_file_path == "":
             continue
 
+        host_entity_update_counter += 1
+
         var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
         snapshots.append([
             uuid,
+            host_entity_update_counter,
             entity.scene_file_path,
             entity.global_position,
             rotation_pivot.rotation.y if rotation_pivot != null else entity.rotation.y,
@@ -2772,6 +2793,14 @@ func _capture_entity_special_state(entity) -> Dictionary:
     if _object_has_property(entity, "state"):
         state_payload["state"] = int(entity.get("state"))
 
+    var compact_anim_state: Dictionary = _capture_compact_animation_state(entity)
+    if not compact_anim_state.is_empty():
+        state_payload["compact_anim"] = compact_anim_state
+
+    var active_anim_players: Array = _capture_active_animation_players(entity)
+    if not active_anim_players.is_empty():
+        state_payload["active_anim_players"] = active_anim_players
+
     if scene_path.contains("/entity/mimic/"):
         var copy_id: int = entity.copy_block.id if entity.copy_block != null else 0
         state_payload["kind"] = "mimic"
@@ -2822,11 +2851,133 @@ func _apply_entity_special_state(entity, special_state: Dictionary) -> void:
             if copy_id > 0:
                 entity.copy_block = ItemMap.map(copy_id)
 
+    if special_state.has("compact_anim") and special_state["compact_anim"] is Dictionary:
+        entity.set_meta("coop_explicit_anim_tree", true)
+        _apply_compact_animation_state(entity, special_state["compact_anim"])
+    else:
+        entity.set_meta("coop_explicit_anim_tree", false)
+
+    if special_state.has("active_anim_players") and special_state["active_anim_players"] is Array:
+        _apply_active_animation_players(entity, special_state["active_anim_players"])
+
     if state_changed and entity.has_method("initialize_state"):
         entity.initialize_state()
 
 
-func _apply_client_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
+func _capture_compact_animation_state(root: Node) -> Dictionary:
+    var animation_tree := _find_first_animation_tree(root)
+    if animation_tree == null:
+        return {}
+
+    var state: Dictionary = {}
+    var tracked_blends := {
+        "walk": "parameters/walk/blend_amount",
+        "run": "parameters/run/blend_amount",
+        "fear": "parameters/fear/blend_amount",
+        "hurt": "parameters/hurt/blend_amount",
+        "crucify": "parameters/crucify/blend_amount",
+    }
+    for key in tracked_blends.keys():
+        var property_path: String = tracked_blends[key]
+        if _animation_tree_has_parameter(animation_tree, property_path):
+            state[key] = float(animation_tree.get(property_path))
+
+    var tracked_requests := {
+        "attack": "parameters/attack/request",
+        "shoot": "parameters/shoot/request",
+        "interact": "parameters/interact/request",
+    }
+    for key in tracked_requests.keys():
+        var request_path: String = tracked_requests[key]
+        if _animation_tree_has_parameter(animation_tree, request_path):
+            var request_value: int = int(animation_tree.get(request_path))
+            if request_value != 0:
+                state[key] = request_value
+    return state
+
+
+func _apply_compact_animation_state(root: Node, state: Dictionary) -> void:
+    var animation_tree := _find_first_animation_tree(root)
+    if animation_tree == null or state.is_empty():
+        return
+
+    var request_cache: Dictionary = root.get_meta("coop_anim_request_cache", {}) if root.has_meta("coop_anim_request_cache") else {}
+    var tracked_blends := {
+        "walk": "parameters/walk/blend_amount",
+        "run": "parameters/run/blend_amount",
+        "fear": "parameters/fear/blend_amount",
+        "hurt": "parameters/hurt/blend_amount",
+        "crucify": "parameters/crucify/blend_amount",
+    }
+    for key in tracked_blends.keys():
+        if not state.has(key):
+            continue
+        var property_path: String = tracked_blends[key]
+        if _animation_tree_has_parameter(animation_tree, property_path):
+            animation_tree.set(property_path, float(state[key]))
+
+    var tracked_requests := {
+        "attack": "parameters/attack/request",
+        "shoot": "parameters/shoot/request",
+        "interact": "parameters/interact/request",
+    }
+    for key in tracked_requests.keys():
+        if not state.has(key):
+            continue
+        var request_path: String = tracked_requests[key]
+        if not _animation_tree_has_parameter(animation_tree, request_path):
+            continue
+        var request_value: int = int(state[key])
+        var previous_value: Variant = request_cache.get(request_path, null)
+        if previous_value == request_value and request_value != 0:
+            continue
+        request_cache[request_path] = request_value
+        animation_tree.set(request_path, request_value)
+    root.set_meta("coop_anim_request_cache", request_cache)
+
+
+func _capture_active_animation_players(root: Node) -> Array:
+    var players: Array = []
+    _collect_active_animation_players(root, root, players)
+    return players
+
+
+func _collect_active_animation_players(root: Node, node: Node, players: Array) -> void:
+    if node is AnimationPlayer:
+        var animation_player := node as AnimationPlayer
+        if animation_player.current_animation != "" and animation_player.is_playing():
+            players.append([
+                str(root.get_path_to(animation_player)),
+                str(animation_player.current_animation),
+                float(animation_player.current_animation_position),
+                float(animation_player.speed_scale),
+            ])
+    for child in node.get_children():
+        _collect_active_animation_players(root, child, players)
+
+
+func _apply_active_animation_players(root: Node, players: Array) -> void:
+    for entry in players:
+        if not (entry is Array) or entry.size() < 4:
+            continue
+        var node_path := NodePath(str(entry[0]))
+        var animation_name: String = str(entry[1])
+        var animation_position: float = float(entry[2])
+        var animation_speed: float = float(entry[3])
+        var animation_player := root.get_node_or_null(node_path) as AnimationPlayer
+        if animation_player == null:
+            continue
+        if not animation_player.has_animation(animation_name):
+            continue
+        animation_player.play(animation_name)
+        animation_player.speed_scale = animation_speed
+        animation_player.seek(animation_position, true)
+
+
+func _apply_client_world_state(sequence: int, entity_snapshots: Array, drop_snapshots: Array) -> void:
+    if sequence <= client_last_world_state_sequence:
+        return
+    client_last_world_state_sequence = sequence
     _prepare_client_world_sync()
     _apply_client_entity_snapshots(entity_snapshots)
     if not drop_snapshots.is_empty():
@@ -2837,15 +2988,16 @@ func _apply_client_entity_snapshots(entity_snapshots: Array) -> void:
     var visible_uuids: Dictionary = {}
 
     for entry in entity_snapshots:
-        if not (entry is Array) or entry.size() < 5:
+        if not (entry is Array) or entry.size() < 6:
             continue
 
         var uuid: String = str(entry[0])
-        var scene_path: String = str(entry[1])
-        var entity_position: Vector3 = entry[2]
-        var entity_yaw: float = float(entry[3])
-        var entity_velocity: Vector3 = entry[4]
-        var special_state: Dictionary = entry[5] if entry.size() >= 6 and entry[5] is Dictionary else {}
+        var update_stamp: int = int(entry[1])
+        var scene_path: String = str(entry[2])
+        var entity_position: Vector3 = entry[3]
+        var entity_yaw: float = float(entry[4])
+        var entity_velocity: Vector3 = entry[5]
+        var special_state: Dictionary = entry[6] if entry.size() >= 7 and entry[6] is Dictionary else {}
         if uuid == "" or scene_path == "":
             continue
 
@@ -2861,6 +3013,12 @@ func _apply_client_entity_snapshots(entity_snapshots: Array) -> void:
             entity = _spawn_client_synced_entity(uuid, scene_path)
         if not is_instance_valid(entity):
             continue
+
+        var last_stamp: int = int(entity.get_meta("coop_update_stamp", -1))
+        if update_stamp <= last_stamp:
+            visible_uuids[uuid] = true
+            continue
+        entity.set_meta("coop_update_stamp", update_stamp)
 
         synced_entities[uuid] = entity
         visible_uuids[uuid] = true
@@ -3030,10 +3188,17 @@ func _configure_client_synced_entity(entity, uuid: String) -> void:
     entity.set_meta("coop_synced_entity", true)
     if entity is Entity:
         entity.disabled = false
-        entity.invincible = false
-        entity.invincible_temporary = false
+        entity.disabled_by_visibility = false
+        entity.movement_enabled = false
+        entity.invincible = true
+        entity.invincible_temporary = true
+        entity.velocity = Vector3.ZERO
+        entity.movement_velocity = Vector3.ZERO
+    if entity is CollisionObject3D:
+        (entity as CollisionObject3D).collision_layer = 0
+        (entity as CollisionObject3D).collision_mask = 0
     entity.set_physics_process(false)
-    entity.set_process(true)
+    entity.set_process(false)
     _strip_client_entity_ai(entity)
     _restore_client_entity_animations(entity)
     if not client_synced_entity_list.has(entity):
@@ -3065,7 +3230,7 @@ func _strip_ai_recursive(node: Node) -> void:
         if child is AnimationPlayer or child is AnimationTree or child is Skeleton3D or child is MeshInstance3D:
             pass
         elif child is CollisionShape3D or child is CollisionPolygon3D:
-            pass
+            child.set_deferred("disabled", true)
         elif child.name == "Behaviors":
             pass
         elif child is RayCast3D:
@@ -3077,11 +3242,23 @@ func _strip_ai_recursive(node: Node) -> void:
         elif child is Area3D:
             (child as Area3D).monitoring = false
             (child as Area3D).monitorable = false
+            for area_child in child.get_children():
+                if area_child is CollisionShape3D or area_child is CollisionPolygon3D:
+                    area_child.set_deferred("disabled", true)
         elif child is Timer:
             if child.name != "DirectDamageTimer" and child.name != "InvincibleTimer":
                 (child as Timer).stop()
+                child.process_mode = Node.PROCESS_MODE_DISABLED
+        elif child is AudioStreamPlayer or child is AudioStreamPlayer3D:
+            child.process_mode = Node.PROCESS_MODE_DISABLED
+        elif child is GPUParticles3D or child is CPUParticles3D:
+            child.process_mode = Node.PROCESS_MODE_DISABLED
         elif child is VisibleOnScreenNotifier3D or child is VisibleOnScreenEnabler3D:
-            pass
+            child.process_mode = Node.PROCESS_MODE_DISABLED
+        elif child is CollisionObject3D:
+            (child as CollisionObject3D).collision_layer = 0
+            (child as CollisionObject3D).collision_mask = 0
+            _strip_ai_recursive(child)
         else:
             _strip_ai_recursive(child)
 
@@ -3108,13 +3285,13 @@ func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw:
     if not is_instance_valid(entity) or not entity.is_inside_tree():
         return
 
-    var predicted_position: Vector3 = entity_position + entity_velocity * WORLD_STATE_INTERVAL * 0.5
+    var predicted_position: Vector3 = entity_position + entity_velocity * WORLD_STATE_INTERVAL * 0.08
     if not bool(entity.get_meta("coop_snapshot_initialized", false)):
         entity.global_position = predicted_position
         entity.set_meta("coop_snapshot_initialized", true)
     else:
         var distance_error: float = entity.global_position.distance_to(predicted_position)
-        if distance_error > 8.0:
+        if distance_error > 1.5:
             entity.global_position = predicted_position
 
     entity.set_meta("coop_target_position", predicted_position)
@@ -3129,6 +3306,8 @@ func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw:
 
 
 func _update_client_entity_visuals(entity, entity_velocity: Vector3) -> void:
+    if bool(entity.get_meta("coop_explicit_anim_tree", false)):
+        return
     var animation_tree := _find_first_animation_tree(entity)
     if animation_tree == null:
         return
@@ -3164,16 +3343,13 @@ func _interpolate_one_synced_entity(entity, delta: float) -> void:
     var distance_to_target: float = to_target.length()
     var speed: float = target_vel.length()
 
-    if distance_to_target < 0.01:
-        entity.global_position = current_pos + target_vel * delta
-    elif distance_to_target > 8.0:
+    if distance_to_target < 0.02:
+        entity.global_position = target_pos
+    elif distance_to_target > 1.5:
         entity.global_position = target_pos
     else:
-        var move_speed: float = maxf(speed, distance_to_target / WORLD_STATE_INTERVAL) * delta
-        if move_speed >= distance_to_target:
-            entity.global_position = target_pos + target_vel * delta * 0.3
-        else:
-            entity.global_position = current_pos + to_target.normalized() * move_speed + target_vel * delta * 0.2
+        var corrected_target: Vector3 = target_pos + target_vel * minf(delta, WORLD_STATE_INTERVAL * 0.25)
+        entity.global_position = current_pos.lerp(corrected_target, clampf(delta * 22.0, 0.0, 1.0))
 
     var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
     var yaw_blend: float = clampf(delta * 12.0, 0.0, 1.0)
@@ -3224,24 +3400,6 @@ func _find_host_entity_by_uuid(uuid: String):
         if child is Entity and not (child is Player) and _get_sync_uuid(child) == uuid:
             return child
     return null
-
-
-func _find_host_entity_by_scene_and_position(scene_path: String, world_position: Vector3, max_distance: float = 6.0):
-    var nearest = null
-    var nearest_distance_squared: float = max_distance * max_distance
-    for child in get_tree().get_root().get_children():
-        if not (child is Entity) or child is Player or not child.is_inside_tree():
-            continue
-        if scene_path != "" and str(child.scene_file_path) != scene_path:
-            continue
-
-        var distance_squared: float = child.global_position.distance_squared_to(world_position)
-        if distance_squared > nearest_distance_squared:
-            continue
-
-        nearest = child
-        nearest_distance_squared = distance_squared
-    return nearest
 
 
 func _force_session_entity_active(target) -> void:
@@ -3508,17 +3666,18 @@ func submit_client_state(active: bool, dimension: int, dimension_instance_key: S
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_entity_attack(target_uuid: String, target_scene_path: String, target_position: Vector3, damage_position: Vector3, attacker_position: Vector3, attacker_velocity: Vector3, held_item_id: int, damage: int, fire_aspect: bool, knockback_strength: float, fly_strength: float) -> void:
+func request_entity_attack(target_uuid: String, damage_position: Vector3, attacker_position: Vector3, attacker_velocity: Vector3, held_item_id: int, damage: int, fire_aspect: bool, knockback_strength: float, fly_strength: float) -> void:
     if not multiplayer.is_server():
         return
 
     var sender_id: int = multiplayer.get_remote_sender_id()
+    if target_uuid == "":
+        print("[lucid-blocks-coop] request_entity_attack rejected empty uuid from peer=%s" % sender_id)
+        return
     var target = _find_host_entity_by_uuid(target_uuid)
-    if target == null:
-        target = _find_host_entity_by_scene_and_position(target_scene_path, target_position)
     if target == null or target.dead or target.direct_damage_cooldown:
         if target == null:
-            print("[lucid-blocks-coop] request_entity_attack target not found uuid=%s scene=%s pos=%s" % [target_uuid, target_scene_path, str(target_position)])
+            print("[lucid-blocks-coop] request_entity_attack target not found uuid=%s peer=%s" % [target_uuid, sender_id])
         return
 
     if target.disabled:
@@ -3558,6 +3717,8 @@ func request_entity_attack(target_uuid: String, target_scene_path: String, targe
         var target_to_attacker: Vector3 = (attacker_position - target.global_position).normalized()
         target.get_node("%Bleed").bleed(damage_position, target_to_attacker, actual_damage)
 
+    sync_entity_hit_feedback.rpc_id(sender_id, target_uuid, damage_position, attacker_position, actual_damage)
+
     for peer_id in peer_states.keys():
         var int_peer_id: int = int(peer_id)
         if int_peer_id == 1 or int_peer_id == sender_id:
@@ -3565,6 +3726,7 @@ func request_entity_attack(target_uuid: String, target_scene_path: String, targe
         sync_entity_hit_feedback.rpc_id(int_peer_id, target_uuid, damage_position, attacker_position, actual_damage)
 
     if fire_aspect:
+        sync_entity_ignite.rpc_id(sender_id, target_uuid)
         for peer_id in peer_states.keys():
             var int_peer_id: int = int(peer_id)
             if int_peer_id == 1:
@@ -3891,12 +4053,12 @@ func sync_remove_drop(drop_uuid: String) -> void:
     _cleanup_local_preview_drops()
 
 
-@rpc("authority", "call_remote", "unreliable")
-func server_world_state(entity_snapshots: Array, drop_snapshots: Array) -> void:
+@rpc("authority", "call_remote", "reliable")
+func server_world_state(sequence: int, entity_snapshots: Array, drop_snapshots: Array) -> void:
     if multiplayer.is_server() or receiving_host_world or _is_local_world_authority():
         return
     _mark_host_contact()
-    _apply_client_world_state(entity_snapshots, drop_snapshots)
+    _apply_client_world_state(sequence, entity_snapshots, drop_snapshots)
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -3955,7 +4117,7 @@ func send_tiamana_reward(amount: int) -> void:
         level_node.give_tiamana(amount, 1)
 
 
-@rpc("authority", "call_remote", "unreliable")
+@rpc("authority", "call_remote", "reliable")
 func sync_entity_hit_feedback(target_uuid: String, damage_position: Vector3, attacker_position: Vector3, damage: int) -> void:
     if multiplayer.is_server():
         return
