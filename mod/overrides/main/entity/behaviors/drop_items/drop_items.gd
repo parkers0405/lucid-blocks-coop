@@ -16,6 +16,8 @@ func _ready() -> void:
 func drop_and_remove_from_inventory(inventory: Inventory, index: int) -> void:
     if entity.disabled or not enabled:
         return
+    if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
+        return
 
     var to_drop: ItemState = inventory.items[index]
     if to_drop != null:
@@ -27,6 +29,8 @@ func drop_and_remove_from_inventory(inventory: Inventory, index: int) -> void:
 
 func drop_item(item: ItemState, override_disable: bool = false) -> void:
     if not override_disable and (entity.disabled or not enabled):
+        return
+    if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
         return
     %PopPlayer.play()
 

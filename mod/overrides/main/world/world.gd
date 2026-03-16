@@ -30,6 +30,7 @@ var buffer_instance_radius: int = 80
 var fps_cap: int = 60
 var current_seed: int
 var even: bool = false
+var coop_perf_override_active: bool = false
 
 var environment_speed_multiplier: float = 1.0
 
@@ -68,6 +69,20 @@ func _on_settings_updated() -> void :
     instance_radius = int(Ref.save_file_manager.settings_file.get_data("render_distance", 80.0))
     Ref.world.force_reload()
     RenderingServer.viewport_set_scaling_3d_scale(get_viewport().get_viewport_rid(), Ref.save_file_manager.settings_file.get_data("render_scale", 100) / 100.0)
+    _apply_frame_pacing_settings()
+
+
+func _is_coop_perf_override_active() -> bool:
+    return Ref.coop_manager != null and (Ref.coop_manager.is_client_session() or Ref.coop_manager.has_connected_remote_peers())
+
+
+func _apply_frame_pacing_settings() -> void:
+    coop_perf_override_active = _is_coop_perf_override_active()
+    if coop_perf_override_active:
+        DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+        fps_cap = 0
+        Engine.max_fps = 0
+        return
 
     DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ENABLED if Ref.save_file_manager.settings_file.get_data("vsync_enabled", true) else DisplayServer.VSYNC_DISABLED)
     fps_cap = Ref.save_file_manager.settings_file.get_data("fps_cap", 60)
@@ -77,9 +92,10 @@ func _on_settings_updated() -> void :
 func _notification(what: int) -> void :
     match what:
         MainLoop.NOTIFICATION_APPLICATION_FOCUS_OUT:
-            Engine.max_fps = 15
+            if not _is_coop_perf_override_active():
+                Engine.max_fps = 15
         MainLoop.NOTIFICATION_APPLICATION_FOCUS_IN:
-            Engine.max_fps = fps_cap
+            _apply_frame_pacing_settings()
 
 
 func _physics_process(_delta: float) -> void :
@@ -97,6 +113,9 @@ func _physics_process(_delta: float) -> void :
 
 func _process(_delta: float) -> void :
     simulate_frame = true
+    var coop_override_now: bool = _is_coop_perf_override_active()
+    if coop_override_now != coop_perf_override_active:
+        _apply_frame_pacing_settings()
 
 
 func _input(event: InputEvent) -> void :

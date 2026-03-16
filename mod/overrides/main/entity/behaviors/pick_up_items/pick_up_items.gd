@@ -24,6 +24,8 @@ func _on_refresh_timer() -> void:
 func _on_dropped_item_entered(area: Area3D) -> void:
     if not enabled or entity.dead or entity.disabled:
         return
+    if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
+        return
     if not area.get_parent() is DroppedItem:
         return
     var dropped_item: DroppedItem = area.get_parent() as DroppedItem
@@ -55,6 +57,8 @@ func _on_dropped_item_entered(area: Area3D) -> void:
 
 
 func accept_item(item_state: ItemState, override_disable: bool = false) -> void:
+    if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
+        return
     var remaining_item: ItemState
 
     if is_instance_valid(inventory_secondary):

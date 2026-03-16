@@ -45,6 +45,8 @@ func _on_progress_effect() -> void :
 
 
 func drop_item() -> void :
+    if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
+        return
     if block.pickaxe_required and not pickaxe:
         return
     if block.axe_required and not axe:
@@ -79,6 +81,8 @@ func drop_item() -> void :
 func break_block_instant(block_position: Vector3i) -> void :
     if entity.disabled or not enabled:
         return
+    if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
+        return
 
     if (Ref.world.is_position_loaded(block_position) and not Ref.world.get_block_type_at(block_position).id == 0) or Ref.world.get_block_type_at(block_position).internal_name == "cutscene block":
         active_position = block_position
@@ -101,6 +105,8 @@ func break_block_instant(block_position: Vector3i) -> void :
 
 
 func break_block_start(block_position: Vector3i) -> void :
+    if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
+        return
     if not Ref.world.is_position_loaded(block_position) or Ref.world.get_block_type_at(block_position).id == 0 or (Ref.world.get_block_type_at(block_position).unbreakable and not Ref.main.creative):
         return
     if breaking:

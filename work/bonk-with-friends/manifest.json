@@ -1,0 +1,9 @@
+{
+  "name": "BonkWithFriends",
+  "version_number": "0.3.2",
+  "website_url": "",
+  "description": "Seamless P2P multiplayer mod for Megabonk using Steamworks.",
+  "dependencies": [
+    "BepInEx-BepInExPack_IL2CPP-6.0.738"
+  ]
+}
