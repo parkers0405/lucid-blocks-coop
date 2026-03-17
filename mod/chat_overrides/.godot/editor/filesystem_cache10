@@ -1,0 +1,9 @@
+63f7b34db8d8cdea90c76aacccf841ec
+::res://::1773695852
+dummy.tscn::PackedScene::-1::1773695775::0::1::::<><><>0<>0<><>::
+export_presets.cfg::TextFile::-1::1773695775::0::1::::<><><>0<>0<><>::
+::res://chat_mod/::1773696754
+command_chat_manager.gd::GDScript::5099149537261426323::1773700129::0::1::::<>Node<><>0<>0<><>::
+::res://main/::1773695775
+::res://main/autoload/::1773695855
+ref.gd::GDScript::3645111292903829596::1773695824::0::1::::<>Node<><>0<>0<><>::

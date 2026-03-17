@@ -2,8 +2,16 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-source "$SCRIPT_DIR/common.sh"
+DEFAULT_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+
+resolve_game_exe() {
+  local game_exe="${GAME_EXE:-$DEFAULT_GAME_EXE}"
+  if [[ ! -f "$game_exe" ]]; then
+    printf 'Lucid Blocks executable not found: %s\n' "$game_exe" >&2
+    return 1
+  fi
+  printf '%s\n' "$game_exe"
+}
 
 GAME_EXE=$(resolve_game_exe)
 STEAM_ROOT="${STEAM_ROOT:-/home/parkersettle/.local/share/Steam}"
