@@ -40,6 +40,39 @@ var desired_direction: Vector3
 var desired_angle: float = 0.0
 var attack_speed_modifier: float = 1.0
 var direction_to_player: Vector3
+var forced_session_target = null
+
+
+func _debug_state_name(value: int) -> String:
+    match value:
+        IDLE:
+            return "IDLE"
+        CHASE:
+            return "CHASE"
+        WARY:
+            return "WARY"
+        CRUCIFY:
+            return "CRUCIFY"
+    return str(value)
+
+
+func _debug_target_label(target) -> String:
+    if not is_instance_valid(target):
+        return "<null>"
+    var label := "%s:%s" % [target.name, target.get_class()]
+    if Ref.coop_manager != null and Ref.coop_manager.is_remote_player_proxy(target):
+        label += ":remote_peer=%s" % Ref.coop_manager.get_remote_player_proxy_peer_id(target)
+    if "disabled" in target:
+        label += ":disabled=%s" % str(bool(target.disabled))
+    if "dead" in target:
+        label += ":dead=%s" % str(bool(target.dead))
+    return label
+
+
+func _debug_log(message: String) -> void:
+    if not _use_session_targeting():
+        return
+    print("[lucid-blocks-coop][manikin-debug] ", message)
 
 
 func _ready() -> void:
@@ -116,7 +149,12 @@ func distance_process_check() -> void:
         distance = session_distance
 
     if has_node("%VisibleOnScreenEnabler3D"):
-        %VisibleOnScreenEnabler3D.enable_node_path = "" if near_session_player or not disabled_by_visibility else ".."
+        if _use_session_targeting():
+            %VisibleOnScreenEnabler3D.enable_node_path = ""
+            %VisibleOnScreenEnabler3D.process_mode = Node.PROCESS_MODE_DISABLED
+        else:
+            %VisibleOnScreenEnabler3D.enable_node_path = "" if near_session_player or not disabled_by_visibility else ".."
+            %VisibleOnScreenEnabler3D.process_mode = Node.PROCESS_MODE_INHERIT
     if near_session_player:
         disabled = false
 
@@ -137,30 +175,110 @@ func _has_session_player_target() -> bool:
 
 
 func _has_active_target() -> bool:
-    return (is_instance_valid(player) and not player.dead) or _has_session_player_target()
+    return _is_target_active(player) or _has_session_player_target()
+
+
+func _is_target_active(target) -> bool:
+    return is_instance_valid(target) and not target.dead and not target.disabled
+
+
+func _get_forced_session_target():
+    if not _is_target_active(forced_session_target) or not _is_session_player_entity(forced_session_target):
+        forced_session_target = null
+        return null
+    return forced_session_target
 
 
 func _get_target_position() -> Vector3:
-    var fallback: Vector3 = player.global_position if is_instance_valid(player) else global_position
+    var preferred_target = _get_forced_session_target()
+    if not is_instance_valid(preferred_target):
+        preferred_target = player
+    var fallback: Vector3 = preferred_target.global_position if is_instance_valid(preferred_target) else global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_preferred_session_player_position(global_position, player, fallback)
+    return Ref.coop_manager.get_preferred_session_player_position(global_position, preferred_target, fallback)
 
 
 func _get_target_head_position() -> Vector3:
     var fallback: Vector3 = global_position + Vector3(0, 1.45, 0)
-    if is_instance_valid(player) and is_instance_valid(player.head):
-        fallback = player.head.global_position
+    var preferred_target = _get_forced_session_target()
+    if not is_instance_valid(preferred_target):
+        preferred_target = player
+    if is_instance_valid(preferred_target) and is_instance_valid(preferred_target.head):
+        fallback = preferred_target.head.global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_preferred_session_player_head_position(global_position, player, fallback)
+    return Ref.coop_manager.get_preferred_session_player_head_position(global_position, preferred_target, fallback)
 
 
 func _get_session_target_player():
-    var fallback = player if is_instance_valid(player) else Ref.player
+    var preferred_target = _get_forced_session_target()
+    if not is_instance_valid(preferred_target):
+        preferred_target = player
+    var fallback = preferred_target if is_instance_valid(preferred_target) else Ref.player
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_preferred_session_player_entity(global_position, player, fallback)
+    return Ref.coop_manager.get_preferred_session_player_entity(global_position, preferred_target, fallback)
+
+
+func get_coop_locked_target_peer_id() -> int:
+    var locked_target = _get_forced_session_target()
+    if not _use_session_targeting() or not is_instance_valid(locked_target):
+        return -1
+    if not Ref.coop_manager.is_remote_player_proxy(locked_target):
+        return -1
+    return Ref.coop_manager.get_remote_player_proxy_peer_id(locked_target)
+
+
+func _force_session_runtime_active() -> void:
+    if not _use_session_targeting():
+        return
+
+    disabled = false
+    process_mode = Node.PROCESS_MODE_ALWAYS
+    set_process(true)
+    set_physics_process(true)
+
+    if has_node("%VisibleOnScreenEnabler3D"):
+        %VisibleOnScreenEnabler3D.enable_node_path = ""
+        %VisibleOnScreenEnabler3D.process_mode = Node.PROCESS_MODE_DISABLED
+
+    if anim != null:
+        anim.process_mode = Node.PROCESS_MODE_ALWAYS
+        anim.active = true
+    var animation_player := %ManikinModel.get_node_or_null("AnimationPlayer") as AnimationPlayer
+    if animation_player != null:
+        animation_player.process_mode = Node.PROCESS_MODE_ALWAYS
+
+
+func _promote_session_attacker(attacker) -> void:
+    var session_target = attacker
+    if not _is_session_player_entity(session_target) and is_instance_valid(session_target) and session_target is Player:
+        session_target = attacker
+    if not _is_session_player_entity(session_target):
+        session_target = _get_session_target_player()
+    if not is_instance_valid(session_target):
+        return
+
+    player = session_target
+    attack_target = session_target
+    forced_session_target = session_target
+    hostility = maxf(hostility, 1.0)
+    friend_hostility = maxf(friend_hostility, 0.25)
+    interest_place = _get_target_position()
+    desired_direction = interest_place - global_position
+    desired_direction.y = 0.0
+    if desired_direction.length_squared() > 0.0001:
+        desired_direction = desired_direction.normalized()
+    _force_session_runtime_active()
+    if state != CHASE:
+        switch_state(CHASE)
+    _debug_log("promote attacker=%s forced=%s player=%s" % [
+        _debug_target_label(attacker),
+        _debug_target_label(forced_session_target),
+        _debug_target_label(player),
+    ])
+    attack()
 
 
 func get_random_flat_vector() -> Vector3:
@@ -175,14 +293,8 @@ func _on_fired() -> void:
 
 
 func _on_attacked(attacker) -> void:
-    if _is_session_player_entity(attacker):
-        player = attacker
-        attack_target = attacker
-        hostility += 1.0
-        friend_hostility += 0.25
-        if state == IDLE or state == CRUCIFY:
-            interest_place = _get_target_position() + get_random_flat_vector() * wary_range
-            switch_state(WARY)
+    if _is_session_player_entity(attacker) or (is_instance_valid(attacker) and attacker is Player):
+        _promote_session_attacker(attacker)
 
     if randf() < jump_attack_chance:
         will_jump = true
@@ -216,8 +328,16 @@ func _on_attack_timeout() -> void:
 func _on_attack_entered(body: PhysicsBody3D) -> void:
     if dead or state != CHASE:
         return
+    var locked_target = _get_forced_session_target()
+    if is_instance_valid(locked_target) and body != locked_target:
+        _debug_log("ignore attack-enter body=%s locked=%s" % [
+            _debug_target_label(body),
+            _debug_target_label(locked_target),
+        ])
+        return
 
     attack_target = body as Entity
+    _debug_log("attack-enter target=%s" % _debug_target_label(attack_target))
     attack()
 
 
@@ -225,7 +345,8 @@ func _on_attack_exited(body: PhysicsBody3D) -> void:
     if dead or not is_inside_tree() or not has_node("%RotationPivot/AttackArea3D") or not %RotationPivot / AttackArea3D.owner:
         return
     if body == attack_target:
-        attack_target = null
+        var locked_target = _get_forced_session_target()
+        attack_target = locked_target if is_instance_valid(locked_target) else null
 
 
 func _on_player_entered(body: PhysicsBody3D) -> void:
@@ -233,8 +354,21 @@ func _on_player_entered(body: PhysicsBody3D) -> void:
         return
     if not _is_session_player_entity(body):
         return
+    var locked_target = _get_forced_session_target()
+    if is_instance_valid(locked_target) and body != locked_target:
+        _debug_log("ignore detect-enter body=%s locked=%s" % [
+            _debug_target_label(body),
+            _debug_target_label(locked_target),
+        ])
+        return
+    _force_session_runtime_active()
     player = body
+    attack_target = body
     interest_place = _get_target_position() + get_random_flat_vector() * wary_range
+    _debug_log("detect-enter player=%s attack_target=%s" % [
+        _debug_target_label(player),
+        _debug_target_label(attack_target),
+    ])
     switch_state(WARY)
 
 
@@ -242,6 +376,8 @@ func _on_player_exited(body: PhysicsBody3D) -> void:
     if dead or not is_inside_tree() or not has_node("%DetectionArea3D") or not %DetectionArea3D.owner:
         return
     if body != player:
+        return
+    if body == _get_forced_session_target():
         return
 
     interest_place = _get_target_position()
@@ -261,11 +397,18 @@ func _physics_process(delta: float) -> void:
         move_and_slide()
 
     if _use_session_targeting() and _has_session_player_target():
+        _force_session_runtime_active()
+        var locked_target = _get_forced_session_target()
         var session_target = _get_session_target_player()
         if is_instance_valid(session_target):
             player = session_target
-            if state == CHASE or not is_instance_valid(attack_target) or _is_session_player_entity(attack_target):
+            if is_instance_valid(locked_target):
+                attack_target = locked_target
+                player = locked_target
+            elif state == CHASE or not is_instance_valid(attack_target) or _is_session_player_entity(attack_target):
                 attack_target = session_target
+            if state != CHASE and hostility + friend_hostility >= 0.75:
+                _promote_session_attacker(session_target)
         if state != CHASE and not is_instance_valid(player):
             player = session_target
         if state != CHASE:
@@ -381,9 +524,18 @@ func look_at_desired_direction(direction: Vector3) -> void:
 
 
 func switch_state(new_state: int) -> void:
+    var previous_state: int = state
     state = new_state
     if not is_inside_tree() or dead:
         return
+    if previous_state != new_state:
+        _debug_log("switch %s -> %s player=%s attack_target=%s forced=%s" % [
+            _debug_state_name(previous_state),
+            _debug_state_name(new_state),
+            _debug_target_label(player),
+            _debug_target_label(attack_target),
+            _debug_target_label(forced_session_target),
+        ])
 
     if new_state == IDLE:
         desired_direction = Vector3.ZERO
@@ -401,6 +553,15 @@ func attack() -> void:
     if not %AttackTimer.is_stopped() or state != CHASE or dead or disabled or not is_inside_tree():
         return
 
+    _debug_log("attack spacer=%s facing=%s dist=%.2f player=%s attack_target=%s forced=%s held=%s" % [
+        str(is_spacer()),
+        str(is_facing_player()),
+        _get_target_position().distance_to(global_position),
+        _debug_target_label(player),
+        _debug_target_label(attack_target),
+        _debug_target_label(forced_session_target),
+        held_item.get_class() if is_instance_valid(held_item) else "<none>",
+    ])
     if is_spacer() and _get_target_position().distance_to(global_position) > shoot_distance:
         if is_facing_player():
             shoot_ball()
@@ -417,6 +578,11 @@ func melee_attack() -> void:
 
 
 func shoot_ball() -> void:
+    _debug_log("shoot player=%s head=%s look_dir=%s" % [
+        _debug_target_label(player),
+        str(_get_target_head_position()),
+        str(get_look_direction()),
+    ])
     %WindupPlayer.play()
     anim["parameters/shoot/request"] = AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE
     attack_speed_modifier = 0.14

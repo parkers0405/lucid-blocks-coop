@@ -19,6 +19,14 @@ var _target_crouching: bool = false
 var _has_pending_state: bool = false
 
 
+func _apply_targetable_collision(enabled: bool) -> void:
+	collision_layer = 2 if enabled else 0
+	var interact_area := get_node_or_null("RotationPivot/InteractArea3D") as Area3D
+	if interact_area != null:
+		interact_area.collision_layer = 4098 if enabled else 0
+		interact_area.collision_mask = 0
+
+
 func _ready() -> void:
 	visible = false
 	collision_layer = 2
@@ -71,6 +79,7 @@ func _ready() -> void:
 		interact_area.set_meta("coop_proxy_owner", self)
 
 	_apply_crouching(false)
+	_apply_targetable_collision(true)
 
 	var direct_damage_timer := get_node_or_null("DirectDamageTimer") as Timer
 	if direct_damage_timer != null:
@@ -117,6 +126,7 @@ func _physics_process(delta: float) -> void:
 
 	dead = false
 	disabled = _target_downed
+	_apply_targetable_collision(not _target_downed)
 	grounded = _target_grounded
 	under_water = _target_under_water
 	movement_velocity = Vector3(velocity.x, 0.0, velocity.z)

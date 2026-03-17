@@ -110,8 +110,31 @@ func explode() -> void:
     queue_free()
 
 
+func _get_coop_intended_remote_peer_id() -> int:
+    if has_meta("coop_intended_peer_id"):
+        return int(get_meta("coop_intended_peer_id", -1))
+    if is_instance_valid(entity_owner) and entity_owner.has_method("get_coop_locked_target_peer_id"):
+        return int(entity_owner.call("get_coop_locked_target_peer_id"))
+    return -1
+
+
+func _should_ignore_target_for_coop_locked_peer(target: Entity) -> bool:
+    if target == null or not is_instance_valid(target) or Ref.coop_manager == null:
+        return false
+    var intended_peer_id: int = _get_coop_intended_remote_peer_id()
+    if intended_peer_id <= 1:
+        return false
+    if target == Ref.player:
+        return true
+    if Ref.coop_manager.is_remote_player_proxy(target):
+        return Ref.coop_manager.get_remote_player_proxy_peer_id(target) != intended_peer_id
+    return false
+
+
 func explode_entity(target: Entity) -> void:
     if not is_instance_valid(target) or target.disabled or target.dead or not target.is_inside_tree():
+        return
+    if _should_ignore_target_for_coop_locked_peer(target):
         return
     if target.direct_damage_cooldown:
         return
@@ -130,9 +153,15 @@ func explode_entity(target: Entity) -> void:
     if is_instance_valid(entity_owner):
         hate = entity_owner.hate
 
-    var actual_damage: int = max(1, round(max_damage * explosion_strength + hate * hate_scale))
+    var scaled_hate: int = hate
+    if hate >= 60:
+        scaled_hate = 60 + int(sqrt(hate - 60))
+    var actual_damage: int = max(1, round(max_damage * explosion_strength + scaled_hate * hate_scale))
     var knockback_direction: Vector3 = explode_vector.normalized()
     var knockback_vector: Vector3 = (knockback_boost + knockback_direction) * explosion_strength * knockback_strength
+
+    if Ref.coop_manager != null and multiplayer.is_server() and Ref.coop_manager.sync_host_direct_hit_on_remote_player(entity_owner, target, target.head.global_position if is_instance_valid(target.head) else target.global_position, actual_damage, knockback_vector, firey):
+        return
 
     target.knockback_velocity += knockback_vector
 

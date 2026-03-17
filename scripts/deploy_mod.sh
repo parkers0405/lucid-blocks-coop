@@ -8,6 +8,7 @@ ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 DEFAULT_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
 DEFAULT_MOD_NAME="lucid-blocks-coop-test.pck"
 DEFAULT_PROJECT_DIR="$ROOT_DIR/mod/overrides"
+DEFAULT_DIST_DIR="$ROOT_DIR/dist"
 
 resolve_godot_bin() {
   if [[ -n "${GODOT_EXPORT_BIN:-}" ]]; then
@@ -62,15 +63,33 @@ main() {
   local mods_dir="${MODS_DIR:-$(dirname "$game_exe")/mods}"
   local mod_name="${MOD_NAME:-$DEFAULT_MOD_NAME}"
   local target_path="$mods_dir/$mod_name"
+  local dist_dir="${DIST_DIR:-$DEFAULT_DIST_DIR}"
+  local dist_target_path="$dist_dir/$mod_name"
 
-  mkdir -p "$mods_dir"
+  local chat_mod_dir="$ROOT_DIR/mod/chat_overrides"
+  local chat_mod_name="zzz-lucid-blocks-command-chat.pck"
+  local chat_target_path="$mods_dir/$chat_mod_name"
+  local dist_chat_target_path="$dist_dir/$chat_mod_name"
+
+  mkdir -p "$mods_dir" "$dist_dir"
   find "$mods_dir" -maxdepth 1 -type f \
+    \( -name 'lucid-blocks-coop*.pck' -o -name 'zz-lucid-blocks-coop*.pck' -o -name 'zzz-lucid-blocks-command-chat*.pck' \) \
+    -delete
+  find "$dist_dir" -maxdepth 1 -type f \
     \( -name 'lucid-blocks-coop*.pck' -o -name 'zz-lucid-blocks-coop*.pck' -o -name 'zzz-lucid-blocks-command-chat*.pck' \) \
     -delete
 
   printf 'Building %s\n' "$target_path"
   "$godot_bin" --headless --path "$project_dir" --export-pack "Linux/X11" "$target_path"
   printf 'Installed mod pack to %s\n' "$target_path"
+  cp -f "$target_path" "$dist_target_path"
+  printf 'Copied mod pack to %s\n' "$dist_target_path"
+
+  printf 'Building %s\n' "$chat_target_path"
+  "$godot_bin" --headless --path "$chat_mod_dir" --export-pack "Linux/X11" "$chat_target_path"
+  printf 'Installed chat mod pack to %s\n' "$chat_target_path"
+  cp -f "$chat_target_path" "$dist_chat_target_path"
+  printf 'Copied chat mod pack to %s\n' "$dist_chat_target_path"
 }
 
 main "$@"

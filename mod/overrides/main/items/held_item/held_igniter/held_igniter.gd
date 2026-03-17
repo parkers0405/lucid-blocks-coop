@@ -8,7 +8,15 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
         if not data.target.has_node("%Burn"):
             return false
 
-        if Ref.coop_manager != null and Ref.coop_manager.is_client_session() and not Ref.coop_manager.is_remote_player_proxy(data.target):
+        if Ref.coop_manager != null and holder == Ref.player and Ref.coop_manager.is_client_session():
+            if not Ref.coop_manager.sync_local_ignite_entity(data.target):
+                return false
+
+            var local_player: AudioStreamPlayer3D = %StrikePlayer.duplicate()
+            get_tree().get_root().add_child(local_player)
+            local_player.global_position = data.target.get_node("%Burn").global_position
+            local_player.play()
+            inventory.change_amount(inventory_index, -1)
             return true
 
         data.target.get_node("%Burn").ignite()

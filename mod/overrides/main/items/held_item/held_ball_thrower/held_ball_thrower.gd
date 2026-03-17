@@ -15,10 +15,16 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
 
     var new_ball: Ball = ball_scene.instantiate()
     new_ball.entity_owner = holder
+    if is_instance_valid(holder) and holder.has_method("get_coop_locked_target_peer_id"):
+        var intended_peer_id: int = int(holder.call("get_coop_locked_target_peer_id"))
+        if intended_peer_id > 1:
+            new_ball.set_meta("coop_intended_peer_id", intended_peer_id)
     get_tree().get_root().add_child(new_ball)
     new_ball.global_position = holder.hand.global_position
 
     new_ball.linear_velocity = holder.velocity + holder.get_look_direction() * throw_impulse
+    if is_instance_valid(holder) and holder.get_class() == "Manikin":
+        print("[lucid-blocks-coop][manikin-debug] fire-ball holder=", holder.name, " look_dir=", holder.get_look_direction(), " hand=", holder.hand.global_position)
     _sync_visual_ball_throw(new_ball)
 
     holder.decrease_held_item_durability(1)
