@@ -5536,7 +5536,7 @@ func host_session_ending(reconnectable: bool = false, reason: String = "") -> vo
 
 
 func _queue_client_main_menu_kick() -> void:
-    if multiplayer.is_server() or client_menu_kick_pending:
+    if (multiplayer.is_server() and _has_live_peer()) or client_menu_kick_pending:
         return
     client_menu_kick_pending = true
     _kick_client_to_main_menu.call_deferred()
@@ -5565,7 +5565,7 @@ func _begin_reconnect_flow(reason: String) -> void:
 
 
 func _tick_reconnect(delta: float) -> void:
-    if multiplayer.is_server() or _has_live_peer() or receiving_host_world:
+    if (multiplayer.is_server() and _has_live_peer()) or _has_live_peer() or receiving_host_world:
         return
 
     reconnect_retry_timer = maxf(0.0, reconnect_retry_timer - delta)
@@ -5582,7 +5582,7 @@ func _tick_reconnect(delta: float) -> void:
 
 
 func _attempt_reconnect() -> void:
-    if multiplayer.is_server() or _has_live_peer() or receiving_host_world:
+    if (multiplayer.is_server() and _has_live_peer()) or _has_live_peer() or receiving_host_world:
         return
 
     _close_pause_menu_if_open()
@@ -5636,7 +5636,7 @@ func _set_reconnect_overlay_visible(visible: bool) -> void:
 
 
 func _kick_client_to_main_menu() -> void:
-    if multiplayer.is_server() or not is_instance_valid(Ref.main) or not Ref.main.loaded:
+    if (multiplayer.is_server() and _has_live_peer()) or not is_instance_valid(Ref.main) or not Ref.main.loaded:
         client_restore_in_progress = false
         client_menu_kick_pending = false
         return

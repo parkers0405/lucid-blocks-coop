@@ -552,6 +552,8 @@ func _refresh_chat_visibility() -> void:
 
     if show_history:
         history_panel.self_modulate = Color(1.0, 1.0, 1.0, 0.45 if show_input else 0.0)
+        if history_scroll != null:
+            history_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO if show_input else ScrollContainer.SCROLL_MODE_SHOW_NEVER
         history_label.text = _build_history_bbcode(visible_messages)
         history_label.custom_minimum_size = Vector2(CHAT_WIDTH - 16.0, 9.0 * maxi(1, visible_messages.size()) + 2.0)
 
