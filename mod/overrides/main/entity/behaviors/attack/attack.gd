@@ -7,6 +7,8 @@ var damage_modifier: float = 1.0
 
 
 func attack(target, damage_position: Vector3, knockback_strength: float = 22.0, fly_strength: float = 0.15) -> bool:
+    if Ref.coop_manager != null and not multiplayer.is_server() and entity == Ref.player:
+        target = Ref.coop_manager._resolve_client_attack_target(target)
     if not is_instance_valid(target) or entity.disabled or not enabled or target.dead or not is_inside_tree() or not target.is_inside_tree():
         return false
 
@@ -60,7 +62,10 @@ func attack(target, damage_position: Vector3, knockback_strength: float = 22.0, 
     if should_sync_local_entity_attack:
         return Ref.coop_manager.sync_local_attack_on_entity(entity, target, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect)
 
-    target.knockback_velocity += 0.45 * entity.velocity + horizontal_kb * knockback_strength
+    var attacker_velocity: Vector3 = entity.velocity
+    if Ref.coop_manager != null and Ref.coop_manager.has_connected_remote_peers():
+        attacker_velocity = Ref.coop_manager.get_attack_impulse_velocity(entity)
+    target.knockback_velocity += 0.45 * attacker_velocity + horizontal_kb * knockback_strength
     target.knockback_velocity.y += knockback_strength * target.jump_modifier * fly_strength * (0.5 if not target.is_on_floor() else 1.0)
     target.attacked(entity, actual_damage)
 

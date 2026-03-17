@@ -10,6 +10,13 @@ var grounded: bool = true
 var crouching: bool = false
 var _last_position: Vector3 = Vector3.ZERO
 var _last_update_msec: int = 0
+var _target_position: Vector3 = Vector3.ZERO
+var _target_yaw: float = 0.0
+var _target_downed: bool = false
+var _target_grounded: bool = true
+var _target_under_water: bool = false
+var _target_crouching: bool = false
+var _has_pending_state: bool = false
 
 
 func _ready() -> void:
@@ -40,6 +47,8 @@ func _ready() -> void:
 		head = get_node_or_null("RotationPivot/Head") as Marker3D
 	if not is_instance_valid(hand):
 		hand = get_node_or_null("RotationPivot/Hand") as Marker3D
+	if not is_instance_valid(rotation_pivot):
+		rotation_pivot = get_node_or_null("RotationPivot") as Node3D
 
 	remove_from_group("save")
 	remove_from_group("preserve")
@@ -67,15 +76,15 @@ func _ready() -> void:
 			direct_damage_timer.timeout.connect(_on_direct_damage_timeout)
 		direct_damage_timer.stop()
 
+	_target_position = global_position
 	set_process(false)
-	set_physics_process(false)
+	set_physics_process(true)
 	set_process_input(false)
 	set_process_unhandled_input(false)
 
 
 func apply_remote_state(state: Dictionary) -> void:
 	var position: Vector3 = state.get("position", Vector3.ZERO)
-	var downed: bool = bool(state.get("downed", false))
 	var now_msec: int = Time.get_ticks_msec()
 	if _last_update_msec > 0:
 		var delta_sec: float = maxf(float(now_msec - _last_update_msec) / 1000.0, 0.001)
@@ -85,21 +94,39 @@ func apply_remote_state(state: Dictionary) -> void:
 	_last_position = position
 	_last_update_msec = now_msec
 
-	global_position = position
+	_target_position = position
+	_target_yaw = float(state.get("yaw", 0.0))
+	_target_downed = bool(state.get("downed", false))
+	_target_grounded = bool(state.get("grounded", true))
+	_target_under_water = bool(state.get("under_water", false))
+	_target_crouching = bool(state.get("crouching", false))
+	_has_pending_state = true
+
+
+func _physics_process(_delta: float) -> void:
+	if not _has_pending_state and _last_update_msec <= 0:
+		return
+
+	global_position = _target_position
+	if has_method("force_update_transform"):
+		force_update_transform()
+
 	dead = false
-	disabled = downed
-	grounded = bool(state.get("grounded", true))
-	under_water = bool(state.get("under_water", false))
+	disabled = _target_downed
+	grounded = _target_grounded
+	under_water = _target_under_water
 	movement_velocity = Vector3(velocity.x, 0.0, velocity.z)
 	gravity_velocity = Vector3.ZERO
 	knockback_velocity = Vector3.ZERO
 	rope_velocity = Vector3.ZERO
 
-	crouching = bool(state.get("crouching", false)) or downed
+	crouching = _target_crouching or _target_downed
 	_apply_crouching(crouching)
 
 	if is_instance_valid(rotation_pivot):
-		rotation_pivot.rotation.y = float(state.get("yaw", 0.0))
+		rotation_pivot.rotation.y = _target_yaw
+
+	_has_pending_state = false
 
 
 func _apply_crouching(value: bool) -> void:

@@ -255,12 +255,17 @@ func _physics_process(delta: float) -> void:
     if is_future_position_loaded(delta):
         move_and_slide()
 
-    if not is_instance_valid(player) and _has_session_player_target() and state != CHASE:
+    if _use_session_targeting() and _has_session_player_target():
         var session_target = _get_session_target_player()
         if is_instance_valid(session_target):
             player = session_target
-        interest_place = _get_target_position() + get_random_flat_vector() * wary_range
-        switch_state(WARY)
+            if state == CHASE or not is_instance_valid(attack_target) or _is_session_player_entity(attack_target):
+                attack_target = session_target
+        if state != CHASE and not is_instance_valid(player):
+            player = session_target
+        if state != CHASE:
+            interest_place = _get_target_position() + get_random_flat_vector() * wary_range
+            switch_state(WARY)
     elif state == CHASE and not is_instance_valid(attack_target):
         var attack_target_candidate = _get_session_target_player()
         if is_instance_valid(attack_target_candidate):

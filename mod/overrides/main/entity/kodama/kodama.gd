@@ -162,6 +162,12 @@ func _physics_process(delta: float) -> void :
     if is_future_position_loaded(delta):
         move_and_slide()
 
+    if _use_session_targeting() and Ref.coop_manager.is_position_near_same_instance_player(global_position, process_distance):
+        var session_target = get_session_target_entity(attack_target if is_instance_valid(attack_target) else player)
+        if is_instance_valid(session_target):
+            player = session_target
+            attack_target = session_target
+
 
     time += delta * 0.5
     if time > 32.0:

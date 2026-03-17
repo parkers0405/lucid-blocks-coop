@@ -1613,7 +1613,7 @@ func sync_host_attack_on_remote_player(attacker: Entity, target, damage_position
         peer_id,
         _get_sync_uuid(attacker) if is_instance_valid(attacker) else "",
         attacker.global_position if is_instance_valid(attacker) else Vector3.ZERO,
-        _get_entity_total_velocity(attacker) if is_instance_valid(attacker) else Vector3.ZERO,
+        get_attack_impulse_velocity(attacker) if is_instance_valid(attacker) else Vector3.ZERO,
         damage_position,
         maxi(1, damage),
         knockback_strength,
@@ -1633,16 +1633,18 @@ func sync_local_attack_on_entity(attacker: Entity, target, damage_position: Vect
 
     var target_uuid: String = _get_sync_uuid(target)
     if target_uuid == "":
+        print("[lucid-blocks-coop][attack-debug] guest target missing uuid name=", target.name if target is Node else str(target), " class=", target.get_class())
         return false
 
     var actual_damage: int = maxi(1, damage)
-    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target, attacker.global_position, _get_entity_total_velocity(attacker), knockback_strength, fly_strength)
+    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target, attacker.global_position, get_attack_impulse_velocity(attacker), knockback_strength, fly_strength)
     _predict_client_entity_knockback(target_uuid, target, knockback_velocity)
     _play_client_entity_hit_feedback(target, attacker, damage_position, actual_damage)
 
     if attacker.held_item != null and attacker.held_item.item is Tool:
         attacker.decrease_held_item_durability(1)
 
+    print("[lucid-blocks-coop][attack-debug] guest send attack uuid=", target_uuid, " target=", target.name if target is Node else str(target), " damage=", actual_damage)
     request_entity_attack.rpc_id(1, target_uuid, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect)
     return true
 
@@ -1747,17 +1749,15 @@ func _cleanup_client_prediction_state() -> void:
         if created_ms > 0 and now_ms - created_ms > int(CLIENT_PREDICTED_DROP_LIFETIME * 1000.0):
             child.call_deferred("queue_free")
 
-    if pending_pickup_receipts.is_empty():
-        return
-
-    var live_receipts: Array = []
-    for receipt in pending_pickup_receipts:
-        if not (receipt is Dictionary):
-            continue
-        var created_ms: int = int(receipt.get("created_ms", 0))
-        if created_ms <= 0 or now_ms - created_ms <= int(CLIENT_PENDING_PICKUP_LIFETIME * 1000.0):
-            live_receipts.append(receipt)
-    pending_pickup_receipts = live_receipts
+    if not pending_pickup_receipts.is_empty():
+        var live_receipts: Array = []
+        for receipt in pending_pickup_receipts:
+            if not (receipt is Dictionary):
+                continue
+            var created_ms: int = int(receipt.get("created_ms", 0))
+            if created_ms <= 0 or now_ms - created_ms <= int(CLIENT_PENDING_PICKUP_LIFETIME * 1000.0):
+                live_receipts.append(receipt)
+        pending_pickup_receipts = live_receipts
 
     for child in _get_live_tracked_entities():
         if not is_client_synced_entity(child):
@@ -1966,7 +1966,7 @@ func _animate_client_drop_merge_removal(dropped_item) -> void:
 
 
 func _should_keep_client_entity_area_active(area: Area3D) -> bool:
-    return area != null and str(area.name) == "InteractArea3D"
+    return area != null and ((int(area.collision_layer) & 16) != 0 or str(area.name) == "InteractArea3D")
 
 
 func _can_share_loaded_world() -> bool:
@@ -3291,6 +3291,27 @@ func _is_entity_model_node(node: Object) -> bool:
     return _object_has_property(node, "look_target") and _object_has_property(node, "look_ratio")
 
 
+func _is_entity_procedural_visual_node(node: Node) -> bool:
+    if node == null:
+        return false
+    var node_name: String = str(node.name)
+    if node_name == "Legs" or node_name == "LegTargets" or node_name == "LegRests" or node_name == "LegRays" or node_name == "GelModel":
+        return true
+    var script_path: String = _get_object_script_path(node)
+    if script_path.contains("/ik_leg/"):
+        return true
+    return node.get_class() == "IKLeg" or node.get_class() == "SoftBody3D"
+
+
+func _node_is_within_kept_client_visual_branch(node: Node) -> bool:
+    var current: Node = node
+    while current != null:
+        if _is_entity_procedural_visual_node(current):
+            return true
+        current = current.get_parent()
+    return false
+
+
 func _find_first_entity_model(root: Node):
     if root == null or not is_instance_valid(root):
         return null
@@ -3376,6 +3397,10 @@ func _capture_entity_procedural_visual_state(entity) -> Dictionary:
         state["direction"] = _quantize_vector3(entity.get("direction"), 0.01)
     if _object_has_property(entity, "look_target"):
         state["look_target"] = entity.get("look_target")
+    if _object_has_property(entity, "color_1"):
+        state["color_1"] = entity.get("color_1")
+    if _object_has_property(entity, "color_2"):
+        state["color_2"] = entity.get("color_2")
 
     var body_model: Node3D = entity.get_node_or_null("%BodyModel") as Node3D
     if body_model != null:
@@ -3416,9 +3441,44 @@ func _capture_entity_procedural_visual_state(entity) -> Dictionary:
     if leg_rests != null:
         state["leg_rests_rotation"] = leg_rests.rotation
 
+    var leg_targets: Node3D = entity.get_node_or_null("%LegTargets") as Node3D
+    if leg_targets != null:
+        var target_positions: Array = []
+        for child in leg_targets.get_children():
+            if child is Node3D:
+                target_positions.append((child as Node3D).global_position)
+        if not target_positions.is_empty():
+            state["leg_target_positions"] = target_positions
+
     var leg_rays: Node3D = entity.get_node_or_null("%LegRays") as Node3D
     if leg_rays != null:
         state["leg_rays_rotation"] = leg_rays.rotation
+
+    var legs_root: Node = entity.get_node_or_null("%Legs")
+    if legs_root != null:
+        var ik_leg_states: Array = []
+        for child in legs_root.get_children():
+            if not (child is Node3D):
+                continue
+            var leg_state: Dictionary = {
+                "global_position": (child as Node3D).global_position,
+                "rotation": (child as Node3D).rotation,
+            }
+            if _object_has_property(child, "target_anim"):
+                leg_state["target_anim"] = float(child.get("target_anim"))
+            if _object_has_property(child, "desired_target_position"):
+                leg_state["desired_target_position"] = child.get("desired_target_position")
+            if _object_has_property(child, "initial_target_position"):
+                leg_state["initial_target_position"] = child.get("initial_target_position")
+            if _object_has_property(child, "is_animating"):
+                leg_state["is_animating"] = bool(child.get("is_animating"))
+            if _object_has_property(child, "is_steady"):
+                leg_state["is_steady"] = bool(child.get("is_steady"))
+            if _object_has_property(child, "state"):
+                leg_state["state"] = int(child.get("state"))
+            ik_leg_states.append(leg_state)
+        if not ik_leg_states.is_empty():
+            state["ik_leg_states"] = ik_leg_states
 
     var core: Node3D = entity.get_node_or_null("%Core") as Node3D
     if core != null:
@@ -3461,6 +3521,12 @@ func _apply_entity_procedural_visual_state(entity, state: Dictionary, lerp_weigh
         entity.set("direction", state.get("direction", Vector3.ZERO))
     if state.has("look_target") and _object_has_property(entity, "look_target"):
         entity.set("look_target", state.get("look_target", Vector3.ZERO))
+    if state.has("color_1") and _object_has_property(entity, "color_1"):
+        entity.set("color_1", state.get("color_1", Color.WHITE))
+    if state.has("color_2") and _object_has_property(entity, "color_2"):
+        entity.set("color_2", state.get("color_2", Color.WHITE))
+    if (state.has("color_1") or state.has("color_2")) and entity.has_method("update_colors"):
+        entity.call("update_colors")
 
     _apply_node_local_rotation(entity.get_node_or_null("%RotationPivot") as Node3D, state.get("rotation_pivot_rotation", null), lerp_weight)
     _apply_node_local_rotation(entity.get_node_or_null("%BodyModel") as Node3D, state.get("body_model_rotation", null), lerp_weight)
@@ -3472,6 +3538,53 @@ func _apply_entity_procedural_visual_state(entity, state: Dictionary, lerp_weigh
     _apply_node_local_rotation(entity.get_node_or_null("%LegRests") as Node3D, state.get("leg_rests_rotation", null), lerp_weight)
     _apply_node_local_rotation(entity.get_node_or_null("%LegRays") as Node3D, state.get("leg_rays_rotation", null), lerp_weight)
     _apply_node_local_rotation(entity.get_node_or_null("%Core") as Node3D, state.get("core_rotation", null), lerp_weight)
+
+    if state.has("leg_target_positions"):
+        var leg_targets: Node3D = entity.get_node_or_null("%LegTargets") as Node3D
+        var target_positions = state.get("leg_target_positions", [])
+        if leg_targets != null and target_positions is Array:
+            var target_children: Array = leg_targets.get_children()
+            for index in range(mini(target_children.size(), target_positions.size())):
+                if target_children[index] is Node3D and target_positions[index] is Vector3:
+                    var target_child := target_children[index] as Node3D
+                    var target_position: Vector3 = target_positions[index]
+                    if lerp_weight >= 1.0:
+                        target_child.global_position = target_position
+                    else:
+                        target_child.global_position = target_child.global_position.lerp(target_position, lerp_weight)
+
+    if state.has("ik_leg_states"):
+        var legs_root: Node = entity.get_node_or_null("%Legs")
+        var ik_leg_states = state.get("ik_leg_states", [])
+        if legs_root != null and ik_leg_states is Array:
+            var legs_children: Array = legs_root.get_children()
+            for index in range(mini(legs_children.size(), ik_leg_states.size())):
+                if not (legs_children[index] is Node3D):
+                    continue
+                var leg = legs_children[index]
+                var leg_state = ik_leg_states[index]
+                if not (leg_state is Dictionary):
+                    continue
+                if leg_state.has("global_position") and leg_state["global_position"] is Vector3:
+                    var leg_position: Vector3 = leg_state["global_position"]
+                    if lerp_weight >= 1.0:
+                        (leg as Node3D).global_position = leg_position
+                    else:
+                        (leg as Node3D).global_position = (leg as Node3D).global_position.lerp(leg_position, lerp_weight)
+                if leg_state.has("rotation") and leg_state["rotation"] is Vector3:
+                    _apply_node_local_rotation(leg as Node3D, leg_state["rotation"], lerp_weight)
+                if leg_state.has("target_anim") and _object_has_property(leg, "target_anim"):
+                    leg.set("target_anim", float(leg_state["target_anim"]))
+                if leg_state.has("desired_target_position") and _object_has_property(leg, "desired_target_position"):
+                    leg.set("desired_target_position", leg_state["desired_target_position"])
+                if leg_state.has("initial_target_position") and _object_has_property(leg, "initial_target_position"):
+                    leg.set("initial_target_position", leg_state["initial_target_position"])
+                if leg_state.has("is_animating") and _object_has_property(leg, "is_animating"):
+                    leg.set("is_animating", bool(leg_state["is_animating"]))
+                if leg_state.has("is_steady") and _object_has_property(leg, "is_steady"):
+                    leg.set("is_steady", bool(leg_state["is_steady"]))
+                if leg_state.has("state") and _object_has_property(leg, "state"):
+                    leg.set("state", int(leg_state["state"]))
 
     var fish_model = entity.get_node_or_null("%FishModel")
     if fish_model != null and is_instance_valid(fish_model):
@@ -3609,6 +3722,24 @@ func _step_client_diatom_visuals(entity, _delta: float) -> void:
         SpatialMath.look_at_local(core, direction)
 
 
+func _step_client_gel_visuals(entity, _delta: float) -> void:
+    if entity == null or not is_instance_valid(entity):
+        return
+    entity.visible = true
+    var gel_model: Node3D = entity.get_node_or_null("%GelModel") as Node3D
+    if gel_model != null:
+        gel_model.visible = true
+    if entity.has_method("override_position"):
+        entity.call("override_position")
+    var softbody = entity.get_node_or_null("%SoftBody3D")
+    if softbody != null and is_instance_valid(softbody):
+        softbody.process_mode = Node.PROCESS_MODE_ALWAYS
+        if softbody is GeometryInstance3D:
+            (softbody as GeometryInstance3D).visible = true
+        if softbody.has_method("set_instance_shader_parameter"):
+            softbody.set_instance_shader_parameter("fade", 1.0)
+
+
 func _advance_client_animation_tree(entity, delta: float) -> void:
     var animation_tree: AnimationTree = _find_first_animation_tree(entity)
     if animation_tree == null:
@@ -3647,6 +3778,8 @@ func _update_client_procedural_entity_visuals(entity, delta: float) -> void:
         _step_client_shark_visuals(entity, delta)
     elif script_path.ends_with("/diatom.gd"):
         _step_client_diatom_visuals(entity, delta)
+    elif script_path.ends_with("/gel.gd"):
+        _step_client_gel_visuals(entity, delta)
 
 
 func calculate_attack_knockback_velocity(target, attacker_position: Vector3, attacker_velocity: Vector3, knockback_strength: float, fly_strength: float) -> Vector3:
@@ -3667,6 +3800,31 @@ func calculate_attack_knockback_velocity(target, attacker_position: Vector3, att
     var knockback_velocity: Vector3 = 0.45 * attacker_velocity + horizontal_kb * knockback_strength
     knockback_velocity.y += knockback_strength * jump_modifier * fly_strength * (0.5 if not on_floor else 1.0)
     return knockback_velocity
+
+
+func get_attack_impulse_velocity(attacker, reported_move_speed: float = -1.0) -> Vector3:
+    if attacker == null or not is_instance_valid(attacker):
+        return Vector3.ZERO
+
+    var attack_velocity: Vector3 = _get_entity_total_velocity(attacker)
+    if not has_connected_remote_peers():
+        return attack_velocity
+
+    var horizontal_velocity: Vector3 = Vector3(attack_velocity.x, 0.0, attack_velocity.z)
+    if _object_has_property(attacker, "movement_velocity"):
+        horizontal_velocity = attacker.get("movement_velocity")
+        horizontal_velocity.y = 0.0
+
+    if reported_move_speed >= 0.0 and horizontal_velocity.length() > reported_move_speed + 1.25:
+        if not horizontal_velocity.is_zero_approx():
+            horizontal_velocity = horizontal_velocity.normalized() * (reported_move_speed + 1.25)
+        else:
+            horizontal_velocity = Vector3.ZERO
+
+    attack_velocity.x = horizontal_velocity.x
+    attack_velocity.z = horizontal_velocity.z
+    attack_velocity.y = clampf(attack_velocity.y, -8.0, 8.0)
+    return attack_velocity
 
 
 func _serialize_peer_states() -> Array:
@@ -5409,6 +5567,7 @@ func _apply_client_entity_snapshots(entity_snapshots: Array, sequence: int = 0) 
             entity.disabled_by_visibility = false
             entity.invincible = true
             entity.invincible_temporary = true
+            _set_client_entity_hit_proxy_enabled(entity, not dead and not disabled)
 
         _apply_entity_held_item_state(entity, held_item_id, held_item_index)
         _apply_entity_special_state(entity, special_state)
@@ -5604,15 +5763,28 @@ func _configure_client_synced_entity(entity, uuid: String) -> void:
         Ref.preserve_node_manager.node_to_uuid_map[entity] = uuid
     if not tracked_root_entities.has(entity):
         tracked_root_entities.append(entity)
-    _disable_client_entity_runtime(entity, true)
+    var runtime_configured: bool = bool(entity.get_meta("coop_client_runtime_configured", false))
+    if not runtime_configured:
+        _disable_client_entity_runtime(entity, true)
+        _restore_client_entity_runtime_branches(entity)
+        entity.set_meta("coop_client_runtime_configured", true)
+    _restore_client_entity_interact_area(entity)
+    _ensure_client_entity_hit_proxy(entity)
     if entity is Entity:
         entity.disabled_by_visibility = false
         entity.invincible = true
         entity.invincible_temporary = true
+        if _get_object_script_path(entity).ends_with("/gel.gd"):
+            entity.visible = true
+            if entity.has_method("update_colors"):
+                entity.call("update_colors")
         var visible_enabler: VisibleOnScreenEnabler3D = entity.get_node_or_null("%VisibleOnScreenEnabler3D") as VisibleOnScreenEnabler3D
         if visible_enabler != null:
             visible_enabler.enable_node_path = ""
             visible_enabler.process_mode = Node.PROCESS_MODE_DISABLED
+        elif not runtime_configured:
+            _ensure_client_entity_hit_proxy(entity)
+        _set_client_entity_hit_proxy_enabled(entity, not entity.dead and not entity.disabled)
 
 
 func _configure_client_synced_drop(dropped_item, uuid: String) -> void:
@@ -5654,6 +5826,146 @@ func _disable_client_entity_runtime(root: Node, preserve_interact_branch: bool =
     _disable_client_entity_runtime_branch(root, root, preserve_interact_branch)
 
 
+func _find_client_entity_hit_proxy(entity):
+    if entity == null or not is_instance_valid(entity):
+        return null
+    var rotation_pivot: Node = entity.get_node_or_null("%RotationPivot")
+    if rotation_pivot == null:
+        return null
+    return rotation_pivot.get_node_or_null("CoopHitArea") as Area3D
+
+
+func _tag_client_entity_hit_owner(node: Node, entity) -> void:
+    if node == null or not is_instance_valid(node) or entity == null or not is_instance_valid(entity):
+        return
+    node.set_meta("coop_hit_owner", entity)
+    for child in node.get_children():
+        if child is Node:
+            _tag_client_entity_hit_owner(child, entity)
+
+
+func _restore_client_entity_interact_area(entity) -> void:
+    if entity == null or not is_instance_valid(entity):
+        return
+    var source_area: Area3D = entity.get_node_or_null("%InteractArea3D") as Area3D
+    if source_area == null:
+        return
+    source_area.monitoring = false
+    source_area.monitorable = true
+    source_area.collision_layer = 4112
+    source_area.collision_mask = 0
+    source_area.owner = entity
+    _tag_client_entity_hit_owner(source_area, entity)
+    for child in source_area.get_children():
+        if _object_has_property(child, "disabled"):
+            child.set_deferred("disabled", false)
+
+
+func _ensure_client_entity_hit_proxy(entity) -> void:
+    if entity == null or not is_instance_valid(entity):
+        return
+    var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
+    var source_area: Area3D = entity.get_node_or_null("%InteractArea3D") as Area3D
+    if rotation_pivot == null or source_area == null:
+        return
+
+    var proxy_area: Area3D = _find_client_entity_hit_proxy(entity)
+    if proxy_area == null:
+        proxy_area = Area3D.new()
+        proxy_area.name = "CoopHitArea"
+        rotation_pivot.add_child(proxy_area)
+        proxy_area.owner = entity
+
+    proxy_area.monitoring = false
+    proxy_area.monitorable = true
+    proxy_area.collision_layer = int(source_area.collision_layer)
+    proxy_area.collision_mask = int(source_area.collision_mask)
+    proxy_area.transform = source_area.transform
+    proxy_area.set_meta("coop_hit_owner", entity)
+
+    var shape_index: int = 0
+    for child in source_area.get_children():
+        if child is CollisionShape3D:
+            var source_shape := child as CollisionShape3D
+            var proxy_shape: CollisionShape3D = null
+            if shape_index < proxy_area.get_child_count() and proxy_area.get_child(shape_index) is CollisionShape3D:
+                proxy_shape = proxy_area.get_child(shape_index) as CollisionShape3D
+            else:
+                proxy_shape = CollisionShape3D.new()
+                proxy_area.add_child(proxy_shape)
+                proxy_shape.owner = entity
+            proxy_shape.shape = source_shape.shape
+            proxy_shape.transform = source_shape.transform
+            proxy_shape.disabled = source_shape.disabled
+            proxy_shape.set_meta("coop_hit_owner", entity)
+            shape_index += 1
+        elif child is CollisionPolygon3D:
+            var source_polygon := child as CollisionPolygon3D
+            var proxy_polygon: CollisionPolygon3D = null
+            if shape_index < proxy_area.get_child_count() and proxy_area.get_child(shape_index) is CollisionPolygon3D:
+                proxy_polygon = proxy_area.get_child(shape_index) as CollisionPolygon3D
+            else:
+                proxy_polygon = CollisionPolygon3D.new()
+                proxy_area.add_child(proxy_polygon)
+                proxy_polygon.owner = entity
+            proxy_polygon.polygon = source_polygon.polygon
+            proxy_polygon.transform = source_polygon.transform
+            proxy_polygon.disabled = source_polygon.disabled
+            proxy_polygon.set_meta("coop_hit_owner", entity)
+            shape_index += 1
+
+    while proxy_area.get_child_count() > shape_index:
+        proxy_area.get_child(proxy_area.get_child_count() - 1).queue_free()
+
+
+func _set_client_entity_hit_proxy_enabled(entity, enabled: bool) -> void:
+    var proxy_area: Area3D = _find_client_entity_hit_proxy(entity)
+    if proxy_area == null:
+        return
+    proxy_area.monitorable = enabled
+    proxy_area.collision_layer = 4112 if enabled else 0
+    proxy_area.collision_mask = 0
+    for child in proxy_area.get_children():
+        if _object_has_property(child, "disabled"):
+            child.set_deferred("disabled", not enabled)
+
+
+func _restore_client_entity_runtime_branches(root: Node) -> void:
+    if root == null or not is_instance_valid(root):
+        return
+    _restore_client_entity_runtime_branch(root, root)
+
+
+func _restore_client_entity_runtime_branch(root: Node, node: Node) -> void:
+    if node == null or not is_instance_valid(node):
+        return
+
+    var keep_active_area_branch: bool = _node_is_within_kept_client_entity_area(node)
+    var keep_visual_branch: bool = _node_is_within_kept_client_visual_branch(node)
+
+    if node is Area3D and _should_keep_client_entity_area_active(node as Area3D):
+        var area := node as Area3D
+        area.monitoring = false
+        area.monitorable = true
+        area.collision_layer = 4112
+        area.collision_mask = 0
+        area.owner = root
+    elif node is CollisionShape3D or node is CollisionPolygon3D:
+        if _object_has_property(node, "disabled") and keep_active_area_branch:
+            node.set_deferred("disabled", false)
+    elif node is SoftBody3D and keep_visual_branch:
+        (node as SoftBody3D).process_mode = Node.PROCESS_MODE_ALWAYS
+
+    if keep_active_area_branch or keep_visual_branch:
+        if node.has_method("set_process"):
+            node.set_process(true)
+        if node.has_method("set_physics_process"):
+            node.set_physics_process(true)
+
+    for child in node.get_children():
+        _restore_client_entity_runtime_branch(root, child)
+
+
 func _disable_client_entity_runtime_branch(root: Node, node: Node, preserve_interact_branch: bool) -> void:
     if node == null or not is_instance_valid(node):
         return
@@ -5684,7 +5996,12 @@ func _disable_client_entity_runtime_branch(root: Node, node: Node, preserve_inte
         if _object_has_property(node, "disabled") and not keep_root_query_shape and not keep_active_area_branch:
             node.set_deferred("disabled", true)
 
-    var keep_animation_runtime: bool = node is AnimationTree or node is AnimationPlayer or node is AudioStreamPlayer3D or node is AudioStreamPlayer or _is_entity_model_node(node)
+    var keep_animation_runtime: bool = node is AnimationTree \
+        or node is AnimationPlayer \
+        or node is AudioStreamPlayer3D \
+        or node is AudioStreamPlayer \
+        or _is_entity_model_node(node) \
+        or _node_is_within_kept_client_visual_branch(node)
     if node != root and not keep_animation_runtime:
         if node.has_method("set_process"):
             node.set_process(false)
@@ -5724,7 +6041,7 @@ func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw:
     if not bool(entity.get_meta("coop_entity_snapshot_initialized", false)) or entity.global_position.distance_squared_to(entity_position) > 36.0:
         entity.global_position = entity_position
         _set_entity_visual_yaw(entity, entity_yaw)
-        if entity.has_method("override_position"):
+        if entity.has_method("override_position") and not bool(entity.get_meta("coop_synced_entity", false)):
             entity.override_position()
         entity.set_meta("coop_entity_snapshot_initialized", true)
         if uuid != "":
@@ -5791,7 +6108,7 @@ func _tick_entity_interpolation(delta: float) -> void:
         entity.global_position = from_position.lerp(to_position, weight) + predicted_velocity * predicted_extra
         var entity_yaw: float = lerp_angle(float(interp.get("from_yaw", _get_entity_visual_yaw(entity))), float(interp.get("to_yaw", _get_entity_visual_yaw(entity))), weight) + float(interp.get("yaw_velocity", 0.0)) * predicted_extra
         _set_entity_visual_yaw(entity, entity_yaw)
-        if entity.has_method("override_position"):
+        if entity.has_method("override_position") and not bool(entity.get_meta("coop_synced_entity", false)):
             entity.override_position()
         interp["elapsed"] = elapsed
         entity_interp_map[uuid] = interp
@@ -5826,7 +6143,7 @@ func _apply_interp_animation(entity, walk_val: float, compact_anim: Dictionary) 
 func _update_client_entity_visuals(entity, entity_velocity: Vector3, _delta: float) -> void:
     if entity == null or not is_instance_valid(entity):
         return
-    if entity.has_method("override_position"):
+    if entity.has_method("override_position") and not bool(entity.get_meta("coop_synced_entity", false)):
         entity.override_position()
     _update_client_procedural_entity_visuals(entity, _delta)
     var base_speed: float = _resolve_object_float_property(entity, ["speed"], 1.0)
@@ -6109,6 +6426,109 @@ func _get_sync_uuid(node: Node) -> String:
     return str(Ref.preserve_node_manager.node_to_uuid_map.get(node, ""))
 
 
+func _entity_segment_projection(point: Vector3, segment_begin: Vector3, segment_end: Vector3) -> Dictionary:
+    var segment: Vector3 = segment_end - segment_begin
+    var segment_length_sq: float = segment.length_squared()
+    if segment_length_sq <= 0.000001:
+        return {
+            "t": 0.0,
+            "closest": segment_begin,
+            "distance_squared": point.distance_squared_to(segment_begin),
+        }
+    var t: float = clampf((point - segment_begin).dot(segment) / segment_length_sq, 0.0, 1.0)
+    var closest: Vector3 = segment_begin + segment * t
+    return {
+        "t": t,
+        "closest": closest,
+        "distance_squared": point.distance_squared_to(closest),
+    }
+
+
+func _estimate_client_attack_target_radius(entity) -> float:
+    if entity == null or not is_instance_valid(entity):
+        return 0.9
+    var radius: float = 0.9
+    var interact_area: Area3D = entity.get_node_or_null("%InteractArea3D") as Area3D
+    if interact_area == null:
+        return radius
+    for child in interact_area.get_children():
+        if not (child is CollisionShape3D):
+            continue
+        var collision_shape := child as CollisionShape3D
+        if collision_shape.shape == null:
+            continue
+        if collision_shape.shape is SphereShape3D:
+            radius = maxf(radius, float((collision_shape.shape as SphereShape3D).radius))
+        elif collision_shape.shape is BoxShape3D:
+            radius = maxf(radius, (collision_shape.shape as BoxShape3D).size.length() * 0.5)
+        elif collision_shape.shape is CapsuleShape3D:
+            var capsule := collision_shape.shape as CapsuleShape3D
+            radius = maxf(radius, capsule.radius + capsule.height * 0.5)
+        elif collision_shape.shape is CylinderShape3D:
+            var cylinder := collision_shape.shape as CylinderShape3D
+            radius = maxf(radius, cylinder.radius + cylinder.height * 0.5)
+    return radius
+
+
+func _get_client_attack_probe_points(entity) -> Array:
+    var points: Array = []
+    if entity == null or not is_instance_valid(entity):
+        return points
+    var interact_area: Area3D = entity.get_node_or_null("%InteractArea3D") as Area3D
+    if interact_area != null:
+        points.append(interact_area.global_position)
+    if entity is Entity:
+        var entity_node := entity as Entity
+        if is_instance_valid(entity_node.head):
+            points.append(entity_node.head.global_position)
+    points.append(entity.global_position)
+    return points
+
+
+func find_client_ray_attack_target(segment_begin: Vector3, segment_end: Vector3):
+    if multiplayer.is_server():
+        return null
+    var best_target = null
+    var best_t: float = INF
+    var best_distance_squared: float = INF
+    for entity in synced_entities.values():
+        if entity == null or not is_instance_valid(entity) or not (entity is Entity):
+            continue
+        if entity.dead or entity.disabled:
+            continue
+        var effective_radius: float = _estimate_client_attack_target_radius(entity) + 0.45
+        var effective_radius_sq: float = effective_radius * effective_radius
+        for point in _get_client_attack_probe_points(entity):
+            if not (point is Vector3):
+                continue
+            var projection: Dictionary = _entity_segment_projection(point, segment_begin, segment_end)
+            var distance_squared: float = float(projection.get("distance_squared", INF))
+            if distance_squared > effective_radius_sq:
+                continue
+            var t: float = float(projection.get("t", INF))
+            if t < best_t or (is_equal_approx(t, best_t) and distance_squared < best_distance_squared):
+                best_t = t
+                best_distance_squared = distance_squared
+                best_target = entity
+    return best_target
+
+
+func get_client_attack_hit_position(entity, segment_begin: Vector3, segment_end: Vector3) -> Vector3:
+    if entity == null or not is_instance_valid(entity):
+        return segment_end
+    var best_position: Vector3 = entity.global_position
+    var best_distance_squared: float = INF
+    for point in _get_client_attack_probe_points(entity):
+        if not (point is Vector3):
+            continue
+        var projection: Dictionary = _entity_segment_projection(point, segment_begin, segment_end)
+        var distance_squared: float = float(projection.get("distance_squared", INF))
+        if distance_squared < best_distance_squared:
+            best_distance_squared = distance_squared
+            best_position = projection.get("closest", point)
+    return best_position
+
+
 func _get_client_sync_clock() -> float:
     if client_server_time_initialized:
         return client_server_time
@@ -6125,6 +6545,26 @@ func _should_prune_client_synced_entity(entity) -> bool:
 
 
 func _resolve_client_attack_target(target):
+    if target == null or not is_instance_valid(target):
+        return target
+    if target is Entity and _get_sync_uuid(target) != "":
+        return target
+
+    var current: Node = target as Node
+    while current != null:
+        if current is Entity and _get_sync_uuid(current) != "":
+            return current
+        if current.owner is Entity and _get_sync_uuid(current.owner) != "":
+            return current.owner
+        current = current.get_parent()
+
+    if target is Entity:
+        var entity_target := target as Entity
+        var scene_path: String = _get_sync_scene_path(entity_target)
+        if scene_path != "":
+            var matched = _find_existing_entity_by_scene_and_position(scene_path, entity_target.global_position, 12.0)
+            if matched != null and _get_sync_uuid(matched) != "":
+                return matched
     return target
 
 
@@ -6171,7 +6611,7 @@ func _predict_client_entity_knockback(target_uuid: String, target, knockback_vel
     _set_client_entity_direct_damage_cooldown(target)
 
     if target is Entity:
-        target.knockback_velocity += knockback_velocity
+        target.knockback_velocity = knockback_velocity
         target.velocity = _get_entity_total_velocity(target)
     elif _object_has_property(target, "velocity"):
         target.set("velocity", knockback_velocity)
@@ -6863,33 +7303,55 @@ func request_entity_attack(target_uuid: String, damage_position: Vector3, damage
 
     var sender_state: Dictionary = peer_states.get(sender_id, {})
     if sender_state.is_empty() or not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
+        print("[lucid-blocks-coop][attack-debug] host reject attack sender_state invalid sender=", sender_id, " uuid=", target_uuid)
         return
 
     var attacker = get_remote_player_proxy(sender_id)
     if attacker == null or not is_instance_valid(attacker) or attacker.dead or attacker.disabled:
+        print("[lucid-blocks-coop][attack-debug] host reject attack attacker invalid sender=", sender_id, " uuid=", target_uuid)
         return
 
     var target = _find_existing_entity_by_uuid(target_uuid)
     if target == null or not is_instance_valid(target) or not (target is Entity) or target is Player or is_remote_player_proxy(target):
+        print("[lucid-blocks-coop][attack-debug] host reject attack target invalid uuid=", target_uuid)
         return
 
     var target_entity := target as Entity
     if target_entity.dead or target_entity.disabled or target_entity.direct_damage_cooldown:
+        print("[lucid-blocks-coop][attack-debug] host reject attack target state uuid=", target_uuid, " dead=", target_entity.dead, " disabled=", target_entity.disabled, " cooldown=", target_entity.direct_damage_cooldown)
         return
-    if attacker.global_position.distance_squared_to(target_entity.global_position) > ENTITY_ATTACK_REQUEST_MAX_DISTANCE * ENTITY_ATTACK_REQUEST_MAX_DISTANCE:
+    var attacker_position: Vector3 = sender_state.get("position", attacker.global_position)
+    if attacker_position.distance_squared_to(target_entity.global_position) > (ENTITY_ATTACK_REQUEST_MAX_DISTANCE + 1.25) * (ENTITY_ATTACK_REQUEST_MAX_DISTANCE + 1.25):
+        print("[lucid-blocks-coop][attack-debug] host reject attack range uuid=", target_uuid, " attacker_pos=", attacker_position, " target_pos=", target_entity.global_position)
         return
 
     var actual_damage: int = maxi(1, damage)
-    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target_entity, attacker.global_position, _get_entity_total_velocity(attacker), knockback_strength, fly_strength)
+    var attacker_velocity: Vector3 = get_attack_impulse_velocity(attacker, float(sender_state.get("move_speed", -1.0)))
+    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target_entity, attacker_position, attacker_velocity, knockback_strength, fly_strength)
     target_entity.knockback_velocity += knockback_velocity
     target_entity.attacked(attacker, actual_damage)
+    print("[lucid-blocks-coop][attack-debug] host accept attack uuid=", target_uuid, " target=", target_entity.name, " damage=", actual_damage)
 
     if fire_aspect and target_entity.has_node("%Burn"):
         target_entity.get_node("%Burn").ignite()
 
     if target_entity.has_node("%Bleed"):
-        var target_to_attacker: Vector3 = (attacker.global_position - target_entity.global_position).normalized()
+        var target_to_attacker: Vector3 = (attacker_position - target_entity.global_position).normalized()
         target_entity.get_node("%Bleed").bleed(damage_position, target_to_attacker, actual_damage)
+
+    confirm_entity_attack.rpc_id(
+        sender_id,
+        target_uuid,
+        target_entity.global_position,
+        _get_entity_visual_yaw(target_entity),
+        target_entity.movement_velocity,
+        target_entity.gravity_velocity,
+        target_entity.knockback_velocity,
+        target_entity.rope_velocity,
+        bool(target_entity.dead),
+        bool(target_entity.disabled),
+        float(Time.get_ticks_msec()) / 1000.0
+    )
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -6994,7 +7456,7 @@ func receive_remote_player_attack(attacker_uuid: String, attacker_position: Vect
 
     _mark_host_contact()
 
-    if not _can_sample_player() or Ref.player.dead or Ref.player.disabled or Ref.player.direct_damage_cooldown:
+    if not _can_sample_player() or Ref.player.dead or Ref.player.disabled:
         return
 
     var attacker = _find_client_synced_entity_by_uuid(attacker_uuid) if attacker_uuid != "" else null
@@ -7015,6 +7477,26 @@ func receive_remote_player_attack(attacker_uuid: String, attacker_position: Vect
 
     if fire_aspect and Ref.player.has_node("%Burn"):
         Ref.player.get_node("%Burn").ignite()
+
+
+@rpc("authority", "call_remote", "reliable")
+func confirm_entity_attack(target_uuid: String, entity_position: Vector3, entity_yaw: float, movement_velocity: Vector3, gravity_velocity: Vector3, knockback_velocity: Vector3, rope_velocity: Vector3, dead: bool, disabled: bool, server_time: float) -> void:
+    if multiplayer.is_server():
+        return
+
+    _mark_host_contact()
+
+    var target = _find_client_synced_entity_by_uuid(target_uuid)
+    if target == null or not is_instance_valid(target):
+        return
+
+    if target is Entity:
+        target.dead = dead
+        target.disabled = disabled
+        target.visible = not dead
+
+    var entity_velocity: Vector3 = movement_velocity + gravity_velocity + knockback_velocity + rope_velocity
+    _apply_client_entity_snapshot(target, entity_position, entity_yaw, entity_velocity, server_time, movement_velocity, gravity_velocity, knockback_velocity, rope_velocity, client_last_world_state_sequence)
 
 
 @rpc("authority", "call_remote", "reliable")

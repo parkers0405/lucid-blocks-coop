@@ -248,7 +248,9 @@ func _physics_process(delta: float) -> void:
                 initialize_state()
 
     if state == DEFENSE:
-        if not is_instance_valid(attack_target):
+        if _use_session_targeting():
+            attack_target = _get_priority_attack_target()
+        elif not is_instance_valid(attack_target):
             attack_target = _get_priority_attack_target()
         if not is_instance_valid(attack_target) and not _has_session_player_target():
             state = IDLE

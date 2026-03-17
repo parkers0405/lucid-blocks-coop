@@ -144,6 +144,11 @@ func _physics_process(delta: float) -> void :
     if is_future_position_loaded(delta):
         move_and_slide()
 
+    if _use_session_targeting() and not is_instance_valid(bothersome):
+        var session_target = get_session_target_entity()
+        if is_instance_valid(session_target) and is_session_player_entity(session_target):
+            bothersome = session_target
+
     if dead:
         run_amount = lerp(run_amount, 0.0, clamp(delta * run_accel, 0.0, 1.0))
         walk_amount = lerp(walk_amount, 0.0, clamp(delta * walk_accel, 0.0, 1.0))

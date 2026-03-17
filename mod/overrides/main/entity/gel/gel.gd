@@ -201,7 +201,6 @@ func update_positions() -> bool:
 
 func override_position() -> void :
     last_softbody_position = global_position
-    softbody.global_position = global_position
     last_position = global_position
 
 
