@@ -78,6 +78,7 @@ func _is_coop_perf_override_active() -> bool:
 
 func _apply_frame_pacing_settings() -> void:
     coop_perf_override_active = _is_coop_perf_override_active()
+    process_mode = Node.PROCESS_MODE_ALWAYS if coop_perf_override_active else Node.PROCESS_MODE_INHERIT
     if coop_perf_override_active:
         DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
         fps_cap = 0
@@ -106,7 +107,8 @@ func _physics_process(_delta: float) -> void :
             load_center = Ref.coop_manager.get_world_load_center(load_center)
         set_loaded_region_center(load_center)
 
-        if simulate_enabled and not get_tree().paused and simulate_frame and not (even and Ref.sun.target_time_scale < 1.0):
+        var pause_blocks_sim: bool = get_tree().paused and not _is_coop_perf_override_active()
+        if simulate_enabled and not pause_blocks_sim and simulate_frame and not (even and Ref.sun.target_time_scale < 1.0):
             simulate_dynamic()
             simulate_frame = false
 

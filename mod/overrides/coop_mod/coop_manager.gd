@@ -132,6 +132,7 @@ var reconnect_restore_capture_on_close: bool = false
 var entity_interp_map: Dictionary = {}
 var host_entity_last_sent: Dictionary = {}
 var host_entity_activity_refresh_timer: float = 0.0
+var host_entity_activity_override_active: bool = false
 var host_server_time: float = 0.0
 var client_server_time: float = 0.0
 var client_server_time_initialized: bool = false
@@ -299,7 +300,18 @@ func _get_live_tracked_drops() -> Array:
     return tracked_root_drops
 
 
+func _enforce_coop_pause_override() -> void:
+    if not _has_live_peer() or get_tree() == null or not get_tree().paused:
+        return
+    if Ref.game_menu == null:
+        return
+    if int(Ref.game_menu.state) != 4:
+        return
+    get_tree().paused = false
+
+
 func _physics_process(delta: float) -> void:
+    _enforce_coop_pause_override()
     _refresh_world_authority_mode()
     _refresh_host_entity_activity_override(delta)
     _refresh_session_load_radius()
@@ -554,6 +566,7 @@ func disconnect_session(announce: bool = true) -> void:
     autosave_timer = 0.0
     client_state_heartbeat_timer = 0.0
     host_entity_activity_refresh_timer = 0.0
+    _clear_host_entity_activity_override()
     synced_entities.clear()
     synced_dropped_items.clear()
     host_entity_last_sent.clear()
@@ -2153,9 +2166,88 @@ func _refresh_world_authority_mode() -> void:
     last_local_world_authority = has_authority
 
 
+func _set_host_runtime_process_mode(node: Node, active: bool) -> void:
+    if node == null or not is_instance_valid(node):
+        return
+
+    if active:
+        if not node.has_meta("coop_host_original_process_mode"):
+            node.set_meta("coop_host_original_process_mode", int(node.process_mode))
+        node.process_mode = Node.PROCESS_MODE_ALWAYS
+    elif node.has_meta("coop_host_original_process_mode"):
+        node.process_mode = int(node.get_meta("coop_host_original_process_mode", int(Node.PROCESS_MODE_INHERIT)))
+        node.remove_meta("coop_host_original_process_mode")
+
+    for child in node.get_children():
+        _set_host_runtime_process_mode(child, active)
+
+
+func _set_host_entity_activity_override(entity: Entity, active: bool) -> void:
+    if entity == null or not is_instance_valid(entity) or not entity.is_inside_tree():
+        return
+
+    if _object_has_property(entity, "disabled_by_visibility"):
+        if active:
+            if not entity.has_meta("coop_host_original_disabled_by_visibility"):
+                entity.set_meta("coop_host_original_disabled_by_visibility", bool(entity.get("disabled_by_visibility")))
+            entity.set("disabled_by_visibility", false)
+        elif entity.has_meta("coop_host_original_disabled_by_visibility"):
+            entity.set("disabled_by_visibility", bool(entity.get_meta("coop_host_original_disabled_by_visibility", true)))
+            entity.remove_meta("coop_host_original_disabled_by_visibility")
+
+    _set_host_runtime_process_mode(entity, active)
+
+    if active:
+        entity.set_process(true)
+        entity.set_physics_process(true)
+    elif entity.has_method("distance_process_check"):
+        entity.call("distance_process_check")
+
+    if entity.has_method("_refresh_visibility_enabler_target"):
+        entity.call("_refresh_visibility_enabler_target")
+
+    var visible_enabler: VisibleOnScreenEnabler3D = entity.get_node_or_null("%VisibleOnScreenEnabler3D") as VisibleOnScreenEnabler3D
+    if visible_enabler != null:
+        if active:
+            if not visible_enabler.has_meta("coop_host_original_enable_node_path"):
+                visible_enabler.set_meta("coop_host_original_enable_node_path", str(visible_enabler.enable_node_path))
+            if not visible_enabler.has_meta("coop_host_original_process_mode"):
+                visible_enabler.set_meta("coop_host_original_process_mode", int(visible_enabler.process_mode))
+            visible_enabler.enable_node_path = ""
+            visible_enabler.process_mode = Node.PROCESS_MODE_DISABLED
+        else:
+            visible_enabler.enable_node_path = str(visible_enabler.get_meta("coop_host_original_enable_node_path", ".."))
+            visible_enabler.process_mode = int(visible_enabler.get_meta("coop_host_original_process_mode", int(Node.PROCESS_MODE_INHERIT)))
+            visible_enabler.remove_meta("coop_host_original_enable_node_path")
+            visible_enabler.remove_meta("coop_host_original_process_mode")
+
+    var distance_timer: Timer = entity.get_node_or_null("%DistanceCheckTimer") as Timer
+    if distance_timer != null:
+        if active:
+            if not distance_timer.has_meta("coop_host_original_process_mode"):
+                distance_timer.set_meta("coop_host_original_process_mode", int(distance_timer.process_mode))
+            distance_timer.process_mode = Node.PROCESS_MODE_ALWAYS
+            if distance_timer.is_stopped():
+                distance_timer.start()
+        elif distance_timer.has_meta("coop_host_original_process_mode"):
+            distance_timer.process_mode = int(distance_timer.get_meta("coop_host_original_process_mode", int(Node.PROCESS_MODE_INHERIT)))
+            distance_timer.remove_meta("coop_host_original_process_mode")
+
+
+func _clear_host_entity_activity_override() -> void:
+    if not host_entity_activity_override_active:
+        return
+    for child in _get_live_tracked_entities():
+        if not (child is Entity) or child is Player or is_remote_player_proxy(child):
+            continue
+        _set_host_entity_activity_override(child as Entity, false)
+    host_entity_activity_override_active = false
+
+
 func _refresh_host_entity_activity_override(delta: float) -> void:
     if not multiplayer.is_server() or not _has_live_peer():
         host_entity_activity_refresh_timer = 0.0
+        _clear_host_entity_activity_override()
         return
 
     host_entity_activity_refresh_timer += delta
@@ -2169,18 +2261,8 @@ func _refresh_host_entity_activity_override(delta: float) -> void:
         var entity := child as Entity
         if entity == null or not is_instance_valid(entity) or not entity.is_inside_tree():
             continue
-        entity.process_mode = Node.PROCESS_MODE_INHERIT
-        entity.set_process(true)
-        entity.set_physics_process(true)
-        if entity.has_method("_refresh_visibility_enabler_target"):
-            entity.call("_refresh_visibility_enabler_target")
-        var visible_enabler: VisibleOnScreenEnabler3D = entity.get_node_or_null("%VisibleOnScreenEnabler3D") as VisibleOnScreenEnabler3D
-        if visible_enabler != null:
-            visible_enabler.enable_node_path = ""
-            visible_enabler.process_mode = Node.PROCESS_MODE_DISABLED
-        var distance_timer: Timer = entity.get_node_or_null("%DistanceCheckTimer") as Timer
-        if distance_timer != null and distance_timer.is_stopped():
-            distance_timer.start()
+        _set_host_entity_activity_override(entity, true)
+    host_entity_activity_override_active = true
 
 
 func _get_same_instance_session_positions() -> Array:
@@ -3252,10 +3334,20 @@ func _capture_entity_procedural_visual_state(entity) -> Dictionary:
         state["rotate_axis"] = bool(entity.get("rotate_axis"))
     if _object_has_property(entity, "state"):
         state["state"] = int(entity.get("state"))
+    if _object_has_property(entity, "teleport_amount"):
+        state["teleport_amount"] = _quantize_float(float(entity.get("teleport_amount")), 0.01)
+    if _object_has_property(entity, "direction"):
+        state["direction"] = _quantize_vector3(entity.get("direction"), 0.01)
+    if _object_has_property(entity, "look_target"):
+        state["look_target"] = entity.get("look_target")
 
     var body_model: Node3D = entity.get_node_or_null("%BodyModel") as Node3D
     if body_model != null:
         state["body_model_rotation"] = body_model.rotation
+
+    var body: Node3D = entity.get_node_or_null("%Body") as Node3D
+    if body != null:
+        state["body_rotation"] = body.rotation
 
     var wing_holder_1: Node3D = entity.get_node_or_null("%WingHolder1") as Node3D
     if wing_holder_1 != null:
@@ -3279,6 +3371,22 @@ func _capture_entity_procedural_visual_state(entity) -> Dictionary:
     var boid_model: Node3D = entity.get_node_or_null("%BoidModel") as Node3D
     if boid_model != null:
         state["boid_model_rotation"] = boid_model.rotation
+
+    var glaggler_model: Node3D = entity.get_node_or_null("%GlagglerModel") as Node3D
+    if glaggler_model != null:
+        state["glaggler_model_rotation"] = glaggler_model.rotation
+
+    var leg_rests: Node3D = entity.get_node_or_null("%LegRests") as Node3D
+    if leg_rests != null:
+        state["leg_rests_rotation"] = leg_rests.rotation
+
+    var leg_rays: Node3D = entity.get_node_or_null("%LegRays") as Node3D
+    if leg_rays != null:
+        state["leg_rays_rotation"] = leg_rays.rotation
+
+    var core: Node3D = entity.get_node_or_null("%Core") as Node3D
+    if core != null:
+        state["core_rotation"] = core.rotation
 
     return state
 
@@ -3311,12 +3419,23 @@ func _apply_entity_procedural_visual_state(entity, state: Dictionary, lerp_weigh
         entity.set("angle", float(state.get("angle", 0.0)))
     if state.has("state") and _object_has_property(entity, "state"):
         entity.set("state", int(state.get("state", 0)))
+    if state.has("teleport_amount") and _object_has_property(entity, "teleport_amount"):
+        entity.set("teleport_amount", float(state.get("teleport_amount", 0.0)))
+    if state.has("direction") and _object_has_property(entity, "direction"):
+        entity.set("direction", state.get("direction", Vector3.ZERO))
+    if state.has("look_target") and _object_has_property(entity, "look_target"):
+        entity.set("look_target", state.get("look_target", Vector3.ZERO))
 
     _apply_node_local_rotation(entity.get_node_or_null("%RotationPivot") as Node3D, state.get("rotation_pivot_rotation", null), lerp_weight)
     _apply_node_local_rotation(entity.get_node_or_null("%BodyModel") as Node3D, state.get("body_model_rotation", null), lerp_weight)
+    _apply_node_local_rotation(entity.get_node_or_null("%Body") as Node3D, state.get("body_rotation", null), lerp_weight)
     _apply_node_local_rotation(entity.get_node_or_null("%WingHolder1") as Node3D, state.get("wing_holder_1_rotation", null), lerp_weight)
     _apply_node_local_rotation(entity.get_node_or_null("%WingHolder2") as Node3D, state.get("wing_holder_2_rotation", null), lerp_weight)
     _apply_node_local_rotation(entity.get_node_or_null("%BoidModel") as Node3D, state.get("boid_model_rotation", null), lerp_weight)
+    _apply_node_local_rotation(entity.get_node_or_null("%GlagglerModel") as Node3D, state.get("glaggler_model_rotation", null), lerp_weight)
+    _apply_node_local_rotation(entity.get_node_or_null("%LegRests") as Node3D, state.get("leg_rests_rotation", null), lerp_weight)
+    _apply_node_local_rotation(entity.get_node_or_null("%LegRays") as Node3D, state.get("leg_rays_rotation", null), lerp_weight)
+    _apply_node_local_rotation(entity.get_node_or_null("%Core") as Node3D, state.get("core_rotation", null), lerp_weight)
 
     var fish_model = entity.get_node_or_null("%FishModel")
     if fish_model != null and is_instance_valid(fish_model):
@@ -3409,6 +3528,51 @@ func _step_client_fish_visuals(entity, delta: float) -> void:
         fish_model.set("speed", lerpf(float(fish_model.get("speed")), speed_ratio, clampf(delta * 3.0, 0.0, 1.0)))
 
 
+func _step_client_glaggler_visuals(entity, delta: float) -> void:
+    if entity == null or not is_instance_valid(entity) or not _object_has_property(entity, "look_direction"):
+        return
+    var horizontal_direction: Vector3 = Vector3(entity.movement_velocity.x, 0.0, entity.movement_velocity.z)
+    if horizontal_direction.length_squared() <= 0.0001:
+        return
+    var look_direction: Vector3 = entity.get("look_direction")
+    look_direction = look_direction.lerp(horizontal_direction.normalized(), clampf(delta * 0.2, 0.0, 1.0))
+    entity.set("look_direction", look_direction)
+    var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
+    if rotation_pivot != null:
+        SpatialMath.look_at_local(rotation_pivot, look_direction)
+
+
+func _step_client_shark_visuals(entity, delta: float) -> void:
+    if entity == null or not is_instance_valid(entity):
+        return
+    if _object_has_property(entity, "time"):
+        entity.set("time", float(entity.get("time")) + delta * 0.1)
+    var body: Node3D = entity.get_node_or_null("%Body") as Node3D
+    if body != null:
+        var spin_per_speed: float = float(entity.get("spin_per_speed")) if _object_has_property(entity, "spin_per_speed") else 0.0
+        body.rotation.x += delta * spin_per_speed * entity.velocity.length()
+    var rotation_pivot: Node3D = entity.get_node_or_null("%RotationPivot") as Node3D
+    if rotation_pivot != null and entity.movement_velocity.length_squared() > 0.0001:
+        SpatialMath.look_at_local(rotation_pivot, -entity.movement_velocity.normalized())
+
+
+func _step_client_diatom_visuals(entity, _delta: float) -> void:
+    if entity == null or not is_instance_valid(entity):
+        return
+    var direction: Vector3 = Vector3(entity.movement_velocity.x, 0.0, entity.movement_velocity.z).normalized()
+    if direction.length_squared() <= 0.0001:
+        return
+    var leg_rests: Node3D = entity.get_node_or_null("%LegRests") as Node3D
+    if leg_rests != null:
+        SpatialMath.look_at_local(leg_rests, direction)
+    var leg_rays: Node3D = entity.get_node_or_null("%LegRays") as Node3D
+    if leg_rays != null:
+        SpatialMath.look_at_local(leg_rays, direction)
+    var core: Node3D = entity.get_node_or_null("%Core") as Node3D
+    if core != null:
+        SpatialMath.look_at_local(core, direction)
+
+
 func _advance_client_animation_tree(entity, delta: float) -> void:
     var animation_tree: AnimationTree = _find_first_animation_tree(entity)
     if animation_tree == null:
@@ -3441,6 +3605,12 @@ func _update_client_procedural_entity_visuals(entity, delta: float) -> void:
         _step_client_boid_visuals(entity, delta)
     elif script_path.ends_with("/fish.gd"):
         _step_client_fish_visuals(entity, delta)
+    elif script_path.ends_with("/glaggler.gd"):
+        _step_client_glaggler_visuals(entity, delta)
+    elif script_path.ends_with("/shark.gd"):
+        _step_client_shark_visuals(entity, delta)
+    elif script_path.ends_with("/diatom.gd"):
+        _step_client_diatom_visuals(entity, delta)
 
 
 func calculate_attack_knockback_velocity(target, attacker_position: Vector3, attacker_velocity: Vector3, knockback_strength: float, fly_strength: float) -> Vector3:
