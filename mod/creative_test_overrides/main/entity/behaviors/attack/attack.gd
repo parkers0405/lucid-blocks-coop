@@ -51,6 +51,15 @@ func attack(target, damage_position: Vector3, knockback_strength: float = 22.0, 
             return true
         return false
 
+    var should_sync_local_entity_attack: bool = entity == Ref.player \
+        and not multiplayer.is_server() \
+        and Ref.coop_manager != null \
+        and target is Entity \
+        and not (target is Player) \
+        and not Ref.coop_manager.is_remote_player_proxy(target)
+    if should_sync_local_entity_attack:
+        return Ref.coop_manager.sync_local_attack_on_entity(entity, target, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect)
+
     target.knockback_velocity += 0.45 * entity.velocity + horizontal_kb * knockback_strength
     target.knockback_velocity.y += knockback_strength * target.jump_modifier * fly_strength * (0.5 if not target.is_on_floor() else 1.0)
     target.attacked(entity, actual_damage)

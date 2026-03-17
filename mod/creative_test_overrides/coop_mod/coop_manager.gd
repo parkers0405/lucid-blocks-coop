@@ -29,6 +29,7 @@ const SHARED_BUBBLE_HARD_TETHER_DISTANCE: float = 80.0
 const SHARED_BUBBLE_TETHER_PULL: float = 10.0
 const ENTITY_SYNC_RADIUS: float = 144.0
 const DROP_SYNC_RADIUS: float = 96.0
+const ENTITY_ATTACK_REQUEST_MAX_DISTANCE: float = 6.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
 const VISUAL_BALL_SCENE_PATH: String = "res://main/items/held_item/held_ball_thrower/ball.tscn"
@@ -44,6 +45,8 @@ const CLIENT_AUTO_PICKUP_RADIUS: float = 2.35
 const CLIENT_PREDICTED_DROP_SYNC_GRACE_MS: int = 350
 const CLIENT_DROP_MERGE_ANIMATION_DISTANCE: float = 2.6
 const CLIENT_DROP_MERGE_ANIMATION_TIME: float = 0.12
+const CLIENT_ENTITY_QUERY_LAYER: int = 16
+const CLIENT_ENTITY_HIT_COOLDOWN_SEC: float = 0.33
 const DEBUG_SPAWN_DISTANCE: float = 6.0
 const DEBUG_SPAWN_RESOURCE_DIR: String = "res://main/items/data/spawners"
 const DEBUG_SPAWN_FALLBACK_IDS: PackedStringArray = [
@@ -1620,6 +1623,30 @@ func sync_host_attack_on_remote_player(attacker: Entity, target, damage_position
     return true
 
 
+func sync_local_attack_on_entity(attacker: Entity, target, damage_position: Vector3, damage: int, knockback_strength: float, fly_strength: float, fire_aspect: bool) -> bool:
+    if not _has_live_peer() or multiplayer.is_server() or attacker == null or not is_instance_valid(attacker) or target == null or not is_instance_valid(target):
+        return false
+    if _is_local_world_authority() or _is_client_gameplay_locked():
+        return false
+    if not (target is Entity) or target is Player or is_remote_player_proxy(target):
+        return false
+
+    var target_uuid: String = _get_sync_uuid(target)
+    if target_uuid == "":
+        return false
+
+    var actual_damage: int = maxi(1, damage)
+    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target, attacker.global_position, _get_entity_total_velocity(attacker), knockback_strength, fly_strength)
+    _predict_client_entity_knockback(target_uuid, target, knockback_velocity)
+    _play_client_entity_hit_feedback(target, attacker, damage_position, actual_damage)
+
+    if attacker.held_item != null and attacker.held_item.item is Tool:
+        attacker.decrease_held_item_durability(1)
+
+    request_entity_attack.rpc_id(1, target_uuid, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect)
+    return true
+
+
 func sync_local_drop_item(item_state, spawn_position: Vector3, launch_velocity: Vector3) -> bool:
     if not _has_live_peer() or multiplayer.is_server() or item_state == null:
         return false
@@ -1731,6 +1758,15 @@ func _cleanup_client_prediction_state() -> void:
         if created_ms <= 0 or now_ms - created_ms <= int(CLIENT_PENDING_PICKUP_LIFETIME * 1000.0):
             live_receipts.append(receipt)
     pending_pickup_receipts = live_receipts
+
+    for child in _get_live_tracked_entities():
+        if not is_client_synced_entity(child):
+            continue
+        var cooldown_until_ms: int = int(child.get_meta("coop_predicted_direct_damage_until_ms", 0))
+        if cooldown_until_ms > 0 and cooldown_until_ms <= now_ms:
+            child.remove_meta("coop_predicted_direct_damage_until_ms")
+            if _object_has_property(child, "direct_damage_cooldown"):
+                child.set("direct_damage_cooldown", false)
 
 
 func _queue_pending_pickup_receipt(item_state) -> void:
@@ -2452,7 +2488,7 @@ func get_remote_player_proxy(peer_id: int):
 
 
 func is_client_synced_entity(node) -> bool:
-    return false
+    return is_instance_valid(node) and bool(node.get_meta("coop_synced_entity", false))
 
 
 func push_client_entity_authoritative_change(node) -> void:
@@ -5568,7 +5604,7 @@ func _configure_client_synced_entity(entity, uuid: String) -> void:
         Ref.preserve_node_manager.node_to_uuid_map[entity] = uuid
     if not tracked_root_entities.has(entity):
         tracked_root_entities.append(entity)
-    _disable_client_entity_runtime(entity)
+    _disable_client_entity_runtime(entity, true)
     if entity is Entity:
         entity.disabled_by_visibility = false
         entity.invincible = true
@@ -5625,6 +5661,8 @@ func _disable_client_entity_runtime_branch(root: Node, node: Node, preserve_inte
     if node is Timer:
         (node as Timer).stop()
 
+    var keep_active_area_branch: bool = preserve_interact_branch and _node_is_within_kept_client_entity_area(node)
+
     if node is Area3D:
         var area := node as Area3D
         if not (preserve_interact_branch and _should_keep_client_entity_area_active(area)):
@@ -5632,6 +5670,8 @@ func _disable_client_entity_runtime_branch(root: Node, node: Node, preserve_inte
             area.monitorable = false
             area.collision_layer = 0
             area.collision_mask = 0
+        else:
+            area.monitorable = true
     elif node is PhysicsBody3D:
         var body := node as PhysicsBody3D
         body.collision_layer = 0
@@ -5640,7 +5680,8 @@ func _disable_client_entity_runtime_branch(root: Node, node: Node, preserve_inte
             body.set_physics_process(false)
 
     if node is CollisionShape3D or node is CollisionPolygon3D:
-        if _object_has_property(node, "disabled"):
+        var keep_root_query_shape: bool = node.get_parent() == root and root is PhysicsBody3D
+        if _object_has_property(node, "disabled") and not keep_root_query_shape and not keep_active_area_branch:
             node.set_deferred("disabled", true)
 
     var keep_animation_runtime: bool = node is AnimationTree or node is AnimationPlayer or node is AudioStreamPlayer3D or node is AudioStreamPlayer or _is_entity_model_node(node)
@@ -5656,6 +5697,15 @@ func _disable_client_entity_runtime_branch(root: Node, node: Node, preserve_inte
 
     for child in node.get_children():
         _disable_client_entity_runtime_branch(root, child, preserve_interact_branch)
+
+
+func _node_is_within_kept_client_entity_area(node: Node) -> bool:
+    var current: Node = node
+    while current != null:
+        if current is Area3D and _should_keep_client_entity_area_active(current as Area3D):
+            return true
+        current = current.get_parent()
+    return false
 
 
 func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw: float, entity_velocity: Vector3, server_time: float = 0.0, movement_velocity: Vector3 = Vector3.ZERO, gravity_velocity: Vector3 = Vector3.ZERO, knockback_velocity: Vector3 = Vector3.ZERO, rope_velocity: Vector3 = Vector3.ZERO, seq: int = 0) -> void:
@@ -5736,7 +5786,9 @@ func _tick_entity_interpolation(delta: float) -> void:
         var from_position: Vector3 = interp.get("from_position", entity.global_position)
         var to_position: Vector3 = interp.get("to_position", entity.global_position)
         var predicted_extra: float = minf(maxf(elapsed - duration, 0.0), ENTITY_DR_HEARTBEAT_SEC)
-        entity.global_position = from_position.lerp(to_position, weight) + interp.get("velocity", Vector3.ZERO) * predicted_extra
+        var predicted_velocity: Vector3 = interp.get("velocity", Vector3.ZERO)
+        predicted_velocity.y = 0.0
+        entity.global_position = from_position.lerp(to_position, weight) + predicted_velocity * predicted_extra
         var entity_yaw: float = lerp_angle(float(interp.get("from_yaw", _get_entity_visual_yaw(entity))), float(interp.get("to_yaw", _get_entity_visual_yaw(entity))), weight) + float(interp.get("yaw_velocity", 0.0)) * predicted_extra
         _set_entity_visual_yaw(entity, entity_yaw)
         if entity.has_method("override_position"):
@@ -6104,16 +6156,78 @@ func _find_client_synced_entity_by_uuid(uuid: String):
     return _find_existing_entity_by_uuid(uuid)
 
 
-func _predict_client_entity_knockback(_target_uuid: String, _target, _knockback_velocity: Vector3) -> void:
-    return
+func _set_client_entity_direct_damage_cooldown(target, duration: float = CLIENT_ENTITY_HIT_COOLDOWN_SEC) -> void:
+    if target == null or not is_instance_valid(target):
+        return
+    target.set_meta("coop_predicted_direct_damage_until_ms", Time.get_ticks_msec() + int(duration * 1000.0))
+    if _object_has_property(target, "direct_damage_cooldown"):
+        target.set("direct_damage_cooldown", true)
 
 
-func _confirm_client_entity_hit(_target_uuid: String, _target, _entity_position: Vector3, _entity_yaw: float, _entity_velocity: Vector3, _knockback_velocity: Vector3, _server_time: float, _seq: int) -> void:
-    return
+func _predict_client_entity_knockback(target_uuid: String, target, knockback_velocity: Vector3) -> void:
+    if target == null or not is_instance_valid(target):
+        return
+
+    _set_client_entity_direct_damage_cooldown(target)
+
+    if target is Entity:
+        target.knockback_velocity += knockback_velocity
+        target.velocity = _get_entity_total_velocity(target)
+    elif _object_has_property(target, "velocity"):
+        target.set("velocity", knockback_velocity)
+
+    if target_uuid == "":
+        return
+
+    var local_receive_time: float = float(Time.get_ticks_msec()) / 1000.0
+    var total_velocity: Vector3 = _get_entity_total_velocity(target)
+    var interp: Dictionary = entity_interp_map.get(target_uuid, {})
+    var duration: float = maxf(float(interp.get("duration", WORLD_STATE_INTERVAL)), WORLD_STATE_INTERVAL)
+    entity_interp_map[target_uuid] = {
+        "entity": target,
+        "from_position": target.global_position,
+        "to_position": target.global_position,
+        "from_yaw": _get_entity_visual_yaw(target),
+        "to_yaw": _get_entity_visual_yaw(target),
+        "velocity": total_velocity,
+        "elapsed": duration,
+        "duration": duration,
+        "server_time": float(interp.get("server_time", client_server_time)),
+        "seq": int(interp.get("seq", client_last_world_state_sequence)),
+        "yaw_velocity": 0.0,
+        "received_local_time": local_receive_time,
+    }
 
 
-func _play_client_entity_hit_feedback(_target, _attacker, _damage_position: Vector3, _damage: int, _attacker_position_override: Variant = null) -> void:
-    return
+func _confirm_client_entity_hit(target_uuid: String, target, entity_position: Vector3, entity_yaw: float, entity_velocity: Vector3, knockback_velocity: Vector3, server_time: float, seq: int) -> void:
+    if target == null or not is_instance_valid(target):
+        target = _find_client_synced_entity_by_uuid(target_uuid)
+    if target == null or not is_instance_valid(target):
+        return
+    if target is Entity:
+        target.knockback_velocity = knockback_velocity
+    _apply_client_entity_snapshot(target, entity_position, entity_yaw, entity_velocity, server_time, (target.movement_velocity if target is Entity else Vector3.ZERO), (target.gravity_velocity if target is Entity else Vector3.ZERO), knockback_velocity, (target.rope_velocity if target is Entity else Vector3.ZERO), seq)
+
+
+func _play_client_entity_hit_feedback(target, _attacker, _damage_position: Vector3, damage: int, _attacker_position_override: Variant = null) -> void:
+    if target == null or not is_instance_valid(target) or damage <= 0:
+        return
+
+    _set_client_entity_direct_damage_cooldown(target)
+
+    if not _object_has_property(target, "damage_modulate") or not _object_has_property(target, "modulate"):
+        return
+
+    var damage_modulate: Color = target.get("damage_modulate")
+    if is_instance_valid(target.get("modulate_tween")):
+        target.get("modulate_tween").stop()
+
+    var tween: Tween = get_tree().create_tween()
+    if _object_has_property(target, "modulate_tween"):
+        target.set("modulate_tween", tween)
+    tween.tween_property(target, "modulate", damage_modulate, 0.04)
+    tween.tween_interval(0.18)
+    tween.tween_property(target, "modulate", Color.WHITE, 0.07)
 
 
 func _apply_network_place(block_position: Vector3i, block_id: int) -> void:
@@ -6736,6 +6850,46 @@ func request_foliage_break(block_position: Vector3i) -> void:
         new_state.count = 1
         _spawn_network_item(new_state, block_position)
     sync_break_block.rpc(block_position)
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func request_entity_attack(target_uuid: String, damage_position: Vector3, damage: int, knockback_strength: float, fly_strength: float, fire_aspect: bool) -> void:
+    if not multiplayer.is_server():
+        return
+
+    var sender_id: int = multiplayer.get_remote_sender_id()
+    if sender_id <= 0:
+        return
+
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if sender_state.is_empty() or not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
+        return
+
+    var attacker = get_remote_player_proxy(sender_id)
+    if attacker == null or not is_instance_valid(attacker) or attacker.dead or attacker.disabled:
+        return
+
+    var target = _find_existing_entity_by_uuid(target_uuid)
+    if target == null or not is_instance_valid(target) or not (target is Entity) or target is Player or is_remote_player_proxy(target):
+        return
+
+    var target_entity := target as Entity
+    if target_entity.dead or target_entity.disabled or target_entity.direct_damage_cooldown:
+        return
+    if attacker.global_position.distance_squared_to(target_entity.global_position) > ENTITY_ATTACK_REQUEST_MAX_DISTANCE * ENTITY_ATTACK_REQUEST_MAX_DISTANCE:
+        return
+
+    var actual_damage: int = maxi(1, damage)
+    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target_entity, attacker.global_position, _get_entity_total_velocity(attacker), knockback_strength, fly_strength)
+    target_entity.knockback_velocity += knockback_velocity
+    target_entity.attacked(attacker, actual_damage)
+
+    if fire_aspect and target_entity.has_node("%Burn"):
+        target_entity.get_node("%Burn").ignite()
+
+    if target_entity.has_node("%Bleed"):
+        var target_to_attacker: Vector3 = (attacker.global_position - target_entity.global_position).normalized()
+        target_entity.get_node("%Bleed").bleed(damage_position, target_to_attacker, actual_damage)
 
 
 @rpc("authority", "call_remote", "reliable")
