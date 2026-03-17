@@ -144,7 +144,7 @@ func _get_target_position() -> Vector3:
     var fallback: Vector3 = player.global_position if is_instance_valid(player) else global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_nearest_session_player_position(global_position, fallback)
+    return Ref.coop_manager.get_preferred_session_player_position(global_position, player, fallback)
 
 
 func _get_target_head_position() -> Vector3:
@@ -153,14 +153,14 @@ func _get_target_head_position() -> Vector3:
         fallback = player.head.global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_nearest_session_player_head_position(global_position, fallback)
+    return Ref.coop_manager.get_preferred_session_player_head_position(global_position, player, fallback)
 
 
 func _get_session_target_player():
     var fallback = player if is_instance_valid(player) else Ref.player
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_nearest_session_player_entity(global_position, fallback)
+    return Ref.coop_manager.get_preferred_session_player_entity(global_position, player, fallback)
 
 
 func get_random_flat_vector() -> Vector3:
@@ -176,8 +176,13 @@ func _on_fired() -> void:
 
 func _on_attacked(attacker) -> void:
     if _is_session_player_entity(attacker):
+        player = attacker
+        attack_target = attacker
         hostility += 1.0
         friend_hostility += 0.25
+        if state == IDLE or state == CRUCIFY:
+            interest_place = _get_target_position() + get_random_flat_vector() * wary_range
+            switch_state(WARY)
 
     if randf() < jump_attack_chance:
         will_jump = true

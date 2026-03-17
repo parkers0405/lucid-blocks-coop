@@ -2376,16 +2376,28 @@ func get_nearest_session_player_distance(world_position: Vector3, fallback_dista
 
 
 func get_nearest_session_player_position(world_position: Vector3, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
-    var positions: Array = _get_same_instance_session_positions()
-    if positions.is_empty():
-        return fallback_position
-    var nearest_position: Vector3 = positions[0]
-    var nearest_distance_squared: float = world_position.distance_squared_to(nearest_position)
-    for position in positions:
-        var distance_squared: float = world_position.distance_squared_to(position)
-        if distance_squared < nearest_distance_squared:
-            nearest_distance_squared = distance_squared
-            nearest_position = position
+    var nearest_position: Vector3 = fallback_position
+    var nearest_distance_squared: float = INF
+
+    if _is_local_session_player_targetable():
+        nearest_position = Ref.player.global_position
+        nearest_distance_squared = world_position.distance_squared_to(nearest_position)
+
+    if not _has_live_peer():
+        return nearest_position
+
+    var active_instance_key: String = get_active_dimension_instance_key()
+    for peer_id in remote_player_proxies.keys():
+        if not _is_remote_session_player_targetable(int(peer_id), active_instance_key):
+            continue
+        var proxy = remote_player_proxies[peer_id]
+        var proxy_position: Vector3 = proxy.global_position
+        var distance_squared: float = world_position.distance_squared_to(proxy_position)
+        if distance_squared >= nearest_distance_squared:
+            continue
+        nearest_distance_squared = distance_squared
+        nearest_position = proxy_position
+
     return nearest_position
 
 
@@ -2397,11 +2409,64 @@ func _is_local_session_player_active() -> bool:
     return _can_sample_player() and not Ref.player.dead and (not Ref.player.disabled or is_local_player_downed()) and not is_local_player_fake_dead() and Ref.player.is_inside_tree()
 
 
+func _is_local_session_player_targetable() -> bool:
+    return _can_sample_player() and not Ref.player.dead and not Ref.player.disabled and not is_local_player_fake_dead() and Ref.player.is_inside_tree()
+
+
+func _is_remote_session_player_targetable(peer_id: int, active_instance_key: String) -> bool:
+    var state: Dictionary = peer_states.get(peer_id, {})
+    if not _is_peer_state_same_instance(state, active_instance_key):
+        return false
+    if bool(state.get("downed", false)):
+        return false
+    var proxy = get_remote_player_proxy(peer_id)
+    return is_instance_valid(proxy) and proxy.is_inside_tree() and not proxy.dead and not proxy.disabled
+
+
+func _is_preferred_session_player_targetable(preferred_target, active_instance_key: String) -> bool:
+    if not is_instance_valid(preferred_target):
+        return false
+    if preferred_target == Ref.player:
+        return _is_local_session_player_targetable()
+    if not is_remote_player_proxy(preferred_target):
+        return false
+    return _is_remote_session_player_targetable(get_remote_player_proxy_peer_id(preferred_target), active_instance_key)
+
+
+func get_preferred_session_player_position(world_position: Vector3, preferred_target = null, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
+    if not _has_live_peer() and not _is_local_world_authority():
+        return fallback_position
+    var active_instance_key: String = get_active_dimension_instance_key()
+    if _is_preferred_session_player_targetable(preferred_target, active_instance_key):
+        return preferred_target.global_position
+    return get_nearest_session_player_position(world_position, fallback_position)
+
+
+func get_preferred_session_player_head_position(world_position: Vector3, preferred_target = null, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
+    if not _has_live_peer() and not _is_local_world_authority():
+        return fallback_position
+    var active_instance_key: String = get_active_dimension_instance_key()
+    if _is_preferred_session_player_targetable(preferred_target, active_instance_key):
+        if is_instance_valid(preferred_target.head):
+            return preferred_target.head.global_position
+        return preferred_target.global_position + Vector3(0, 1.45, 0)
+    return get_nearest_session_player_head_position(world_position, fallback_position)
+
+
+func get_preferred_session_player_entity(world_position: Vector3, preferred_target = null, fallback = null):
+    if not _has_live_peer() and not _is_local_world_authority():
+        return fallback
+    var active_instance_key: String = get_active_dimension_instance_key()
+    if _is_preferred_session_player_targetable(preferred_target, active_instance_key):
+        return preferred_target
+    return get_nearest_session_player_entity(world_position, fallback)
+
+
 func get_nearest_session_player_head_position(world_position: Vector3, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
     var nearest_head_position: Vector3 = fallback_position
     var nearest_distance_squared: float = INF
 
-    if _is_local_session_player_active():
+    if _is_local_session_player_targetable():
         var local_head: Vector3 = Ref.player.head.global_position if is_instance_valid(Ref.player.head) else Ref.player.global_position + Vector3(0, 1.45, 0)
         nearest_head_position = local_head
         nearest_distance_squared = world_position.distance_squared_to(Ref.player.global_position)
@@ -2415,15 +2480,15 @@ func get_nearest_session_player_head_position(world_position: Vector3, fallback_
         var int_peer_id: int = int(peer_id)
         if int_peer_id == local_peer_id:
             continue
-        var state: Dictionary = peer_states[peer_id]
-        if not _is_peer_state_same_instance(state, active_instance_key):
+        if not _is_remote_session_player_targetable(int_peer_id, active_instance_key):
             continue
-        var peer_position: Vector3 = state.get("position", Vector3.ZERO)
+        var proxy = get_remote_player_proxy(int_peer_id)
+        var peer_position: Vector3 = proxy.global_position
         var distance_squared: float = world_position.distance_squared_to(peer_position)
         if distance_squared >= nearest_distance_squared:
             continue
         nearest_distance_squared = distance_squared
-        nearest_head_position = peer_position + Vector3(0, 1.45 if not bool(state.get("crouching", false)) else 1.1, 0)
+        nearest_head_position = proxy.head.global_position if is_instance_valid(proxy.head) else peer_position + Vector3(0, 1.45, 0)
 
     return nearest_head_position
 
@@ -2446,7 +2511,7 @@ func get_nearest_session_player_entity(world_position: Vector3, fallback = null)
     var nearest = fallback
     var nearest_distance_squared: float = INF
 
-    if _is_local_session_player_active():
+    if _is_local_session_player_targetable():
         nearest = Ref.player
         nearest_distance_squared = world_position.distance_squared_to(Ref.player.global_position)
 
@@ -2455,12 +2520,9 @@ func get_nearest_session_player_entity(world_position: Vector3, fallback = null)
 
     var active_instance_key: String = get_active_dimension_instance_key()
     for peer_id in remote_player_proxies.keys():
+        if not _is_remote_session_player_targetable(int(peer_id), active_instance_key):
+            continue
         var proxy = remote_player_proxies[peer_id]
-        if not is_instance_valid(proxy) or proxy.dead or not proxy.is_inside_tree():
-            continue
-        var state: Dictionary = peer_states.get(peer_id, {})
-        if not _is_peer_state_same_instance(state, active_instance_key):
-            continue
         var distance_squared: float = world_position.distance_squared_to(proxy.global_position)
         if distance_squared >= nearest_distance_squared:
             continue
@@ -5560,14 +5622,14 @@ func _apply_client_entity_snapshots(entity_snapshots: Array, sequence: int = 0) 
         synced_entities[uuid] = entity
         _configure_client_synced_entity(entity, uuid)
         entity.set_meta("coop_last_snapshot_msec", Time.get_ticks_msec())
-        entity.visible = not dead
 
         if entity is Entity:
-            entity.disabled = disabled
             entity.disabled_by_visibility = false
             entity.invincible = true
             entity.invincible_temporary = true
-            _set_client_entity_hit_proxy_enabled(entity, not dead and not disabled)
+            _apply_client_entity_authoritative_lifecycle(entity as Entity, dead, disabled)
+        else:
+            entity.visible = not dead
 
         _apply_entity_held_item_state(entity, held_item_id, held_item_index)
         _apply_entity_special_state(entity, special_state)
@@ -6596,6 +6658,49 @@ func _find_client_synced_entity_by_uuid(uuid: String):
     return _find_existing_entity_by_uuid(uuid)
 
 
+func _apply_client_entity_authoritative_lifecycle(entity: Entity, dead: bool, disabled: bool) -> void:
+    if entity == null or not is_instance_valid(entity):
+        return
+
+    var was_dead: bool = bool(entity.get_meta("coop_client_authoritative_dead", bool(entity.dead)))
+    entity.set_meta("coop_client_authoritative_dead", dead)
+
+    if dead:
+        entity.visible = true
+        entity.disabled = true
+        if not entity.dead:
+            entity.dead = true
+        _set_client_entity_hit_proxy_enabled(entity, false)
+        _play_client_entity_death_visual(entity, was_dead)
+        return
+
+    entity.visible = true
+    entity.disabled = disabled
+    if entity.dead:
+        entity.dead = false
+    entity.set_meta("coop_client_death_visual_played", false)
+    _set_client_entity_hit_proxy_enabled(entity, not disabled)
+
+
+func _play_client_entity_death_visual(entity: Entity, was_dead: bool) -> void:
+    if entity == null or not is_instance_valid(entity):
+        return
+    if was_dead or bool(entity.get_meta("coop_client_death_visual_played", false)):
+        return
+
+    entity.set_meta("coop_client_death_visual_played", true)
+
+    var interact_area: Node = entity.get_node_or_null("%InteractArea3D")
+    if interact_area != null:
+        for child in interact_area.get_children():
+            if child is CollisionShape3D:
+                child.set_deferred("disabled", true)
+
+    var death_anim: AnimationPlayer = entity.get_node_or_null("%DeathAnimationPlayer") as AnimationPlayer
+    if death_anim != null and death_anim.has_animation("die"):
+        death_anim.play("die")
+
+
 func _set_client_entity_direct_damage_cooldown(target, duration: float = CLIENT_ENTITY_HIT_COOLDOWN_SEC) -> void:
     if target == null or not is_instance_valid(target):
         return
@@ -7491,8 +7596,8 @@ func confirm_entity_attack(target_uuid: String, entity_position: Vector3, entity
         return
 
     if target is Entity:
-        target.dead = dead
-        target.disabled = disabled
+        _apply_client_entity_authoritative_lifecycle(target as Entity, dead, disabled)
+    else:
         target.visible = not dead
 
     var entity_velocity: Vector3 = movement_velocity + gravity_velocity + knockback_velocity + rope_velocity

@@ -32,6 +32,7 @@ var desired_velocity: Vector3 = Vector3.ZERO
 var near_entities: Array = []
 var attacked_by_player: bool = false
 var stuck_impulse: Vector3
+var chase_target_override = null
 
 
 func _ready() -> void:
@@ -124,10 +125,10 @@ func _is_session_player_entity(entity) -> bool:
 
 
 func _get_chase_target():
-    var fallback = Ref.player if is_instance_valid(Ref.player) else null
+    var fallback = chase_target_override if is_instance_valid(chase_target_override) else (Ref.player if is_instance_valid(Ref.player) else null)
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_nearest_session_player_entity(global_position, fallback)
+    return Ref.coop_manager.get_preferred_session_player_entity(global_position, chase_target_override, fallback)
 
 
 func _on_body_entered_attack(body: Node3D) -> void:
@@ -261,5 +262,6 @@ func die() -> void:
 func _on_attacked(attacker) -> void:
     if _is_session_player_entity(attacker):
         attacked_by_player = true
+        chase_target_override = attacker
     if jumpy and randf() < 0.1 and stuck_impulse.length() < 32.0:
         stuck_impulse = Vector3(randf_range(-0.5, 0.5), 0.0, randf_range(-0.5, 0.5)).normalized() * 96.0

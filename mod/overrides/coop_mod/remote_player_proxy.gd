@@ -103,13 +103,14 @@ func apply_remote_state(state: Dictionary) -> void:
 	_has_pending_state = true
 
 
-func _physics_process(_delta: float) -> void:
+func _physics_process(delta: float) -> void:
 	if not _has_pending_state and _last_update_msec <= 0:
 		return
 
-	global_position = _target_position
-	if has_method("force_update_transform"):
-		force_update_transform()
+	var desired_position: Vector3 = _target_position
+	var displacement: Vector3 = desired_position - global_position
+	var step_delta: float = maxf(delta, 0.001)
+	velocity = displacement / step_delta
 
 	dead = false
 	disabled = _target_downed
@@ -122,6 +123,14 @@ func _physics_process(_delta: float) -> void:
 
 	crouching = _target_crouching or _target_downed
 	_apply_crouching(crouching)
+
+	if displacement.length_squared() > 0.0:
+		if displacement.length() > 8.0:
+			global_position = desired_position
+			if has_method("force_update_transform"):
+				force_update_transform()
+		else:
+			move_and_collide(displacement)
 
 	if is_instance_valid(rotation_pivot):
 		rotation_pivot.rotation.y = _target_yaw

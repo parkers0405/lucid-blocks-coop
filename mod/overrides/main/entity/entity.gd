@@ -349,7 +349,7 @@ func get_session_target_entity(default_target = null):
         fallback = Ref.player
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_nearest_session_player_entity(global_position, fallback)
+    return Ref.coop_manager.get_preferred_session_player_entity(global_position, fallback, fallback)
 
 
 func get_session_target_position(default_position: Vector3) -> Vector3:

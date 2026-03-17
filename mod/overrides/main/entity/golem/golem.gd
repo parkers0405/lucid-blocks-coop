@@ -125,7 +125,7 @@ func _get_target_position() -> Vector3:
     var fallback: Vector3 = attack_target.global_position if is_instance_valid(attack_target) else global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_nearest_session_player_position(global_position, fallback)
+    return Ref.coop_manager.get_preferred_session_player_position(global_position, attack_target, fallback)
 
 
 func _get_target_head_position() -> Vector3:
@@ -134,10 +134,13 @@ func _get_target_head_position() -> Vector3:
         fallback = attack_target.head.global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_nearest_session_player_head_position(global_position, fallback)
+    return Ref.coop_manager.get_preferred_session_player_head_position(global_position, attack_target, fallback)
 
 
-func _get_priority_attack_target():
+func _get_priority_attack_target(preferred_target = null):
+    if _is_session_player_entity(preferred_target) and is_instance_valid(preferred_target) and not preferred_target.dead and not preferred_target.disabled:
+        return preferred_target
+
     var nearest = null
     var nearest_player = null
 
@@ -152,7 +155,7 @@ func _get_priority_attack_target():
     if is_instance_valid(nearest_player):
         return nearest_player
     if _use_session_targeting():
-        var session_target = Ref.coop_manager.get_nearest_session_player_entity(global_position, nearest)
+        var session_target = Ref.coop_manager.get_preferred_session_player_entity(global_position, preferred_target, nearest)
         if is_instance_valid(session_target) and not session_target.dead and not session_target.disabled:
             return session_target
     return nearest
@@ -242,16 +245,16 @@ func _physics_process(delta: float) -> void:
                 desired_direction = Vector3.ZERO
                 initialize_state()
         else:
-            attack_target = _get_priority_attack_target()
+            attack_target = _get_priority_attack_target(attack_target)
             if state != DEFENSE:
                 state = DEFENSE
                 initialize_state()
 
     if state == DEFENSE:
         if _use_session_targeting():
-            attack_target = _get_priority_attack_target()
+            attack_target = _get_priority_attack_target(attack_target)
         elif not is_instance_valid(attack_target):
-            attack_target = _get_priority_attack_target()
+            attack_target = _get_priority_attack_target(attack_target)
         if not is_instance_valid(attack_target) and not _has_session_player_target():
             state = IDLE
             desired_direction = Vector3.ZERO

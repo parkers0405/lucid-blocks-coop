@@ -51,7 +51,9 @@ func _on_body_entered_attack(body: Node3D) -> void:
         initialize_state()
 
 
-func _on_attacked(_attacker) -> void:
+func _on_attacked(attacker) -> void:
+    if _is_session_player_entity(attacker):
+        chase_target_override = attacker
     if state != CHASE:
         state = CHASE
         initialize_state()
