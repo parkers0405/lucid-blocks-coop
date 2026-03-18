@@ -44,7 +44,12 @@ func interact(interactor: Entity) -> void:
     super.interact(interactor)
 
     if Ref.coop_manager != null:
-        Ref.coop_manager.travel_group_to_dimension(int(target_dimension))
+        if target_dimension == LucidBlocksWorld.Dimension.POCKET and Ref.coop_manager.has_method("prompt_pocket_dimension_choice"):
+            Ref.coop_manager.prompt_pocket_dimension_choice(false)
+        elif Ref.world.current_dimension == LucidBlocksWorld.Dimension.POCKET and Ref.coop_manager.has_method("open_dimension_instance"):
+            Ref.coop_manager.open_dimension_instance(int(target_dimension))
+        else:
+            Ref.coop_manager.travel_group_to_dimension(int(target_dimension))
     else:
         Ref.main.teleport_to_dimension(target_dimension)
 

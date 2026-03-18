@@ -10,6 +10,20 @@ DEFAULT_MOD_NAME="lucid-blocks-coop-test.pck"
 DEFAULT_PROJECT_DIR="$ROOT_DIR/mod/overrides"
 DEFAULT_DIST_DIR="$ROOT_DIR/dist"
 
+build_and_copy_pack() {
+  local godot_bin="$1"
+  local project_dir="$2"
+  local target_path="$3"
+  local dist_target_path="$4"
+  local label="$5"
+
+  printf 'Building %s\n' "$target_path"
+  "$godot_bin" --headless --path "$project_dir" --export-pack "Linux/X11" "$target_path"
+  printf 'Installed %s pack to %s\n' "$label" "$target_path"
+  cp -f "$target_path" "$dist_target_path"
+  printf 'Copied %s pack to %s\n' "$label" "$dist_target_path"
+}
+
 resolve_godot_bin() {
   if [[ -n "${GODOT_EXPORT_BIN:-}" ]]; then
     if [[ -x "$GODOT_EXPORT_BIN" ]]; then
@@ -79,17 +93,8 @@ main() {
     \( -name 'lucid-blocks-coop*.pck' -o -name 'zz-lucid-blocks-coop*.pck' -o -name 'zzz-lucid-blocks-command-chat*.pck' \) \
     -delete
 
-  printf 'Building %s\n' "$target_path"
-  "$godot_bin" --headless --path "$project_dir" --export-pack "Linux/X11" "$target_path"
-  printf 'Installed mod pack to %s\n' "$target_path"
-  cp -f "$target_path" "$dist_target_path"
-  printf 'Copied mod pack to %s\n' "$dist_target_path"
-
-  printf 'Building %s\n' "$chat_target_path"
-  "$godot_bin" --headless --path "$chat_mod_dir" --export-pack "Linux/X11" "$chat_target_path"
-  printf 'Installed chat mod pack to %s\n' "$chat_target_path"
-  cp -f "$chat_target_path" "$dist_chat_target_path"
-  printf 'Copied chat mod pack to %s\n' "$dist_chat_target_path"
+  build_and_copy_pack "$godot_bin" "$project_dir" "$target_path" "$dist_target_path" "coop mod"
+  build_and_copy_pack "$godot_bin" "$chat_mod_dir" "$chat_target_path" "$dist_chat_target_path" "chat mod"
 }
 
 main "$@"

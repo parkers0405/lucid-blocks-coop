@@ -1003,7 +1003,39 @@ func _tick_local_downed_state(_delta: float) -> void:
                 status_message = "Both downed - waiting for host regroup"
                 _update_status_text()
             return
-        _commit_local_real_death("No partner available to revive you")
+        
+        # If there are live peers elsewhere, just teleport us to safety (home or overworld) instead of game-overing
+        var other_peers_alive = false
+        for p in peer_states.keys():
+            if int(p) != multiplayer.get_unique_id() and bool(peer_states[p].get("active", false)) and not bool(peer_states[p].get("downed", false)):
+                other_peers_alive = true
+                break
+                
+        other_peers_alive = false
+        for p in peer_states.keys():
+            var p_state: Dictionary = peer_states[p]
+            if int(p) != multiplayer.get_unique_id() and bool(p_state.get("active", false)) and not bool(p_state.get("downed", false)):
+                other_peers_alive = true
+                break
+                
+        if other_peers_alive:
+            status_message = "No partner in dimension. Returning..."
+            _update_status_text()
+            _clear_local_downed_state()
+            
+            if is_instance_valid(Ref.player):
+                Ref.player.health = maxi(int(Ref.player.max_health) / 4, 3)
+                Ref.player.dead = false
+                Ref.player.disabled = false
+                Ref.player.invincible = false
+                Ref.player.invincible_temporary = false
+                
+            if int(Ref.world.current_dimension) == int(LucidBlocksWorld.Dimension.POCKET):
+                open_dimension_instance(0, "")
+            else:
+                open_dimension_instance(int(LucidBlocksWorld.Dimension.POCKET), "")
+        else:
+            _commit_local_real_death("No partner available to revive you")
 
 
 func _get_revivable_peer_state() -> Dictionary:
@@ -1183,6 +1215,7 @@ func _resolve_target_pocket_owner_key(target_dimension: int, target_pocket_owner
     var pocket_owner_key: String = target_pocket_owner_key.strip_edges()
     if target_dimension == int(LucidBlocksWorld.Dimension.POCKET) and pocket_owner_key == "":
         pocket_owner_key = _get_local_player_key()
+    _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension, pocket_owner_key)
     return pocket_owner_key
 
 
@@ -1190,10 +1223,13 @@ func _travel_group_to_dimension_async(target_dimension: int, immediate: bool = f
     if not _can_sample_player() or group_dimension_transfer_in_progress:
         return
 
+    _persist_current_owned_pocket_variants_if_needed()
     var pocket_owner_key: String = _resolve_target_pocket_owner_key(target_dimension, target_pocket_owner_key)
     if not _has_live_peer():
         _set_loaded_dimension_instance(target_dimension, pocket_owner_key)
+        suppress_local_game_quit_session_shutdown = true
         await Ref.main.teleport_to_dimension(target_dimension, immediate, white_close)
+        suppress_local_game_quit_session_shutdown = false
         return
 
     if not multiplayer.is_server():
@@ -1229,17 +1265,55 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
     if not _can_sample_player():
         return
 
+    _persist_current_owned_pocket_variants_if_needed()
     var pocket_owner_key: String = _resolve_target_pocket_owner_key(target_dimension, target_pocket_owner_key)
 
+    var host_in_target = false
     if _has_live_peer() and not multiplayer.is_server():
-        _send_persistent_state_to_host()
-        request_dimension_world_snapshot.rpc_id(1, target_dimension, pocket_owner_key)
-        status_message = "Requesting world sync"
-        _update_status_text()
-        return
-
+        var target_key = get_dimension_instance_key(target_dimension, pocket_owner_key)
+        var host_state = peer_states.get(1, {})
+        if str(host_state.get("dimension_instance_key", "")) == target_key:
+            host_in_target = true
+            
+        # Only request snapshot if host is actually in the target dimension!
+        if host_in_target:
+            _send_persistent_state_to_host()
+            request_dimension_world_snapshot.rpc_id(1, target_dimension, pocket_owner_key)
+            status_message = "Requesting world sync"
+            _update_status_text()
+            return
+            
+    # Load locally!
     _set_loaded_dimension_instance(target_dimension, pocket_owner_key)
-    await Ref.main.teleport_to_dimension(target_dimension)
+    suppress_local_game_quit_session_shutdown = true
+    await Ref.main.teleport_to_dimension(target_dimension, false, false)
+    suppress_local_game_quit_session_shutdown = false
+    if _has_live_peer():
+        _broadcast_local_state_now()
+    
+    # If leaving pocket dimension, teleport to another player in that dimension if possible
+    if target_dimension != int(LucidBlocksWorld.Dimension.POCKET) and is_instance_valid(Ref.player):
+        var target_key = get_active_dimension_instance_key()
+        var target_pos = Vector3.ZERO
+        var found_peer = false
+        for peer_id in peer_states.keys():
+            var int_peer_id = int(peer_id)
+            if int_peer_id == multiplayer.get_unique_id():
+                continue
+            var state = peer_states[peer_id]
+            if str(state.get("dimension_instance_key", "")) == target_key and bool(state.get("active", false)):
+                target_pos = state.get("position", Vector3.ZERO)
+                found_peer = true
+                break
+                
+        if found_peer:
+            # We must await a frame to ensure player is fully initialized in the new world
+            await get_tree().process_frame
+            await get_tree().process_frame
+            if is_instance_valid(Ref.player):
+                _teleport_local_player_near(target_pos)
+                status_message = "Teleported to peer"
+                _update_status_text()
 
 
 func _set_loaded_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> void:
@@ -1292,8 +1366,12 @@ func teleport_to_connected_player() -> void:
         return
 
     if str(target_state.get("dimension_instance_key", "")) != get_active_dimension_instance_key():
-        request_host_world_snapshot.rpc_id(1)
-        status_message = "Resyncing to host world"
+        var target_key = str(target_state.get("dimension_instance_key", ""))
+        if target_key.begins_with("pocket:"):
+            open_dimension_instance(int(LucidBlocksWorld.Dimension.POCKET), target_key.substr(7))
+        elif target_key.begins_with("dimension:"):
+            open_dimension_instance(int(target_key.substr(10)))
+        status_message = "Teleporting to peer dimension"
         _update_status_text()
         return
 
@@ -1321,6 +1399,10 @@ func execute_command(raw_text: String) -> void:
             _execute_kill_command(parts)
         "/list":
             _execute_list_command()
+        "/home":
+            _execute_home_command()
+        "/give":
+            _execute_give_command(parts)
         "/tp":
             _execute_tp_command(parts)
         "/gamemode", "/gm":
@@ -1364,6 +1446,119 @@ func execute_command(raw_text: String) -> void:
 
 
 
+
+func _execute_home_command() -> void:
+    if not is_instance_valid(Ref.player):
+        return
+        
+    if not str(get_active_dimension_instance_key()).begins_with("pocket:"):
+        prompt_pocket_dimension_choice(false)
+    else:
+        status_message = "Already in pocket dimension"
+        _update_status_text()
+
+func prompt_pocket_dimension_choice(is_group_travel: bool) -> void:
+    var canvas = CanvasLayer.new()
+    canvas.layer = 100
+    add_child(canvas)
+    
+    var popup = PopupMenu.new()
+    canvas.add_child(popup)
+    
+    popup.add_theme_font_size_override("font_size", 16)
+    popup.add_item("My Pocket Dimension", 0)
+    
+    var peer_keys = []
+    var item_id = 1
+    
+    for peer_id in peer_states.keys():
+        if int(peer_id) == multiplayer.get_unique_id():
+            continue
+        var state = peer_states[peer_id]
+        if not bool(state.get("active", false)):
+            continue
+        var peer_name = str(state.get("name", "Peer " + str(peer_id)))
+        var player_key = str(state.get("player_key", "")).strip_edges()
+        if player_key != "":
+            popup.add_item(peer_name + "'s Pocket Dimension", item_id)
+            peer_keys.append(player_key)
+            item_id += 1
+            
+    var was_captured = false
+    if MouseHandler.captured:
+        was_captured = true
+        MouseHandler.release()
+        
+    popup.id_pressed.connect(func(id: int):
+        var target_key = ""
+        if id > 0:
+            target_key = peer_keys[id - 1]
+            
+        status_message = "Teleporting to pocket dimension..."
+        _update_status_text()
+        
+        if is_group_travel:
+            travel_group_to_dimension(int(LucidBlocksWorld.Dimension.POCKET), false, false, target_key)
+        else:
+            open_dimension_instance(int(LucidBlocksWorld.Dimension.POCKET), target_key)
+    )
+    
+    popup.popup_hide.connect(func():
+        if was_captured:
+            MouseHandler.capture()
+        canvas.queue_free()
+    )
+    
+    popup.popup_centered()
+
+func _execute_give_command(parts: PackedStringArray) -> void:
+    if parts.size() < 3:
+        status_message = "Usage: /give <amount> <item_name_or_id>"
+        _update_status_text()
+        return
+        
+    var amount = 1
+    if parts[1].is_valid_int():
+        amount = int(parts[1])
+        
+    var item_str = parts[2]
+        
+    if not is_instance_valid(Ref.player) or not is_instance_valid(Ref.player_inventory):
+        status_message = "Cannot give items right now"
+        _update_status_text()
+        return
+        
+    var item_id = -1
+    var item_map = get_tree().root.get_node_or_null("ItemMap")
+    
+    if item_str.is_valid_int():
+        item_id = int(item_str)
+    elif is_instance_valid(item_map) and "id_to_resource" in item_map:
+        for id in item_map.id_to_resource.keys():
+            var item = item_map.id_to_resource[id]
+            var item_name = str(item.get("display_name", item.get("internal_name", ""))).to_lower().replace(" ", "_")
+            if item_name == item_str.to_lower():
+                item_id = id
+                break
+                
+    if item_id >= 0:
+        if is_instance_valid(item_map) and "id_to_resource" in item_map and not item_map.id_to_resource.has(item_id):
+            status_message = "Unknown item id: %d" % item_id
+        elif Ref.player_inventory.has_method("add_item"):
+            var item_stack = load("res://main/items/item_stack.gd").new()
+            item_stack.item_id = item_id
+            item_stack.amount = amount
+            Ref.player_inventory.add_item(item_stack)
+            var actual_name = item_str
+            if is_instance_valid(item_map) and "id_to_resource" in item_map and item_map.id_to_resource.has(item_id):
+                actual_name = str(item_map.id_to_resource[item_id].get("display_name", item_map.id_to_resource[item_id].get("internal_name", item_str)))
+            status_message = "Gave %s x%d" % [actual_name, amount]
+        else:
+            status_message = "Inventory not accessible"
+    else:
+        status_message = "Item not found: %s" % item_str
+            
+    _update_status_text()
 func _execute_list_command() -> void:
     var count = 1
     var msg = _get_local_player_name() + " (You)"
@@ -1432,6 +1627,8 @@ func get_command_autocomplete_entries(raw_text: String) -> Array:
         return _get_root_command_autocomplete_entries(command_body)
 
     match command_body:
+        "give":
+            return _get_give_command_autocomplete_entries(argument_body)
         "time":
             return _get_time_command_autocomplete_entries(argument_body)
         "weather":
@@ -1454,6 +1651,45 @@ func get_command_autocomplete_entries(raw_text: String) -> Array:
 
 
 
+
+func _get_give_command_autocomplete_entries(query: String) -> Array:
+    var entries = []
+    
+    var tokens = query.split(" ", false)
+    var is_second_arg = tokens.size() > 1 or (tokens.size() == 1 and query.ends_with(" "))
+    
+    if is_second_arg:
+        var amount_str = tokens[0]
+        var item_query = ""
+        if tokens.size() > 1:
+            item_query = tokens[1].to_lower()
+            
+        var item_map = get_tree().root.get_node_or_null("ItemMap")
+        if is_instance_valid(item_map) and "id_to_resource" in item_map:
+            for item_id in item_map.id_to_resource.keys():
+                var item = item_map.id_to_resource[item_id]
+                var raw_name = str(item.get("display_name", item.get("internal_name", "Unknown")))
+                var item_name = raw_name.to_lower().replace(" ", "_")
+                if item_query == "" or item_name.contains(item_query) or str(item_id).begins_with(item_query):
+                    entries.append(_make_command_autocomplete_entry("/give %s %s " % [amount_str, item_name], item_name, raw_name))
+                    
+            if entries.is_empty() and item_query == "":
+                entries.append(_make_command_autocomplete_entry("/give %s " % amount_str, "/give %s <item_name>" % amount_str, "Give an item by name or id"))
+        else:
+            entries.append(_make_command_autocomplete_entry("/give %s " % amount_str, "/give %s <item_id>" % amount_str, "Give an item"))
+        return entries
+        
+    var lowered_query: String = query.to_lower()
+    
+    var amounts = ["1", "16", "32", "64", "99"]
+    for amt in amounts:
+        if lowered_query == "" or amt.begins_with(lowered_query):
+            entries.append(_make_command_autocomplete_entry("/give %s " % amt, amt, "Amount"))
+            
+    if entries.is_empty() and lowered_query == "":
+        entries.append(_make_command_autocomplete_entry("/give ", "/give <amount> <item_name>", "Give amount of items"))
+    
+    return entries
 func _get_time_command_autocomplete_entries(query: String) -> Array:
     var options = ["set", "add", "query"]
     if query.to_lower().begins_with("set "):
@@ -1492,11 +1728,15 @@ func _get_root_command_autocomplete_entries(query: String) -> Array:
         {"command": "/time", "hint": "Change world time"},
         {"command": "/weather", "hint": "Change world weather"},
         {"command": "/kill", "hint": "Kill yourself"},
+        {"command": "/home", "hint": "Teleport to pocket dimension"},
+        {"command": "/give", "hint": "Give yourself an item"},
         {"command": "/help", "hint": "List all commands"},
         {"command": "/list", "hint": "List connected players"},
         {"command": "/time", "hint": "Change world time"},
         {"command": "/weather", "hint": "Change world weather"},
         {"command": "/kill", "hint": "Kill yourself"},
+        {"command": "/home", "hint": "Teleport to pocket dimension"},
+        {"command": "/give", "hint": "Give yourself an item"},
         {"command": "/help", "hint": "List all commands"},
     ]
     var lowered_query: String = query.to_lower()
@@ -1819,8 +2059,12 @@ func _execute_tp_command(parts: PackedStringArray) -> void:
         return
 
     if str(target_state.get("dimension_instance_key", "")) != get_active_dimension_instance_key():
-        request_host_world_snapshot.rpc_id(1)
-        status_message = "Resyncing to host world"
+        var target_key = str(target_state.get("dimension_instance_key", ""))
+        if target_key.begins_with("pocket:"):
+            open_dimension_instance(int(LucidBlocksWorld.Dimension.POCKET), target_key.substr(7))
+        elif target_key.begins_with("dimension:"):
+            open_dimension_instance(int(target_key.substr(10)))
+        status_message = "Teleporting to peer dimension"
         _update_status_text()
         return
 
@@ -2676,14 +2920,105 @@ func _get_loaded_register_pocket_owner_key() -> String:
     return str(Ref.save_file_manager.loaded_file_register.get_data("pocket_owner_key", "")).strip_edges()
 
 
+func _duplicate_world_namespace(save_data: Dictionary, source_prefix: String, target_prefix: String) -> bool:
+    var source_root: Variant = save_data.get(source_prefix + "world", null)
+    if not (source_root is Dictionary):
+        return false
+
+    var source_world: Dictionary = source_root
+    if source_world.is_empty():
+        return false
+
+    var target_world: Dictionary = {}
+    for suffix in ["chunk_block", "chunk_water", "chunk_water_awake", "chunk_fire"]:
+        var source_key: String = source_prefix + suffix
+        if not source_world.has(source_key):
+            continue
+        var target_key: String = target_prefix + suffix
+        var entry: Variant = source_world[source_key]
+        target_world[target_key] = entry.duplicate(true)
+
+    if target_world.is_empty():
+        return false
+
+    save_data[target_prefix + "world"] = target_world
+    return true
+
+
+func _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension: int, target_pocket_owner_key: String) -> void:
+    if target_dimension != int(LucidBlocksWorld.Dimension.POCKET):
+        return
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
+        return
+    if _has_live_peer() and not multiplayer.is_server():
+        return
+
+    var local_player_key: String = _get_local_player_key()
+    var target_owner_key: String = target_pocket_owner_key.strip_edges()
+    if target_owner_key == "" or target_owner_key != local_player_key:
+        return
+
+    var legacy_prefix: String = _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), "") + "_"
+    var owned_prefix: String = _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), target_owner_key) + "_"
+    var save_data: Dictionary = Ref.save_file_manager.loaded_file.data
+    if save_data.has(owned_prefix + "world"):
+        return
+    if not _duplicate_world_namespace(save_data, legacy_prefix, owned_prefix):
+        return
+
+    var legacy_respawns: Variant = Ref.save_file_manager.loaded_file.get_data("%s/respawn_positions" % _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), ""), null)
+    if legacy_respawns != null:
+        SaveFile._set_data(save_data, "%s/respawn_positions" % _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), target_owner_key), legacy_respawns.duplicate(true))
+
+
+func _migrate_loaded_legacy_pocket_to_local_owner_if_needed() -> void:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or Ref.save_file_manager.loaded_file_register == null:
+        return
+    if not is_instance_valid(Ref.world) or int(Ref.world.current_dimension) != int(LucidBlocksWorld.Dimension.POCKET):
+        return
+    if _get_loaded_register_pocket_owner_key() != "":
+        return
+    if _has_live_peer() and not multiplayer.is_server():
+        return
+
+    var local_player_key: String = _get_local_player_key()
+    if local_player_key == "":
+        return
+
+    _migrate_legacy_pocket_save_to_owner_if_needed(int(LucidBlocksWorld.Dimension.POCKET), local_player_key)
+    Ref.save_file_manager.loaded_file_register.set_data("pocket_owner_key", local_player_key, true)
+    if _has_live_peer():
+        call_deferred("_broadcast_local_state_now")
+
+
+func _persist_current_owned_pocket_variants_if_needed() -> void:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
+        return
+    if not is_instance_valid(Ref.world) or int(Ref.world.current_dimension) != int(LucidBlocksWorld.Dimension.POCKET):
+        return
+
+    var owner_key: String = _get_loaded_register_pocket_owner_key()
+    var local_player_key: String = _get_local_player_key()
+    if owner_key == "" or local_player_key == "" or owner_key != local_player_key:
+        return
+
+    var save_data: Dictionary = Ref.save_file_manager.loaded_file.data
+    var owned_namespace: String = _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), owner_key)
+    var legacy_namespace: String = _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), "")
+    Ref.world.save_data(save_data, owned_namespace + "_")
+    Ref.world.save_data(save_data, legacy_namespace + "_")
+    SaveFile._set_data(save_data, owned_namespace + "/respawn_positions", Ref.world.respawn_positions.duplicate(true))
+    SaveFile._set_data(save_data, legacy_namespace + "/respawn_positions", Ref.world.respawn_positions.duplicate(true))
+
+
 func get_active_pocket_owner_key() -> String:
     if not _can_sample_player() or int(Ref.world.current_dimension) != int(LucidBlocksWorld.Dimension.POCKET):
         return ""
 
     var owner_key: String = _get_loaded_register_pocket_owner_key()
-    if owner_key != "":
-        return owner_key
-    return _get_local_player_key() if _has_live_peer() else ""
+    # Keep vanilla/legacy pocket travel in the shared "legacy" instance unless
+    # a coop-specific owner key was explicitly written into the loaded register.
+    return owner_key
 
 
 func get_dimension_instance_key(dimension: int, pocket_owner_key: String = "") -> String:
@@ -2717,7 +3052,14 @@ func _is_local_world_authority() -> bool:
         return true
     if reconnect_pending or client_restore_in_progress:
         return false
-    return not _has_live_peer()
+    if not _has_live_peer():
+        return true
+        
+    var host_state = peer_states.get(1, {})
+    if not host_state.is_empty() and not _is_peer_state_same_instance(host_state, get_active_dimension_instance_key()):
+        return true
+        
+    return false
 
 
 func has_connected_remote_peers() -> bool:
@@ -3211,6 +3553,8 @@ func _get_nearest_connected_peer_state() -> Dictionary:
 
 func _enforce_shared_bubble_tether(delta: float) -> void:
     if not _has_live_peer() or not _can_sample_player():
+        return
+    if int(Ref.world.current_dimension) == int(LucidBlocksWorld.Dimension.POCKET):
         return
     if reconnect_pending or client_restore_in_progress or remote_host_respawning or is_local_player_fake_dead() or is_local_player_downed() or Ref.player.dead or Ref.player.disabled:
         return
@@ -5492,6 +5836,7 @@ func _shutdown_host_session(reconnectable: bool, reason: String = "") -> void:
 
 
 func _on_local_world_loaded() -> void:
+    _migrate_loaded_legacy_pocket_to_local_owner_if_needed()
     if not host_rehost_pending:
         return
     _resume_host_session_after_world_load.call_deferred()
@@ -5684,6 +6029,7 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
     if not _can_share_loaded_world():
         return
 
+    _persist_current_owned_pocket_variants_if_needed()
     status_message = "Sending world to peer %s" % peer_id
     _update_status_text()
 
@@ -5700,7 +6046,17 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
     var save_buffer: PackedByteArray = save_json.to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)
     var chunk_count: int = maxi(1, int(ceil(float(save_buffer.size()) / float(SNAPSHOT_CHUNK_SIZE))))
 
-    begin_host_world_snapshot.rpc_id(peer_id, register_json, chunk_count, Ref.player.global_position, follow_host_position)
+    var spawn_pos = Ref.player.global_position
+    if not follow_host_position:
+        var target_key = get_dimension_instance_key(target_dimension if target_dimension >= 0 else int(Ref.world.current_dimension), target_pocket_owner_key)
+        for p in peer_states.keys():
+            var st = peer_states[p]
+            if str(st.get("dimension_instance_key", "")) == target_key and bool(st.get("active", false)):
+                spawn_pos = st.get("position", spawn_pos)
+                follow_host_position = true
+                break
+
+    begin_host_world_snapshot.rpc_id(peer_id, register_json, chunk_count, spawn_pos, follow_host_position)
     for chunk_index in range(chunk_count):
         var start: int = chunk_index * SNAPSHOT_CHUNK_SIZE
         var end: int = mini(start + SNAPSHOT_CHUNK_SIZE, save_buffer.size())
@@ -8206,6 +8562,9 @@ func request_place_block(block_position: Vector3i, block_id: int) -> void:
     var sender_id: int = multiplayer.get_remote_sender_id()
     if sender_id <= 0:
         return
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
+        return
     if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
         return
 
@@ -8234,7 +8593,13 @@ func request_dimension_world_snapshot(target_dimension: int, target_pocket_owner
     if sender_id <= 0:
         return
 
-    _send_world_snapshot_to_peer.call_deferred(sender_id, target_dimension, target_pocket_owner_key, false)
+    var follow = false
+    if target_dimension != int(LucidBlocksWorld.Dimension.POCKET):
+        var target_key = get_dimension_instance_key(target_dimension, target_pocket_owner_key)
+        if str(peer_states[1].get("dimension_instance_key", "")) == target_key:
+            follow = true
+
+    _send_world_snapshot_to_peer.call_deferred(sender_id, target_dimension, target_pocket_owner_key, follow)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -8330,6 +8695,9 @@ func request_break_block(block_position: Vector3i, pickaxe: bool, axe: bool, sho
 
     var sender_id: int = multiplayer.get_remote_sender_id()
     if sender_id <= 0:
+        return
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
         return
     if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
         return
@@ -8609,6 +8977,11 @@ func server_world_state(sequence: int, drop_snapshots: Array, entity_snapshots: 
     if multiplayer.is_server() or receiving_host_world or _is_local_world_authority():
         return
     _mark_host_contact()
+    
+    var host_state = peer_states.get(1, {})
+    if not host_state.is_empty() and not _is_peer_state_same_instance(host_state, get_active_dimension_instance_key()):
+        return
+        
     _apply_client_world_state(sequence, drop_snapshots, entity_snapshots)
 
 
@@ -8767,13 +9140,13 @@ func server_snapshot(snapshot_sequence: int, snapshot: Array) -> void:
             "break_progress": float(entry[21]),
         }
 
-    if not multiplayer.is_server() and not receiving_host_world and _can_sample_player() and peer_states.has(1):
-        var host_instance_key: String = str(peer_states[1].get("dimension_instance_key", ""))
-        if host_instance_key != "" and host_instance_key != get_active_dimension_instance_key():
-            status_message = "Resyncing host world"
-            _update_status_text()
-            request_host_world_snapshot.rpc_id(1)
-            return
+    # if not multiplayer.is_server() and not receiving_host_world and _can_sample_player() and peer_states.has(1):
+    #     var host_instance_key: String = str(peer_states[1].get("dimension_instance_key", ""))
+    #     if host_instance_key != "" and host_instance_key != get_active_dimension_instance_key():
+    #         status_message = "Resyncing host world"
+    #         _update_status_text()
+    #         request_host_world_snapshot.rpc_id(1)
+    #         return
 
     _refresh_markers(peer_states, multiplayer.get_unique_id())
 
