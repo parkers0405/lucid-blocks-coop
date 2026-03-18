@@ -1,76 +1,36 @@
 # Lucid Blocks Co-op Mod
 
-Initial workspace for a co-op mod built against the Steam release of Lucid Blocks.
+Multiplayer Co-op mod For Lucid Blocks.
 
-## Current findings
-
-- Steam app ID: `3495730`
-- Steam library: `/data/SteamLibrary`
-- Installed executable: `/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe`
-- Current Steam build ID: `22330271`
-- Recovery snapshot: `work/recovered/lucid-blocks-20260313-100618`
-- The Linux install is shipping a Windows executable plus Windows DLLs, so the game is running through Proton.
-- No standalone `.pck` file is present next to the executable, so the Godot pack is likely embedded in the `.exe`.
-- Official modding guidance points modders to `Godot 4.6 stable double` and `.pck`-based mods.
-- GDRE recovered `5943` files and `318` scripts from the embedded pack.
-- The main native `gdblocks` extension only ships Windows libraries in this build, so the recovered project will not open natively in a Linux Godot editor without extra work.
-
-## Workspace layout
-
-- `docs/` - notes, reverse-engineering targets, and roadmap
-- `scripts/` - helper scripts for installing GDRE and recovering the project
-- `mod/overrides/` - place for authored override files once the recovered project is understood
-- `dist/` - exported mod packs
-- `work/` - local-only extracted project, tool downloads, and logs
 
 ## Quick start
 
-1. Install GDRE tools:
+1) Download From Github
+2) Unzip, and open "dist"
+4) Copy both 'lucid-blocks-coop-test.pck', and 'zzz-lucid-blocks-command-chat.pck'.
+5) Paste into your mods folder (EX:'SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/mods')
 
-   ```bash
-   ./scripts/install_gdre.sh
-   ```
 
-2. List files inside the embedded Godot pack:
+## How To Join Co-op
 
-   ```bash
-   ./scripts/list_pck_files.sh
-   ```
+1) [Host] needs to go into the world press F5 or do /host
+2) [Host] Enter IP (you can use LogMeInHamchi, Tailscale, or Port Forward and use your public IP address, etc...)
+3) [Guest] Once they are hosting, enter their IP and click join.
 
-3. Recover the project into `work/recovered/`:
 
-   ```bash
-   ./scripts/recover_project.sh
-   ```
+## Known Issues
 
-4. Open the recovered project with the exact Godot version reported by GDRE. The official Lucid Blocks mod tutorial says to use `Godot 4.6 stable double`.
+- Apotheosis is 'working' but its not super tested so make sure to back up your world
+- Host can save and quit great, but guest has to relauch game after playing COOP
+- Manikin can't agro Guest, and will always attack
+- Gel, and small gel are invisble to Gust but can beat the heck out the guest anyway
 
-5. Build the current proof-of-concept mod pack:
 
-   ```bash
-   ./scripts/build_test_mod.sh
-   ```
+## Future
 
-6. Install a built mod pack into the Steam copy:
-
-   ```bash
-   ./scripts/install_mod.sh
-   ```
-
-The current proof-of-concept mod overrides `res://main/autoload/ref.gd` and prints a startup line so there is a safe, minimal pack to iterate on.
-
-## Co-op direction
-
-The first playable target should stay small:
-
-- 2 players
-- host authoritative
-- direct IP or LAN first
-- synced player transforms
-- synced block placement and breaking
-- synced pickup and inventory events
-- shared save separate from vanilla saves
-
-The highest-risk unknown is whether world generation and critical gameplay systems are script-driven enough to patch cleanly from recovered `GDScript`, or whether too much logic lives in the native `libgdblocks` module.
-
-See `docs/recovery-notes.md` for the first reverse-engineering notes and blockers.
+- Steam-Join: able to join freinds from steam instead of lan joining.
+- Real-Mutliplayer, Instead of Guest being "rubber banded" to the host, each player can play independent of one another on a world.
+- Seprate-Apotheosis: Per player in coop, and you can visit each other Apotheosis (but I do  kinda like one per world its kind of cozy)
+- Player-Model: I put this player model in pretty fast but it is kinda fitting, I want to add more aniamtions to it, and add in easy way to get any 3d model playable, and be able to add skins, and pick skin in game.
+- Ender Chest: Minecraft like ender-chest.
+- Dedtcated server: Be able to host the server independent from lan or steam, and have a ton of players on one world for 2B2T vibes.
