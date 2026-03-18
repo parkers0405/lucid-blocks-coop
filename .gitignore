@@ -5,4 +5,5 @@ dist/*.pck
 dist/*.zip
 mod/overrides/.godot/
 !dist/lucid-blocks-coop-test.pck
+!dist/zzz-lucid-blocks-command-chat.pck
 lucid-blocks-decompiled
