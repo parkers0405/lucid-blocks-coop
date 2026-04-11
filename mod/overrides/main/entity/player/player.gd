@@ -22,6 +22,8 @@ class_name Player extends Entity
 
 var sprint_toggle: bool = false
 var crouch_toggle: bool = false
+const COOP_INTERACT_RELEASE_GRACE_SEC: float = 0.12
+
 var left_handed: bool = false
 var invert_mouse_y: bool = false
 var might_double_jump: bool = false
@@ -62,6 +64,7 @@ var teleport: bool = false
 
 
 var push_bodies: Dictionary[Entity, bool]
+var coop_interact_release_grace_timer: float = 0.0
 
 signal structure_changed(new_structure: Structure)
 signal can_interact_with_block_changed(value: bool)
@@ -127,6 +130,25 @@ func is_action_pressed_safe(action: String) -> bool:
     return Input.is_action_pressed(action)
 
 
+func _get_coop_interact_pressed(raw_interact_pressed: bool, delta: float) -> bool:
+    if multiplayer.is_server() or not is_interacting() or %PlayerHand.current_hand == null:
+        coop_interact_release_grace_timer = 0.0
+        return raw_interact_pressed
+    if %PlayerHand.current_hand.state != PlayerHandVariant.State.INTERACT_SUSTAIN:
+        coop_interact_release_grace_timer = 0.0
+        return raw_interact_pressed
+
+    if raw_interact_pressed:
+        coop_interact_release_grace_timer = COOP_INTERACT_RELEASE_GRACE_SEC
+        return true
+
+    if coop_interact_release_grace_timer > 0.0:
+        coop_interact_release_grace_timer = maxf(coop_interact_release_grace_timer - delta, 0.0)
+        return true
+
+    return false
+
+
 func _on_fly_timeout() -> void :
     might_double_jump = false
 
@@ -165,8 +187,31 @@ func _on_body_exited(body: PhysicsBody3D) -> void :
     push_bodies.erase(body)
 
 
+func _get_selected_hotbar_item_state() -> ItemState:
+    if held_item_inventory == null or not is_instance_valid(held_item_inventory):
+        return null
+    if held_item_index < 0 or held_item_index >= held_item_inventory.items.size():
+        return null
+    return held_item_inventory.items[held_item_index]
+
+
+func _sync_player_hand_visual() -> void:
+    if not is_node_ready():
+        return
+    var player_hand: PlayerHand = get_node_or_null("%PlayerHand") as PlayerHand
+    if player_hand == null:
+        return
+    player_hand.switch_item(held_item, _get_selected_hotbar_item_state())
+
+
 func _on_held_item_index_changed() -> void :
-    %PlayerHand.switch_item(held_item, %Hotbar.items[held_item_index])
+    call_deferred("_sync_player_hand_visual")
+
+
+func _on_held_item_inventory_item_slot_changed(_inventory: Inventory, index: int) -> void :
+    super._on_held_item_inventory_item_slot_changed(_inventory, index)
+    if index == held_item_index:
+        call_deferred("_sync_player_hand_visual")
 
 
 func _on_instant_interact_impulse() -> void :
@@ -201,7 +246,8 @@ func _process(delta: float) -> void :
     if not local_movement_enabled:
         if %BreakBlocks.breaking:
             %BreakBlocks.break_block_stop()
-        if is_interacting():
+        var keep_interacting: bool = _get_coop_interact_pressed(is_action_pressed_safe("interact"), delta)
+        if is_interacting() and not keep_interacting:
             held_item.interact_end()
             if %PlayerHand.current_hand.state == PlayerHandVariant.State.INTERACT_SUSTAIN:
                 %PlayerHand.interact_sustain_end()
@@ -209,7 +255,7 @@ func _process(delta: float) -> void :
 
         var data: Dictionary = get_interact_data()
 
-        interaction_process(data)
+        interaction_process(data, delta)
         attack_process(data)
 
     update_pointer_visual.call_deferred()
@@ -532,10 +578,10 @@ func attack_process(data: Dictionary) -> void :
 
 
 
-func interaction_process(data: Dictionary) -> void :
+func interaction_process(data: Dictionary, delta: float) -> void :
     if disabled:
         return
-    var interact_pressed: bool = is_action_pressed_safe("interact")
+    var interact_pressed: bool = _get_coop_interact_pressed(is_action_pressed_safe("interact"), delta)
 
     can_interact_with_block = ("target_position" in data and is_instance_valid(Ref.world.get_living_block_at(data.target_position)) and Ref.world.get_living_block_at(data.target_position).can_currently_interact(self))
     can_interact_using_item = is_instance_valid(held_item) and held_item.can_interact(data)

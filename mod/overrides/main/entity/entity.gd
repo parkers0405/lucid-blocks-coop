@@ -136,6 +136,8 @@ signal death_drop_item
 
 var held_item_index: int = 0:
     set(val):
+        if held_item_index == val:
+            return
         held_item_index = val
         held_item_index_changed.emit()
 var held_item: HeldItem
@@ -374,7 +376,7 @@ func _on_damage_timeout() -> void :
 
 func _on_held_item_inventory_item_slot_changed(_inventory: Inventory, index: int) -> void :
     if index == held_item_index:
-        hold_item(index)
+        _refresh_held_item_from_inventory_slot(index)
 
 
 func _on_equipment_inventory_item_slot_changed(_inventory: Inventory, _index: int) -> void :
@@ -748,6 +750,10 @@ func decrease_held_item_durability(amount: int) -> void :
     if held_item == null:
         return
     held_item_inventory.decrease_item_durability(held_item_index, amount)
+
+
+func _refresh_held_item_from_inventory_slot(index: int) -> void:
+    hold_item(index)
 
 
 

@@ -263,6 +263,34 @@ func _get_max_spacer_attack_distance() -> float:
     return maxf(shoot_distance, _get_detection_radius() + spacer_attack_max_distance_padding)
 
 
+func _get_melee_attack_max_distance() -> float:
+    var collision_shape := %AttackArea3D.get_node_or_null("CollisionShape3D") as CollisionShape3D
+    if collision_shape != null:
+        if collision_shape.shape is CylinderShape3D:
+            var cylinder := collision_shape.shape as CylinderShape3D
+            return maxf(1.0, float(cylinder.radius) + 1.0)
+        if collision_shape.shape is SphereShape3D:
+            var sphere := collision_shape.shape as SphereShape3D
+            return maxf(1.0, float(sphere.radius) + 0.75)
+        if collision_shape.shape is BoxShape3D:
+            var box := collision_shape.shape as BoxShape3D
+            return maxf(1.0, Vector2(box.size.x, box.size.z).length() * 0.5 + 0.75)
+    return 1.5
+
+
+func _can_melee_attack_target() -> bool:
+    if not is_instance_valid(attack_target) or attack_target.dead:
+        return false
+    if not _is_target_active(attack_target):
+        return false
+
+    if %AttackArea3D.has_overlapping_bodies() and attack_target in %AttackArea3D.get_overlapping_bodies():
+        return true
+
+    var target_distance: float = global_position.distance_to(attack_target.global_position)
+    return target_distance <= _get_melee_attack_max_distance()
+
+
 func _promote_session_attacker(attacker) -> void:
     var session_target = attacker
     if not _is_session_player_entity(session_target) and is_instance_valid(session_target) and session_target is Player:
@@ -580,11 +608,13 @@ func attack() -> void:
     if is_spacer() and target_distance > shoot_distance:
         if is_facing_player():
             shoot_ball()
-    elif attack_target != null and not attack_target.dead:
+    elif _can_melee_attack_target():
         melee_attack()
 
 
 func melee_attack() -> void:
+    if not _can_melee_attack_target():
+        return
     %WhiffPlayer3D.play()
     anim["parameters/attack/request"] = AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE
     attack_speed_modifier = 0.05

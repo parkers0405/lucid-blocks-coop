@@ -5,7 +5,8 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
-DEFAULT_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
 DEFAULT_MOD_NAME="lucid-blocks-coop-test.pck"
 DEFAULT_PROJECT_DIR="$ROOT_DIR/mod/overrides"
 DEFAULT_DIST_DIR="$ROOT_DIR/dist"
@@ -53,12 +54,31 @@ resolve_godot_bin() {
 }
 
 resolve_game_exe() {
-  local game_exe="${GAME_EXE:-$DEFAULT_GAME_EXE}"
-  if [[ ! -f "$game_exe" ]]; then
-    printf 'Lucid Blocks executable not found: %s\n' "$game_exe" >&2
-    return 1
+  local configured_game_exe="${GAME_EXE:-}"
+  if [[ -n "$configured_game_exe" ]]; then
+    if [[ ! -f "$configured_game_exe" ]]; then
+      printf 'Lucid Blocks executable not found: %s\n' "$configured_game_exe" >&2
+      return 1
+    fi
+    printf '%s\n' "$configured_game_exe"
+    return 0
   fi
-  printf '%s\n' "$game_exe"
+
+  local candidates=(
+    "$DEFAULT_GAME_EXE"
+    "$LEGACY_GAME_EXE"
+  )
+
+  local game_exe
+  for game_exe in "${candidates[@]}"; do
+    if [[ -f "$game_exe" ]]; then
+      printf '%s\n' "$game_exe"
+      return 0
+    fi
+  done
+
+  printf 'Lucid Blocks executable not found. Checked: %s\n' "${candidates[*]}" >&2
+  return 1
 }
 
 main() {
@@ -80,11 +100,6 @@ main() {
   local dist_dir="${DIST_DIR:-$DEFAULT_DIST_DIR}"
   local dist_target_path="$dist_dir/$mod_name"
 
-  local chat_mod_dir="$ROOT_DIR/mod/chat_overrides"
-  local chat_mod_name="zzz-lucid-blocks-command-chat.pck"
-  local chat_target_path="$mods_dir/$chat_mod_name"
-  local dist_chat_target_path="$dist_dir/$chat_mod_name"
-
   mkdir -p "$mods_dir" "$dist_dir"
   find "$mods_dir" -maxdepth 1 -type f \
     \( -name 'lucid-blocks-coop*.pck' -o -name 'zz-lucid-blocks-coop*.pck' -o -name 'zzz-lucid-blocks-command-chat*.pck' \) \
@@ -94,7 +109,6 @@ main() {
     -delete
 
   build_and_copy_pack "$godot_bin" "$project_dir" "$target_path" "$dist_target_path" "coop mod"
-  build_and_copy_pack "$godot_bin" "$chat_mod_dir" "$chat_target_path" "$dist_chat_target_path" "chat mod"
 }
 
 main "$@"
