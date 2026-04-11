@@ -1,6 +1,7 @@
 extends Node
 
 
+const AvatarRegistry = preload("res://coop_mod/avatar_registry.gd")
 const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_CLIENTS: int = 4
@@ -10,6 +11,7 @@ const ENTITY_DR_POS_ERR_SQ: float = 0.0225
 const ENTITY_DR_KB_ERR_SQ: float = 0.25
 const ENTITY_DR_YAW_ERR_DEG: float = 5.0
 const ENTITY_DR_HEARTBEAT_SEC: float = 0.25
+const ENTITY_WORLD_STATE_MAX_INTERVAL_SEC: float = 1.25
 const ENTITY_VISUAL_STATE_INTERVAL: float = 0.15
 const CLIENT_ENTITY_SYNC_GRACE_SEC: float = 0.5
 const PERSIST_INTERVAL: float = 1.0
@@ -52,6 +54,10 @@ const CLIENT_PICKUP_PULL_ANIMATION_TIME: float = 0.1
 const CLIENT_PICKUP_PULL_OFFSET: Vector3 = Vector3(0.0, 0.95, 0.0)
 const CLIENT_ENTITY_QUERY_LAYER: int = 16
 const CLIENT_ENTITY_HIT_COOLDOWN_SEC: float = 0.33
+const WATER_SYNC_INTERVAL: float = 0.12
+const WATER_SYNC_HORIZONTAL_RADIUS: int = 12
+const WATER_SYNC_VERTICAL_RADIUS: int = 10
+const WATER_SYNC_BUCKET_SIZE: float = 4.0
 const DEBUG_SPAWN_DISTANCE: float = 6.0
 const DEBUG_SPAWN_RESOURCE_DIR: String = "res://main/items/data/spawners"
 const DEBUG_SPAWN_FALLBACK_IDS: PackedStringArray = [
@@ -74,6 +80,7 @@ var peer_states: Dictionary = {}
 var markers: Dictionary = {}
 var send_timer: float = 0.0
 var world_state_timer: float = 0.0
+var water_sync_timer: float = 0.0
 var persist_timer: float = 0.0
 var autosave_timer: float = 0.0
 var status_message: String = "Idle"
@@ -127,6 +134,7 @@ var group_dimension_transfer_in_progress: bool = false
 var pending_remote_block_changes: Dictionary = {}
 var pending_remote_water_changes: Dictionary = {}
 var pending_remote_fire_changes: Dictionary = {}
+var pending_remote_storage_changes: Dictionary = {}
 var remote_player_proxies: Dictionary = {}
 var spawn_anchor_index: int = 0
 var host_world_state_sequence: int = 0
@@ -154,6 +162,9 @@ var double_downed_recovery_pending: bool = false
 var revive_hold_progress: float = 0.0
 var revive_target_peer_id: int = -1
 var revive_request_pending: bool = false
+var host_water_snapshot_cache: Dictionary = {}
+var host_fire_snapshot_cache: Dictionary = {}
+var applying_remote_storage_positions: Dictionary = {}
 
 var hud: CanvasLayer
 var overlay: Control
@@ -171,6 +182,14 @@ var spawn_browser_list: ItemList
 var spawn_browser_hint_label: Label
 var spawn_browser_restore_capture_on_close: bool = false
 var spawn_browser_entries: PackedStringArray = PackedStringArray()
+var char_select_overlay: Control
+var char_select_panel: PanelContainer
+var char_select_list: ItemList
+var char_select_preview_container: SubViewportContainer
+var char_select_preview_viewport: SubViewport
+var char_select_preview_instance: Node3D
+var char_select_entries: Array = []
+var char_select_restore_capture_on_close: bool = false
 var reconnect_overlay: Control
 var reconnect_overlay_title: Label
 var reconnect_overlay_subtitle: Label
@@ -302,6 +321,13 @@ func _input(event: InputEvent) -> void:
     if Ref.command_chat_manager != null and Ref.command_chat_manager.has_method("is_command_chat_open") and Ref.command_chat_manager.is_command_chat_open():
         return
 
+    if char_select_overlay != null and char_select_overlay.visible:
+        match event.keycode:
+            KEY_ESCAPE:
+                toggle_char_select(false)
+                get_viewport().set_input_as_handled()
+        return
+
     if spawn_browser_overlay != null and spawn_browser_overlay.visible:
         match event.keycode:
             KEY_ESCAPE, KEY_F10:
@@ -400,8 +426,30 @@ func _enforce_coop_pause_override() -> void:
     get_tree().paused = false
 
 
+func _refresh_world_runtime_mode() -> void:
+    if is_instance_valid(Ref.world) and Ref.world.has_method("refresh_multiplayer_runtime_mode"):
+        Ref.world.refresh_multiplayer_runtime_mode()
+
+
+var _bg_tick_log_timer: float = 0.0
+
+func _enforce_host_background_frame_rate() -> void:
+    if not _should_force_host_background_runtime():
+        _bg_tick_log_timer = 0.0
+        return
+    if Engine.max_fps != 0:
+        Engine.max_fps = 0
+    if Engine.physics_ticks_per_second < 60:
+        Engine.physics_ticks_per_second = 60
+    _bg_tick_log_timer += 1.0 / 60.0
+    if _bg_tick_log_timer >= 2.0:
+        _bg_tick_log_timer = 0.0
+        print("[lucid-blocks-coop][bg-tick] host unfocused: fps=%.1f max_fps=%d physics_ticks=%d actual_fps=%.1f" % [Engine.get_frames_per_second(), Engine.max_fps, Engine.physics_ticks_per_second, Performance.get_monitor(Performance.TIME_FPS)])
+
+
 func _physics_process(delta: float) -> void:
     _enforce_coop_pause_override()
+    _enforce_host_background_frame_rate()
     _refresh_world_authority_mode()
     _refresh_host_entity_activity_override(delta)
     _refresh_session_load_radius()
@@ -423,6 +471,7 @@ func _physics_process(delta: float) -> void:
 
     send_timer += delta
     world_state_timer += delta
+    water_sync_timer += delta
     persist_timer += delta
     autosave_timer += delta
     client_state_heartbeat_timer += delta
@@ -442,6 +491,17 @@ func _physics_process(delta: float) -> void:
                 _capture_host_drop_snapshots(peer_state.get("position", Ref.player.global_position)),
                 _capture_host_entity_snapshots(peer_state.get("position", Ref.player.global_position))
             )
+    if multiplayer.is_server() and (WATER_SYNC_INTERVAL <= 0.0 or water_sync_timer >= WATER_SYNC_INTERVAL):
+        water_sync_timer = 0.0
+        for peer_id in peer_states.keys():
+            var water_peer_id: int = int(peer_id)
+            if water_peer_id == 1:
+                continue
+            var water_peer_state: Dictionary = peer_states[peer_id]
+            if not bool(water_peer_state.get("active", false)):
+                continue
+            _sync_host_water_state_for_peer(water_peer_id, water_peer_state)
+            _sync_host_fire_state_for_peer(water_peer_id, water_peer_state)
     elif not multiplayer.is_server() and client_world_sync_ready and guest_persistent_ready and persist_timer >= PERSIST_INTERVAL:
         persist_timer = 0.0
         _send_persistent_state_to_host()
@@ -647,6 +707,7 @@ func disconnect_session(announce: bool = true) -> void:
             Ref.player.invincible_temporary = false
     if multiplayer.multiplayer_peer != null:
         multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+    _refresh_world_runtime_mode()
 
     peer_states.clear()
     _clear_markers()
@@ -655,6 +716,7 @@ func disconnect_session(announce: bool = true) -> void:
     world_state_timer = 0.0
     persist_timer = 0.0
     autosave_timer = 0.0
+    water_sync_timer = 0.0
     client_state_heartbeat_timer = 0.0
     host_entity_activity_refresh_timer = 0.0
     _clear_host_entity_activity_override()
@@ -670,6 +732,10 @@ func disconnect_session(announce: bool = true) -> void:
     pending_remote_block_changes.clear()
     pending_remote_water_changes.clear()
     pending_remote_fire_changes.clear()
+    pending_remote_storage_changes.clear()
+    host_water_snapshot_cache.clear()
+    host_fire_snapshot_cache.clear()
+    applying_remote_storage_positions.clear()
     _clear_local_downed_state()
 
     if announce:
@@ -1211,9 +1277,13 @@ func travel_group_to_dimension(target_dimension: int, immediate: bool = false, w
     _travel_group_to_dimension_async.call_deferred(target_dimension, immediate, white_close, target_pocket_owner_key)
 
 
+func _is_private_instance_dimension(dimension: int) -> bool:
+    return dimension == int(LucidBlocksWorld.Dimension.POCKET) or dimension == int(LucidBlocksWorld.Dimension.FIRMAMENT)
+
+
 func _resolve_target_pocket_owner_key(target_dimension: int, target_pocket_owner_key: String = "") -> String:
     var pocket_owner_key: String = target_pocket_owner_key.strip_edges()
-    if target_dimension == int(LucidBlocksWorld.Dimension.POCKET) and pocket_owner_key == "":
+    if _is_private_instance_dimension(target_dimension) and pocket_owner_key == "":
         pocket_owner_key = _get_local_player_key()
     _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension, pocket_owner_key)
     return pocket_owner_key
@@ -1266,6 +1336,7 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
         return
 
     _persist_current_owned_pocket_variants_if_needed()
+    var source_dimension: int = int(Ref.world.current_dimension)
     var pocket_owner_key: String = _resolve_target_pocket_owner_key(target_dimension, target_pocket_owner_key)
 
     var host_in_target = false
@@ -1290,30 +1361,8 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
     suppress_local_game_quit_session_shutdown = false
     if _has_live_peer():
         _broadcast_local_state_now()
-    
-    # If leaving pocket dimension, teleport to another player in that dimension if possible
-    if target_dimension != int(LucidBlocksWorld.Dimension.POCKET) and is_instance_valid(Ref.player):
-        var target_key = get_active_dimension_instance_key()
-        var target_pos = Vector3.ZERO
-        var found_peer = false
-        for peer_id in peer_states.keys():
-            var int_peer_id = int(peer_id)
-            if int_peer_id == multiplayer.get_unique_id():
-                continue
-            var state = peer_states[peer_id]
-            if str(state.get("dimension_instance_key", "")) == target_key and bool(state.get("active", false)):
-                target_pos = state.get("position", Vector3.ZERO)
-                found_peer = true
-                break
-                
-        if found_peer:
-            # We must await a frame to ensure player is fully initialized in the new world
-            await get_tree().process_frame
-            await get_tree().process_frame
-            if is_instance_valid(Ref.player):
-                _teleport_local_player_near(target_pos)
-                status_message = "Teleported to peer"
-                _update_status_text()
+
+    await _position_local_player_after_dimension_open(source_dimension, target_dimension)
 
 
 func _set_loaded_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> void:
@@ -1321,10 +1370,114 @@ func _set_loaded_dimension_instance(target_dimension: int, target_pocket_owner_k
         return
 
     Ref.save_file_manager.loaded_file_register.set_data("dimension", target_dimension, true)
-    if target_dimension == int(LucidBlocksWorld.Dimension.POCKET):
+    if _is_private_instance_dimension(target_dimension):
         Ref.save_file_manager.loaded_file_register.set_data("pocket_owner_key", target_pocket_owner_key, true)
     else:
         Ref.save_file_manager.loaded_file_register.set_data("pocket_owner_key", "", true)
+
+
+func _find_active_peer_position_in_instance(instance_key: String) -> Dictionary:
+    for peer_id in peer_states.keys():
+        var int_peer_id: int = int(peer_id)
+        if int_peer_id == multiplayer.get_unique_id():
+            continue
+
+        var state: Dictionary = peer_states[peer_id]
+        if not bool(state.get("active", false)):
+            continue
+        if str(state.get("dimension_instance_key", "")) != instance_key:
+            continue
+
+        return {
+            "found": true,
+            "peer_id": int_peer_id,
+            "position": state.get("position", Vector3.ZERO),
+        }
+
+    return {"found": false}
+
+
+func _position_local_player_after_dimension_open(source_dimension: int, target_dimension: int) -> void:
+    if not is_instance_valid(Ref.player):
+        return
+
+    if target_dimension == int(LucidBlocksWorld.Dimension.NARAKA):
+        var main_world_peer: Dictionary = _find_active_peer_position_in_instance(get_active_dimension_instance_key())
+        if bool(main_world_peer.get("found", false)):
+            await get_tree().process_frame
+            await get_tree().process_frame
+            if is_instance_valid(Ref.player):
+                _teleport_local_player_near(main_world_peer.get("position", Ref.player.global_position))
+                status_message = "Teleported to peer"
+                _update_status_text()
+            return
+
+        if source_dimension == int(LucidBlocksWorld.Dimension.FIRMAMENT):
+            await get_tree().process_frame
+            if is_instance_valid(Ref.world) and is_instance_valid(Ref.world.spawn_tester):
+                var found_spawn: bool = await Ref.world.spawn_tester.find_spawn_position(Vector3.ZERO, Ref.world.current_dimension, 1.0)
+                if found_spawn and is_instance_valid(Ref.player):
+                    if _has_live_peer():
+                        _broadcast_local_state_now()
+                    status_message = "Returned to spawn"
+                    _update_status_text()
+                    return
+
+            _teleport_local_player_exact(_resolve_default_respawn_fallback_position(Vector3.ZERO))
+            status_message = "Returned to spawn"
+            _update_status_text()
+            return
+
+    if target_dimension == int(LucidBlocksWorld.Dimension.POCKET):
+        return
+
+    var target_peer: Dictionary = _find_active_peer_position_in_instance(get_active_dimension_instance_key())
+    if not bool(target_peer.get("found", false)):
+        return
+
+    await get_tree().process_frame
+    await get_tree().process_frame
+    if is_instance_valid(Ref.player):
+        _teleport_local_player_near(target_peer.get("position", Ref.player.global_position))
+        status_message = "Teleported to peer"
+        _update_status_text()
+
+
+func _parse_dimension_instance_key(target_key: String) -> Dictionary:
+    var instance_key: String = target_key.strip_edges()
+    if instance_key == "":
+        return {}
+    if instance_key.begins_with("pocket:"):
+        return {
+            "dimension": int(LucidBlocksWorld.Dimension.POCKET),
+            "owner_key": instance_key.substr(7),
+        }
+    if not instance_key.begins_with("dimension:"):
+        return {}
+
+    var payload: String = instance_key.substr(10)
+    if payload == "":
+        return {}
+    var separator_index: int = payload.find(":")
+    if separator_index == -1:
+        return {
+            "dimension": int(payload),
+            "owner_key": "",
+        }
+
+    return {
+        "dimension": int(payload.substr(0, separator_index)),
+        "owner_key": payload.substr(separator_index + 1),
+    }
+
+
+func _open_dimension_instance_from_key(target_key: String) -> bool:
+    var parsed_key: Dictionary = _parse_dimension_instance_key(target_key)
+    if parsed_key.is_empty():
+        return false
+
+    open_dimension_instance(int(parsed_key.get("dimension", -1)), str(parsed_key.get("owner_key", "")))
+    return true
 
 
 func teleport_to_connected_player() -> void:
@@ -1367,13 +1520,10 @@ func teleport_to_connected_player() -> void:
 
     if str(target_state.get("dimension_instance_key", "")) != get_active_dimension_instance_key():
         var target_key = str(target_state.get("dimension_instance_key", ""))
-        if target_key.begins_with("pocket:"):
-            open_dimension_instance(int(LucidBlocksWorld.Dimension.POCKET), target_key.substr(7))
-        elif target_key.begins_with("dimension:"):
-            open_dimension_instance(int(target_key.substr(10)))
-        status_message = "Teleporting to peer dimension"
-        _update_status_text()
-        return
+        if _open_dimension_instance_from_key(target_key):
+            status_message = "Teleporting to peer dimension"
+            _update_status_text()
+            return
 
     _teleport_local_player_near(target_state.get("position", Ref.player.global_position))
     status_message = "Teleported to peer %s" % target_peer_id
@@ -1439,6 +1589,8 @@ func execute_command(raw_text: String) -> void:
                 _save_config()
                 status_message = "Avatar set to %s" % config["avatar_id"]
             _update_status_text()
+        "/char-select", "/charselect", "/characters":
+            toggle_char_select(true)
         _:
             status_message = "Unknown command: %s" % text
             _update_status_text()
@@ -1511,53 +1663,167 @@ func prompt_pocket_dimension_choice(is_group_travel: bool) -> void:
     
     popup.popup_centered()
 
+func _get_debug_give_inventories() -> Array:
+    var inventories: Array = []
+    for inventory in [Ref.player_hotbar, Ref.player_inventory]:
+        if inventory != null and is_instance_valid(inventory) and not inventories.has(inventory):
+            inventories.append(inventory)
+
+    if is_instance_valid(Ref.player):
+        for fallback_path in ["%Hotbar", "%Inventory"]:
+            var inventory = Ref.player.get_node_or_null(fallback_path)
+            if inventory != null and is_instance_valid(inventory) and not inventories.has(inventory):
+                inventories.append(inventory)
+
+    return inventories
+
+
+func _get_item_command_aliases(item) -> PackedStringArray:
+    var aliases: PackedStringArray = PackedStringArray()
+    for raw_name in [
+        str(item.get("display_name", "")),
+        str(item.get("internal_name", "")),
+    ]:
+        var alias: String = _slugify_string(raw_name)
+        if alias != "" and not aliases.has(alias):
+            aliases.append(alias)
+    return aliases
+
+
+func _resolve_debug_item_query(item_query: String) -> Dictionary:
+    var item_map = get_tree().root.get_node_or_null("ItemMap")
+    if not is_instance_valid(item_map) or not "id_to_resource" in item_map:
+        return {"error": "Item map is unavailable right now"}
+
+    if item_query.is_valid_int():
+        var numeric_item_id: int = int(item_query)
+        if item_map.id_to_resource.has(numeric_item_id):
+            var numeric_item = item_map.id_to_resource[numeric_item_id]
+            return {
+                "item_id": numeric_item_id,
+                "item": numeric_item,
+                "display_name": str(numeric_item.get("display_name", numeric_item.get("internal_name", item_query))),
+            }
+        return {"error": "Unknown item id: %d" % numeric_item_id}
+
+    var normalized_query: String = _slugify_string(item_query)
+    if normalized_query == "":
+        return {"error": "Usage: /give [amount] <item_name_or_id>"}
+
+    var partial_matches: Array = []
+    for item_id in item_map.id_to_resource.keys():
+        var item = item_map.id_to_resource[item_id]
+        var aliases: PackedStringArray = _get_item_command_aliases(item)
+        for alias in aliases:
+            if alias == normalized_query:
+                return {
+                    "item_id": int(item_id),
+                    "item": item,
+                    "display_name": str(item.get("display_name", item.get("internal_name", normalized_query))),
+                }
+            if alias.contains(normalized_query):
+                partial_matches.append({
+                    "item_id": int(item_id),
+                    "item": item,
+                    "display_name": str(item.get("display_name", item.get("internal_name", normalized_query))),
+                })
+                break
+
+    if partial_matches.size() == 1:
+        return partial_matches[0]
+
+    if partial_matches.size() > 1:
+        var labels: PackedStringArray = PackedStringArray()
+        for index in range(mini(5, partial_matches.size())):
+            var match: Dictionary = partial_matches[index]
+            labels.append("%s (%s)" % [str(match.get("display_name", "item")), str(match.get("item_id", -1))])
+        return {"error": "Multiple items match: %s" % ", ".join(labels)}
+
+    return {"error": "Item not found: %s" % item_query}
+
+
+func _give_local_item_for_testing(item, amount: int) -> Dictionary:
+    var inventories: Array = _get_debug_give_inventories()
+    if inventories.is_empty():
+        return {"given": 0, "remaining": amount}
+
+    var remaining: int = amount
+    var stack_size: int = maxi(1, int(item.stack_size))
+    for inventory in inventories:
+        while remaining > 0:
+            var new_item_state := ItemState.new()
+            new_item_state.initialize(item)
+            new_item_state.count = mini(remaining, stack_size)
+
+            var requested_count: int = int(new_item_state.count)
+            var leftover = inventory.accept(new_item_state)
+            var leftover_count: int = int(leftover.count) if leftover != null else 0
+            var inserted_count: int = requested_count - leftover_count
+            remaining -= inserted_count
+            if inserted_count <= 0:
+                break
+
+    if is_instance_valid(Ref.player) and Ref.player.has_method("hold_item"):
+        Ref.player.hold_item(int(Ref.player.held_item_index))
+
+    if is_instance_valid(Ref.game_menu) and Ref.game_menu.has_method("update_inventory_screen") and Ref.game_menu.is_inventory_open():
+        Ref.game_menu.update_inventory_screen(int(Ref.game_menu.inventory_screen))
+
+    if _has_live_peer():
+        _broadcast_local_state_now()
+        if not multiplayer.is_server():
+            _send_persistent_state_to_host(true)
+
+    return {"given": amount - remaining, "remaining": remaining}
+
+
 func _execute_give_command(parts: PackedStringArray) -> void:
-    if parts.size() < 3:
-        status_message = "Usage: /give <amount> <item_name_or_id>"
+    if parts.size() < 2:
+        status_message = "Usage: /give [amount] <item_name_or_id>"
         _update_status_text()
         return
-        
-    var amount = 1
+
+    var amount: int = 1
+    var item_part_index: int = 1
     if parts[1].is_valid_int():
         amount = int(parts[1])
-        
-    var item_str = parts[2]
-        
-    if not is_instance_valid(Ref.player) or not is_instance_valid(Ref.player_inventory):
+        item_part_index = 2
+
+    if amount <= 0 or parts.size() <= item_part_index:
+        status_message = "Usage: /give [amount] <item_name_or_id>"
+        _update_status_text()
+        return
+
+    if not is_instance_valid(Ref.player):
         status_message = "Cannot give items right now"
         _update_status_text()
         return
-        
-    var item_id = -1
-    var item_map = get_tree().root.get_node_or_null("ItemMap")
-    
-    if item_str.is_valid_int():
-        item_id = int(item_str)
-    elif is_instance_valid(item_map) and "id_to_resource" in item_map:
-        for id in item_map.id_to_resource.keys():
-            var item = item_map.id_to_resource[id]
-            var item_name = str(item.get("display_name", item.get("internal_name", ""))).to_lower().replace(" ", "_")
-            if item_name == item_str.to_lower():
-                item_id = id
-                break
-                
-    if item_id >= 0:
-        if is_instance_valid(item_map) and "id_to_resource" in item_map and not item_map.id_to_resource.has(item_id):
-            status_message = "Unknown item id: %d" % item_id
-        elif Ref.player_inventory.has_method("add_item"):
-            var item_stack = load("res://main/items/item_stack.gd").new()
-            item_stack.item_id = item_id
-            item_stack.amount = amount
-            Ref.player_inventory.add_item(item_stack)
-            var actual_name = item_str
-            if is_instance_valid(item_map) and "id_to_resource" in item_map and item_map.id_to_resource.has(item_id):
-                actual_name = str(item_map.id_to_resource[item_id].get("display_name", item_map.id_to_resource[item_id].get("internal_name", item_str)))
-            status_message = "Gave %s x%d" % [actual_name, amount]
-        else:
-            status_message = "Inventory not accessible"
-    else:
+
+    var item_str: String = " ".join(parts.slice(item_part_index, parts.size())).strip_edges()
+    var resolved: Dictionary = _resolve_debug_item_query(item_str)
+    if resolved.has("error"):
+        status_message = str(resolved.get("error", "Item not found"))
+        _update_status_text()
+        return
+
+    var item = resolved.get("item", null)
+    if item == null:
         status_message = "Item not found: %s" % item_str
-            
+        _update_status_text()
+        return
+
+    var give_result: Dictionary = _give_local_item_for_testing(item, amount)
+    var given: int = int(give_result.get("given", 0))
+    var remaining: int = int(give_result.get("remaining", amount))
+    var actual_name: String = str(resolved.get("display_name", item_str))
+
+    if given <= 0:
+        status_message = "No room for %s" % actual_name
+    elif remaining > 0:
+        status_message = "Gave %s x%d (%d could not fit)" % [actual_name, given, remaining]
+    else:
+        status_message = "Gave %s x%d" % [actual_name, given]
+
     _update_status_text()
 func _execute_list_command() -> void:
     var count = 1
@@ -1724,6 +1990,7 @@ func _get_root_command_autocomplete_entries(query: String) -> Array:
         {"command": "/spawnmenu", "hint": "Open the mob spawn browser"},
         {"command": "/spawnlist", "hint": "List spawnable mob ids"},
         {"command": "/avatar", "hint": "Set your avatar id"},
+        {"command": "/char-select", "hint": "Open character select menu"},
         {"command": "/list", "hint": "List connected players"},
         {"command": "/time", "hint": "Change world time"},
         {"command": "/weather", "hint": "Change world weather"},
@@ -2060,13 +2327,10 @@ func _execute_tp_command(parts: PackedStringArray) -> void:
 
     if str(target_state.get("dimension_instance_key", "")) != get_active_dimension_instance_key():
         var target_key = str(target_state.get("dimension_instance_key", ""))
-        if target_key.begins_with("pocket:"):
-            open_dimension_instance(int(LucidBlocksWorld.Dimension.POCKET), target_key.substr(7))
-        elif target_key.begins_with("dimension:"):
-            open_dimension_instance(int(target_key.substr(10)))
-        status_message = "Teleporting to peer dimension"
-        _update_status_text()
-        return
+        if _open_dimension_instance_from_key(target_key):
+            status_message = "Teleporting to peer dimension"
+            _update_status_text()
+            return
 
     _teleport_local_player_near(target_state.get("position", Ref.player.global_position))
     status_message = "Teleported to %s" % str(target_state.get("name", "peer %s" % target_peer_id))
@@ -2119,7 +2383,7 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
         _apply_network_place(block_position, block_id)
         if inventory != null:
             inventory.change_amount(inventory_index, -1)
-        sync_place_block.rpc(block_position, block_id)
+        sync_place_block.rpc(get_active_dimension_instance_key(), block_position, block_id)
         return true
 
     if _is_local_world_authority():
@@ -2130,7 +2394,7 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
     _apply_network_place(block_position, block_id)
     if inventory != null:
         inventory.change_amount(inventory_index, -1)
-    request_place_block.rpc_id(1, block_position, block_id)
+    request_place_block.rpc_id(1, get_active_dimension_instance_key(), block_position, block_id)
     return true
 
 
@@ -2162,6 +2426,7 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
     _apply_network_break(block_position)
     request_break_block.rpc_id(
         1,
+        get_active_dimension_instance_key(),
         block_position,
         bool(break_behavior.pickaxe),
         bool(break_behavior.axe),
@@ -2175,7 +2440,7 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
 func broadcast_host_block_break(block_position: Vector3i) -> void:
     if not _has_live_peer() or not multiplayer.is_server():
         return
-    sync_break_block.rpc(block_position)
+    sync_break_block.rpc(get_active_dimension_instance_key(), block_position)
 
 
 func broadcast_host_world_changes(block_changes: Array, fire_changes: Array) -> void:
@@ -2360,7 +2625,7 @@ func sync_local_water_cells(changes: Array) -> bool:
         return false
     if _is_client_gameplay_locked():
         return false
-    request_water_cells.rpc_id(1, changes)
+    request_water_cells.rpc_id(1, get_active_dimension_instance_key(), changes)
     return true
 
 
@@ -2369,7 +2634,7 @@ func sync_local_fire_cell(block_position: Vector3i, fire_level: int) -> bool:
         return false
     if _is_client_gameplay_locked():
         return false
-    request_fire_cell.rpc_id(1, block_position, fire_level)
+    request_fire_cell.rpc_id(1, get_active_dimension_instance_key(), block_position, fire_level)
     return true
 
 
@@ -2421,6 +2686,18 @@ func sync_local_explosive_throw(scene_path: String, start_position: Vector3, lin
     return true
 
 
+func sync_local_capsule_throw(item_id: int, start_position: Vector3, linear_velocity: Vector3) -> bool:
+    if not _has_live_peer() or multiplayer.is_server() or _is_local_world_authority():
+        return false
+    if _is_client_gameplay_locked():
+        return false
+    if item_id <= 0:
+        return false
+
+    request_guest_capsule_throw.rpc_id(1, item_id, start_position, linear_velocity)
+    return true
+
+
 func sync_local_foliage_break(block_position: Vector3i) -> bool:
     if not _has_live_peer() or multiplayer.is_server() or _is_local_world_authority():
         return false
@@ -2435,7 +2712,7 @@ func sync_local_foliage_break(block_position: Vector3i) -> bool:
         new_state.count = 1
         _spawn_client_predicted_drop(new_state, Vector3(block_position), Vector3.ZERO, false, false, true)
 
-    request_foliage_break.rpc_id(1, block_position)
+    request_foliage_break.rpc_id(1, get_active_dimension_instance_key(), block_position)
     return true
 
 
@@ -2796,6 +3073,8 @@ func _flush_pending_remote_world_changes() -> void:
         var water_level: int = int(pending_remote_water_changes[block_position])
         pending_remote_water_changes.erase(block_position)
         Ref.world.place_water_at(block_position, water_level)
+        if Ref.world.has_method("queue_coop_dynamic_visual_refresh"):
+            Ref.world.queue_coop_dynamic_visual_refresh(1)
 
     for block_position in pending_remote_fire_changes.keys().duplicate():
         if not Ref.world.is_position_loaded(block_position):
@@ -2803,6 +3082,15 @@ func _flush_pending_remote_world_changes() -> void:
         var fire_level: int = int(pending_remote_fire_changes[block_position])
         pending_remote_fire_changes.erase(block_position)
         Ref.world.place_fire_at(block_position, fire_level)
+        if Ref.world.has_method("queue_coop_dynamic_visual_refresh"):
+            Ref.world.queue_coop_dynamic_visual_refresh(1)
+
+    for block_position in pending_remote_storage_changes.keys().duplicate():
+        if not Ref.world.is_position_loaded(block_position):
+            continue
+        var serialized_items: Array = pending_remote_storage_changes[block_position]
+        pending_remote_storage_changes.erase(block_position)
+        _apply_storage_inventory_snapshot(block_position, serialized_items)
 
 
 func _run_host_autosave() -> void:
@@ -3012,12 +3300,10 @@ func _persist_current_owned_pocket_variants_if_needed() -> void:
 
 
 func get_active_pocket_owner_key() -> String:
-    if not _can_sample_player() or int(Ref.world.current_dimension) != int(LucidBlocksWorld.Dimension.POCKET):
+    if not _can_sample_player() or not _is_private_instance_dimension(int(Ref.world.current_dimension)):
         return ""
 
     var owner_key: String = _get_loaded_register_pocket_owner_key()
-    # Keep vanilla/legacy pocket travel in the shared "legacy" instance unless
-    # a coop-specific owner key was explicitly written into the loaded register.
     return owner_key
 
 
@@ -3025,12 +3311,16 @@ func get_dimension_instance_key(dimension: int, pocket_owner_key: String = "") -
     if dimension == int(LucidBlocksWorld.Dimension.POCKET):
         var owner_key: String = pocket_owner_key.strip_edges()
         return "pocket:%s" % (owner_key if owner_key != "" else "legacy")
+    if _is_private_instance_dimension(dimension):
+        var owner_key: String = pocket_owner_key.strip_edges()
+        if owner_key != "":
+            return "dimension:%s:%s" % [dimension, owner_key]
     return "dimension:%s" % dimension
 
 
 func _resolve_dimension_namespace(dimension: int, pocket_owner_key: String = "") -> String:
     var dimension_namespace: String = SaveFile.DIMENSION_MAP.get(dimension, "unknown")
-    if dimension == int(LucidBlocksWorld.Dimension.POCKET) and pocket_owner_key.strip_edges() != "":
+    if _is_private_instance_dimension(dimension) and pocket_owner_key.strip_edges() != "":
         dimension_namespace = "%s__%s" % [dimension_namespace, pocket_owner_key.strip_edges()]
     return dimension_namespace
 
@@ -3056,7 +3346,7 @@ func _is_local_world_authority() -> bool:
         return true
         
     var host_state = peer_states.get(1, {})
-    if not host_state.is_empty() and not _is_peer_state_same_instance(host_state, get_active_dimension_instance_key()):
+    if not host_state.is_empty() and not _does_peer_state_match_instance(host_state, get_active_dimension_instance_key()):
         return true
         
     return false
@@ -3096,8 +3386,32 @@ func _set_host_runtime_process_mode(node: Node, active: bool) -> void:
         node.process_mode = int(node.get_meta("coop_host_original_process_mode", int(Node.PROCESS_MODE_INHERIT)))
         node.remove_meta("coop_host_original_process_mode")
 
+    if node is Timer:
+        var timer := node as Timer
+        if active:
+            if not timer.has_meta("coop_host_original_timer_process_callback"):
+                timer.set_meta("coop_host_original_timer_process_callback", int(timer.process_callback))
+            timer.process_callback = Timer.TIMER_PROCESS_PHYSICS
+        elif timer.has_meta("coop_host_original_timer_process_callback"):
+            timer.process_callback = int(timer.get_meta("coop_host_original_timer_process_callback", int(Timer.TIMER_PROCESS_IDLE)))
+            timer.remove_meta("coop_host_original_timer_process_callback")
+
     for child in node.get_children():
         _set_host_runtime_process_mode(child, active)
+
+
+func _set_host_background_runtime_node(node: Node, active: bool) -> void:
+    if node == null or not is_instance_valid(node) or not node.is_inside_tree():
+        return
+
+    _set_host_runtime_process_mode(node, active)
+    if active:
+        node.set_process(true)
+        node.set_physics_process(true)
+
+
+func _should_force_host_background_runtime() -> bool:
+    return multiplayer.is_server() and _has_live_peer() and not DisplayServer.window_is_focused()
 
 
 func _set_host_entity_activity_override(entity: Entity, active: bool) -> void:
@@ -3115,15 +3429,6 @@ func _set_host_entity_activity_override(entity: Entity, active: bool) -> void:
 
     _set_host_runtime_process_mode(entity, active)
 
-    if active:
-        entity.set_process(true)
-        entity.set_physics_process(true)
-    elif entity.has_method("distance_process_check"):
-        entity.call("distance_process_check")
-
-    if entity.has_method("_refresh_visibility_enabler_target"):
-        entity.call("_refresh_visibility_enabler_target")
-
     var visible_enabler: VisibleOnScreenEnabler3D = entity.get_node_or_null("%VisibleOnScreenEnabler3D") as VisibleOnScreenEnabler3D
     if visible_enabler != null:
         if active:
@@ -3138,6 +3443,16 @@ func _set_host_entity_activity_override(entity: Entity, active: bool) -> void:
             visible_enabler.process_mode = int(visible_enabler.get_meta("coop_host_original_process_mode", int(Node.PROCESS_MODE_INHERIT)))
             visible_enabler.remove_meta("coop_host_original_enable_node_path")
             visible_enabler.remove_meta("coop_host_original_process_mode")
+
+    if active:
+        entity.disabled = false
+        entity.set_process(true)
+        entity.set_physics_process(true)
+    elif entity.has_method("distance_process_check"):
+        entity.call("distance_process_check")
+
+    if entity.has_method("_refresh_visibility_enabler_target"):
+        entity.call("_refresh_visibility_enabler_target")
 
     var distance_timer: Timer = entity.get_node_or_null("%DistanceCheckTimer") as Timer
     if distance_timer != null:
@@ -3159,17 +3474,19 @@ func _clear_host_entity_activity_override() -> void:
         if not (child is Entity) or child is Player or is_remote_player_proxy(child):
             continue
         _set_host_entity_activity_override(child as Entity, false)
+    _set_host_background_runtime_node(Ref.entity_spawner, false)
+    _set_host_background_runtime_node(Ref.sun, false)
     host_entity_activity_override_active = false
 
 
 func _refresh_host_entity_activity_override(delta: float) -> void:
-    if not multiplayer.is_server() or not _has_live_peer():
+    if not _should_force_host_background_runtime():
         host_entity_activity_refresh_timer = 0.0
         _clear_host_entity_activity_override()
         return
 
     host_entity_activity_refresh_timer += delta
-    if host_entity_activity_refresh_timer < 0.2:
+    if host_entity_activity_refresh_timer < 0.05:
         return
     host_entity_activity_refresh_timer = 0.0
 
@@ -3180,6 +3497,8 @@ func _refresh_host_entity_activity_override(delta: float) -> void:
         if entity == null or not is_instance_valid(entity) or not entity.is_inside_tree():
             continue
         _set_host_entity_activity_override(entity, true)
+    _set_host_background_runtime_node(Ref.entity_spawner, true)
+    _set_host_background_runtime_node(Ref.sun, true)
     host_entity_activity_override_active = true
 
 
@@ -3283,8 +3602,32 @@ func get_nearest_session_player_position(world_position: Vector3, fallback_posit
     return nearest_position
 
 
+func _does_peer_state_match_instance(state: Dictionary, active_instance_key: String, require_active: bool = false) -> bool:
+    if state.is_empty():
+        return false
+    if require_active and not bool(state.get("active", false)):
+        return false
+
+    var state_key: String = str(state.get("dimension_instance_key", "")).strip_edges()
+    if state_key != "" and state_key == active_instance_key:
+        return true
+
+    if not _can_sample_player():
+        return state_key == active_instance_key
+
+    var local_dimension: int = int(Ref.world.current_dimension)
+    var state_dimension: int = int(state.get("dimension", -1))
+    if state_dimension != local_dimension:
+        return false
+
+    if _is_private_instance_dimension(local_dimension):
+        return str(state.get("pocket_owner_key", "")).strip_edges() == get_active_pocket_owner_key()
+
+    return active_instance_key == get_dimension_instance_key(local_dimension)
+
+
 func _is_peer_state_same_instance(state: Dictionary, active_instance_key: String) -> bool:
-    return bool(state.get("active", false)) and str(state.get("dimension_instance_key", "")) == active_instance_key
+    return _does_peer_state_match_instance(state, active_instance_key, true)
 
 
 func _is_local_session_player_active() -> bool:
@@ -3670,12 +4013,235 @@ func _deserialize_item_state(item_data: PackedInt32Array):
     return item_state
 
 
+func _serialize_inventory_items(inventory: Inventory) -> Array:
+    var serialized_items: Array = []
+    if inventory == null or not is_instance_valid(inventory):
+        return serialized_items
+
+    for i in range(inventory.capacity):
+        serialized_items.append(_serialize_item_state(inventory.items[i]))
+    return serialized_items
+
+
+func _apply_serialized_inventory_items(inventory: Inventory, serialized_items: Array) -> void:
+    if inventory == null or not is_instance_valid(inventory):
+        return
+
+    for i in range(inventory.capacity):
+        var item_data: PackedInt32Array = PackedInt32Array()
+        if i < serialized_items.size() and serialized_items[i] is PackedInt32Array:
+            item_data = serialized_items[i]
+        inventory.set_item(i, _deserialize_item_state(item_data))
+
+
+func _resolve_storage_inventory(block_position: Vector3i) -> Inventory:
+    if not is_instance_valid(Ref.world):
+        return null
+
+    var living_block = Ref.world.get_living_block_at(block_position)
+    if living_block == null or not is_instance_valid(living_block):
+        return null
+    return living_block.get_node_or_null("%Inventory") as Inventory
+
+
+func is_applying_remote_storage_sync(block_position: Vector3i) -> bool:
+    return applying_remote_storage_positions.has(block_position)
+
+
+func notify_local_storage_inventory_changed(block_position: Vector3i, inventory: Inventory) -> void:
+    if inventory == null or not is_instance_valid(inventory):
+        return
+    if is_applying_remote_storage_sync(block_position):
+        return
+    if is_instance_valid(Ref.world):
+        Ref.world.modify_chunk(block_position)
+
+    var serialized_items: Array = _serialize_inventory_items(inventory)
+    var dimension_instance_key: String = get_active_dimension_instance_key()
+    if multiplayer.is_server():
+        if _has_live_peer():
+            sync_storage_inventory.rpc(dimension_instance_key, block_position, serialized_items)
+        return
+
+    if not _has_live_peer() or _is_local_world_authority() or _is_client_gameplay_locked():
+        return
+    request_storage_inventory.rpc_id(1, dimension_instance_key, block_position, serialized_items)
+
+
+func _apply_storage_inventory_snapshot(block_position: Vector3i, serialized_items: Array) -> void:
+    if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
+        pending_remote_storage_changes[block_position] = serialized_items.duplicate(true)
+        return
+
+    var inventory: Inventory = _resolve_storage_inventory(block_position)
+    if inventory == null or not is_instance_valid(inventory):
+        pending_remote_storage_changes[block_position] = serialized_items.duplicate(true)
+        return
+
+    if is_instance_valid(Ref.world):
+        Ref.world.modify_chunk(block_position)
+
+    applying_remote_storage_positions[block_position] = true
+    _apply_serialized_inventory_items(inventory, serialized_items)
+    applying_remote_storage_positions.erase(block_position)
+
+
+func _invalidate_host_dynamic_cell_caches() -> void:
+    if not multiplayer.is_server():
+        return
+    host_water_snapshot_cache.clear()
+    host_fire_snapshot_cache.clear()
+
+
+func _get_water_sync_bucket(center: Vector3) -> Vector3i:
+    return Vector3i(
+        int(floor(center.x / WATER_SYNC_BUCKET_SIZE)),
+        int(floor(center.y / WATER_SYNC_BUCKET_SIZE)),
+        int(floor(center.z / WATER_SYNC_BUCKET_SIZE))
+    )
+
+
+func _capture_host_water_changes(peer_id: int, center_position: Vector3, dimension_instance_key: String) -> Array:
+    var cache: Dictionary = host_water_snapshot_cache.get(peer_id, {})
+    var bucket: Vector3i = _get_water_sync_bucket(center_position)
+    var previous_levels: Dictionary = cache.get("levels", {})
+    var force_full_sync: bool = cache.is_empty() or str(cache.get("dimension_instance_key", "")) != dimension_instance_key
+    if str(cache.get("dimension_instance_key", "")) != dimension_instance_key:
+        previous_levels = {}
+
+    var current_levels: Dictionary = {}
+    var changes: Array = []
+    var base_position: Vector3i = Vector3i(center_position.floor())
+    for y in range(base_position.y - WATER_SYNC_VERTICAL_RADIUS, base_position.y + WATER_SYNC_VERTICAL_RADIUS + 1):
+        for x in range(base_position.x - WATER_SYNC_HORIZONTAL_RADIUS, base_position.x + WATER_SYNC_HORIZONTAL_RADIUS + 1):
+            for z in range(base_position.z - WATER_SYNC_HORIZONTAL_RADIUS, base_position.z + WATER_SYNC_HORIZONTAL_RADIUS + 1):
+                var cell_position: Vector3i = Vector3i(x, y, z)
+                if not Ref.world.is_position_loaded(cell_position):
+                    continue
+                var water_level: int = int(Ref.world.get_water_level_at(cell_position))
+                if force_full_sync:
+                    changes.append([cell_position, water_level])
+                if water_level > 0:
+                    current_levels[cell_position] = water_level
+
+    if not force_full_sync:
+        for cell_position in current_levels.keys():
+            var water_level: int = int(current_levels[cell_position])
+            if int(previous_levels.get(cell_position, -1)) != water_level:
+                changes.append([cell_position, water_level])
+
+        for cell_position in previous_levels.keys():
+            if not current_levels.has(cell_position):
+                changes.append([cell_position, 0])
+
+    host_water_snapshot_cache[peer_id] = {
+        "dimension_instance_key": dimension_instance_key,
+        "bucket": bucket,
+        "levels": current_levels,
+    }
+    return changes
+
+
+func _capture_host_fire_changes(peer_id: int, center_position: Vector3, dimension_instance_key: String) -> Array:
+    var cache: Dictionary = host_fire_snapshot_cache.get(peer_id, {})
+    var bucket: Vector3i = _get_water_sync_bucket(center_position)
+    var previous_levels: Dictionary = cache.get("levels", {})
+    var force_full_sync: bool = cache.is_empty() or str(cache.get("dimension_instance_key", "")) != dimension_instance_key
+    if str(cache.get("dimension_instance_key", "")) != dimension_instance_key:
+        previous_levels = {}
+
+    var current_levels: Dictionary = {}
+    var changes: Array = []
+    var base_position: Vector3i = Vector3i(center_position.floor())
+    for y in range(base_position.y - WATER_SYNC_VERTICAL_RADIUS, base_position.y + WATER_SYNC_VERTICAL_RADIUS + 1):
+        for x in range(base_position.x - WATER_SYNC_HORIZONTAL_RADIUS, base_position.x + WATER_SYNC_HORIZONTAL_RADIUS + 1):
+            for z in range(base_position.z - WATER_SYNC_HORIZONTAL_RADIUS, base_position.z + WATER_SYNC_HORIZONTAL_RADIUS + 1):
+                var cell_position: Vector3i = Vector3i(x, y, z)
+                if not Ref.world.is_position_loaded(cell_position):
+                    continue
+                var fire_level: int = int(Ref.world.get_fire_at(cell_position))
+                if force_full_sync:
+                    changes.append([cell_position, fire_level])
+                if fire_level > 0:
+                    current_levels[cell_position] = fire_level
+
+    if not force_full_sync:
+        for cell_position in current_levels.keys():
+            var fire_level: int = int(current_levels[cell_position])
+            if int(previous_levels.get(cell_position, -1)) != fire_level:
+                changes.append([cell_position, fire_level])
+
+        for cell_position in previous_levels.keys():
+            if not current_levels.has(cell_position):
+                changes.append([cell_position, 0])
+
+    host_fire_snapshot_cache[peer_id] = {
+        "dimension_instance_key": dimension_instance_key,
+        "bucket": bucket,
+        "levels": current_levels,
+    }
+    return changes
+
+
+func _sync_host_water_state_for_peer(peer_id: int, peer_state: Dictionary) -> void:
+    if not multiplayer.is_server() or peer_id <= 1 or not is_instance_valid(Ref.world):
+        return
+
+    var dimension_instance_key: String = get_active_dimension_instance_key()
+    if not _is_peer_state_same_instance(peer_state, dimension_instance_key):
+        return
+
+    var center_position: Vector3 = peer_state.get("position", Ref.player.global_position)
+    var changes: Array = _capture_host_water_changes(peer_id, center_position, dimension_instance_key)
+    if changes.is_empty():
+        return
+    sync_water_cells.rpc_id(peer_id, dimension_instance_key, changes)
+
+
+func _sync_host_fire_state_for_peer(peer_id: int, peer_state: Dictionary) -> void:
+    if not multiplayer.is_server() or peer_id <= 1 or not is_instance_valid(Ref.world):
+        return
+
+    var dimension_instance_key: String = get_active_dimension_instance_key()
+    if not _is_peer_state_same_instance(peer_state, dimension_instance_key):
+        return
+
+    var center_position: Vector3 = peer_state.get("position", Ref.player.global_position)
+    var changes: Array = _capture_host_fire_changes(peer_id, center_position, dimension_instance_key)
+    if changes.is_empty():
+        return
+    sync_fire_cells.rpc_id(peer_id, dimension_instance_key, changes)
+
+
 func _capture_local_persistent_state() -> Dictionary:
     if not _can_sample_player():
         return {}
 
     var temp_file := SaveFile.new()
-    Ref.player.save_file(temp_file)
+    var player = Ref.player
+    var uuid: String = "player"
+    var multidimensional: bool = true
+
+    temp_file.set_data("node/%s/held_item_index" % uuid, player.held_item_index, multidimensional)
+    temp_file.set_data("node/%s/in_air" % uuid, player.in_air, false)
+    temp_file.set_data("node/%s/global_position" % uuid, player.global_position, false)
+    temp_file.set_data("node/%s/movement_velocity" % uuid, player.movement_velocity, false)
+    temp_file.set_data("node/%s/gravity_velocity" % uuid, player.gravity_velocity, false)
+    temp_file.set_data("node/%s/knockback_velocity" % uuid, player.knockback_velocity, false)
+    temp_file.set_data("node/%s/rope_velocity" % uuid, player.rope_velocity, false)
+    temp_file.set_data("node/%s/health" % uuid, player.health, multidimensional)
+    temp_file.set_data("node/%s/max_health" % uuid, player.max_health, multidimensional)
+    temp_file.set_data("node/%s/hate" % uuid, player.hate, multidimensional)
+    temp_file.set_data("node/%s/faith" % uuid, player.faith, multidimensional)
+    temp_file.set_data("node/%s/lust" % uuid, player.lust, multidimensional)
+    temp_file.set_data("node/%s/rotation_pivot" % uuid, player.get_node("%RotationPivot").rotation.y, false)
+    temp_file.set_data("node/%s/nickname" % uuid, player.nickname, multidimensional)
+    temp_file.set_data("node/%s/has_endure" % uuid, player.has_endure, multidimensional)
+
+    for child in player.find_children("*"):
+        if "preserve_save" in child and child != player:
+            child.preserve_save(temp_file, uuid)
+
     return temp_file.data.duplicate_deep()
 
 
@@ -3685,11 +4251,15 @@ func _send_persistent_state_to_host(force_send: bool = false) -> void:
     if not force_send and not guest_persistent_ready:
         return
 
+    var state: Dictionary = _capture_local_persistent_state()
+    if state.is_empty():
+        return
+
     submit_guest_persistent_state.rpc_id(
         1,
         _get_local_player_key(),
         _get_local_player_name(),
-        _capture_local_persistent_state()
+        state
     )
 
 
@@ -4922,6 +5492,7 @@ func _serialize_peer_states() -> Array:
             bool(state.get("crouching", false)),
             bool(state.get("grounded", true)),
             float(state.get("move_speed", 0.0)),
+            bool(state.get("under_water", false)),
             int(state.get("held_item_id", -1)),
             int(state.get("action_state", 0)),
             str(state.get("name", "Peer %s" % int(peer_id))),
@@ -4947,7 +5518,7 @@ func _refresh_markers(states: Dictionary, local_peer_id: int) -> void:
         visible_ids[int_peer_id] = true
         var state: Dictionary = states[peer_id]
         var downed: bool = bool(state.get("downed", false))
-        var same_dimension: bool = _can_sample_player() and str(state.get("dimension_instance_key", "")) == active_instance_key
+        var same_dimension: bool = _can_sample_player() and _does_peer_state_match_instance(state, active_instance_key)
         var marker: Node = _ensure_marker(int_peer_id)
         marker.set_avatar_id(str(state.get("avatar_id", DEFAULT_AVATAR_ID)))
         var display_name: String = str(state.get("name", "Peer %s" % int_peer_id))
@@ -5499,6 +6070,283 @@ func _build_hud() -> void:
     spawn_browser_button_row.add_child(spawn_browser_cancel_button)
 
     _refresh_spawn_browser_entries("")
+    _build_char_select_ui()
+
+
+func _build_char_select_ui() -> void:
+    char_select_overlay = Control.new()
+    char_select_overlay.visible = false
+    char_select_overlay.anchor_right = 1.0
+    char_select_overlay.anchor_bottom = 1.0
+    char_select_overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+    overlay.add_child(char_select_overlay)
+
+    var fade := ColorRect.new()
+    fade.anchor_right = 1.0
+    fade.anchor_bottom = 1.0
+    fade.color = Color(0.0, 0.0, 0.0, 0.65)
+    char_select_overlay.add_child(fade)
+
+    var center := CenterContainer.new()
+    center.anchor_right = 1.0
+    center.anchor_bottom = 1.0
+    char_select_overlay.add_child(center)
+
+    char_select_panel = PanelContainer.new()
+    char_select_panel.custom_minimum_size = Vector2(520.0, 420.0)
+    center.add_child(char_select_panel)
+
+    var margin := MarginContainer.new()
+    margin.add_theme_constant_override("margin_left", 14)
+    margin.add_theme_constant_override("margin_right", 14)
+    margin.add_theme_constant_override("margin_top", 14)
+    margin.add_theme_constant_override("margin_bottom", 14)
+    char_select_panel.add_child(margin)
+
+    var main_col := VBoxContainer.new()
+    main_col.add_theme_constant_override("separation", 10)
+    margin.add_child(main_col)
+
+    # Title row
+    var title_row := HBoxContainer.new()
+    main_col.add_child(title_row)
+
+    var title := Label.new()
+    title.text = "Character Select"
+    title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    title.add_theme_font_size_override("font_size", 18)
+    title_row.add_child(title)
+
+    var close_btn := Button.new()
+    close_btn.text = "X"
+    close_btn.custom_minimum_size = Vector2(30, 0)
+    close_btn.pressed.connect(toggle_char_select.bind(false))
+    title_row.add_child(close_btn)
+
+    # Content: preview on left, list on right
+    var content_row := HBoxContainer.new()
+    content_row.size_flags_vertical = Control.SIZE_EXPAND_FILL
+    content_row.add_theme_constant_override("separation", 12)
+    main_col.add_child(content_row)
+
+    # 3D preview using SubViewport
+    var preview_panel := PanelContainer.new()
+    preview_panel.custom_minimum_size = Vector2(260, 360)
+    content_row.add_child(preview_panel)
+
+    char_select_preview_container = SubViewportContainer.new()
+    char_select_preview_container.stretch = true
+    char_select_preview_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    char_select_preview_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
+    preview_panel.add_child(char_select_preview_container)
+
+    char_select_preview_viewport = SubViewport.new()
+    char_select_preview_viewport.size = Vector2i(260, 360)
+    char_select_preview_viewport.transparent_bg = true
+    char_select_preview_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+    char_select_preview_container.add_child(char_select_preview_viewport)
+
+    # Add camera and light to the preview viewport
+    var cam := Camera3D.new()
+    cam.name = "CharPreviewCam"
+    cam.position = Vector3(0, 1.0, 2.8)
+    cam.rotation_degrees = Vector3(-8, 0, 0)
+    cam.current = true
+    char_select_preview_viewport.add_child(cam)
+
+    var light := DirectionalLight3D.new()
+    light.rotation_degrees = Vector3(-40, 25, 0)
+    char_select_preview_viewport.add_child(light)
+
+    var env_node := WorldEnvironment.new()
+    var env := Environment.new()
+    env.background_mode = Environment.BG_COLOR
+    env.background_color = Color(0.15, 0.15, 0.2)
+    env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+    env.ambient_light_color = Color(0.5, 0.55, 0.6)
+    env.ambient_light_energy = 0.8
+    env_node.environment = env
+    char_select_preview_viewport.add_child(env_node)
+
+    # Character list on the right
+    var right_col := VBoxContainer.new()
+    right_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    right_col.add_theme_constant_override("separation", 8)
+    content_row.add_child(right_col)
+
+    var list_label := Label.new()
+    list_label.text = "Available Characters:"
+    list_label.add_theme_font_size_override("font_size", 13)
+    right_col.add_child(list_label)
+
+    char_select_list = ItemList.new()
+    char_select_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+    char_select_list.allow_reselect = true
+    char_select_list.item_selected.connect(_on_char_select_item_selected)
+    char_select_list.item_activated.connect(_on_char_select_item_activated)
+    right_col.add_child(char_select_list)
+
+    # Select button
+    var btn_row := HBoxContainer.new()
+    btn_row.add_theme_constant_override("separation", 8)
+    main_col.add_child(btn_row)
+
+    var select_btn := Button.new()
+    select_btn.text = "Select Character"
+    select_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    select_btn.pressed.connect(_on_char_select_confirm)
+    btn_row.add_child(select_btn)
+
+    var cancel_btn := Button.new()
+    cancel_btn.text = "Close"
+    cancel_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    cancel_btn.pressed.connect(toggle_char_select.bind(false))
+    btn_row.add_child(cancel_btn)
+
+    _refresh_char_select_entries()
+
+
+func _refresh_char_select_entries() -> void:
+    if char_select_list == null:
+        return
+    char_select_list.clear()
+    char_select_entries.clear()
+
+    AvatarRegistry.invalidate_cache()
+    char_select_entries = AvatarRegistry.list_avatar_entries()
+
+    for entry in char_select_entries:
+        char_select_list.add_item(entry["name"])
+
+    # Highlight current selection
+    var current_id = _normalize_avatar_id(str(config.get("avatar_id", DEFAULT_AVATAR_ID)))
+    for i in range(char_select_entries.size()):
+        if char_select_entries[i]["id"] == current_id:
+            char_select_list.select(i)
+            _update_char_preview(i)
+            break
+
+
+func toggle_char_select(show: bool = true) -> void:
+    if char_select_overlay == null:
+        return
+
+    if show:
+        _refresh_char_select_entries()
+        char_select_overlay.visible = true
+        char_select_restore_capture_on_close = Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
+        Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+    else:
+        char_select_overlay.visible = false
+        if char_select_restore_capture_on_close:
+            Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+        _clear_char_preview()
+
+
+func _update_char_preview(index: int) -> void:
+    if index < 0 or index >= char_select_entries.size():
+        return
+    _clear_char_preview()
+
+    var entry = char_select_entries[index]
+    var scene = load(entry["path"])
+    if scene is PackedScene:
+        char_select_preview_instance = scene.instantiate() as Node3D
+        if char_select_preview_instance:
+            # Auto-scale to fit preview
+            var aabb: AABB = _get_preview_bounds(char_select_preview_instance)
+            var height: float = aabb.size.y if aabb.size.y > 0.001 else 1.0
+            var preview_height: float = float(entry.get("preview_height", 1.8))
+            var scale_factor: float = preview_height / height
+            char_select_preview_instance.scale = Vector3.ONE * scale_factor
+            char_select_preview_instance.position = Vector3(0, -aabb.position.y * scale_factor, 0)
+            char_select_preview_instance.rotation_degrees = Vector3(0, float(entry.get("preview_yaw", 160.0)), 0)
+            char_select_preview_viewport.add_child(char_select_preview_instance)
+
+            var cam: Camera3D = char_select_preview_viewport.get_node_or_null("CharPreviewCam") as Camera3D
+            if cam != null:
+                var scaled_center: Vector3 = (aabb.position + aabb.size * 0.5) * scale_factor
+                var scaled_size: Vector3 = aabb.size * scale_factor
+                var max_span: float = maxf(maxf(scaled_size.x, scaled_size.y), scaled_size.z)
+                var distance: float = maxf(2.1, max_span * 2.35)
+                cam.position = Vector3(0.0, scaled_center.y + scaled_size.y * 0.08, distance)
+                cam.look_at(Vector3(0.0, scaled_center.y + scaled_size.y * 0.02, 0.0), Vector3.UP)
+
+
+func _get_preview_bounds(root: Node3D) -> AABB:
+    var mesh_bounds: Array = []
+    _collect_preview_bounds(root, Transform3D.IDENTITY, mesh_bounds, true)
+    if mesh_bounds.is_empty():
+        return AABB(Vector3(-0.35, 0.0, -0.35), Vector3(0.7, 1.7, 0.7))
+
+    var merged: AABB = mesh_bounds[0]
+    for index in range(1, mesh_bounds.size()):
+        merged = merged.merge(mesh_bounds[index])
+    return merged
+
+
+func _collect_preview_bounds(node: Node, parent_transform: Transform3D, mesh_bounds: Array, skip_node_transform: bool = false) -> void:
+    var current_transform: Transform3D = parent_transform
+    if node is Node3D and not skip_node_transform:
+        current_transform = parent_transform * (node as Node3D).transform
+
+    if node is MeshInstance3D:
+        var mesh_node := node as MeshInstance3D
+        if mesh_node.mesh != null:
+            mesh_bounds.append(_transform_preview_aabb(mesh_node.get_aabb(), current_transform))
+
+    for child in node.get_children():
+        _collect_preview_bounds(child, current_transform, mesh_bounds, false)
+
+
+func _transform_preview_aabb(source_aabb: AABB, transform: Transform3D) -> AABB:
+    var corners: Array = [
+        source_aabb.position,
+        source_aabb.position + Vector3(source_aabb.size.x, 0.0, 0.0),
+        source_aabb.position + Vector3(0.0, source_aabb.size.y, 0.0),
+        source_aabb.position + Vector3(0.0, 0.0, source_aabb.size.z),
+        source_aabb.position + Vector3(source_aabb.size.x, source_aabb.size.y, 0.0),
+        source_aabb.position + Vector3(source_aabb.size.x, 0.0, source_aabb.size.z),
+        source_aabb.position + Vector3(0.0, source_aabb.size.y, source_aabb.size.z),
+        source_aabb.position + source_aabb.size,
+    ]
+
+    var first_corner: Vector3 = transform * corners[0]
+    var transformed_aabb: AABB = AABB(first_corner, Vector3.ZERO)
+    for index in range(1, corners.size()):
+        transformed_aabb = transformed_aabb.expand(transform * corners[index])
+    return transformed_aabb
+
+
+func _clear_char_preview() -> void:
+    if char_select_preview_instance != null:
+        char_select_preview_instance.queue_free()
+        char_select_preview_instance = null
+
+
+func _on_char_select_item_selected(index: int) -> void:
+    _update_char_preview(index)
+
+
+func _on_char_select_item_activated(index: int) -> void:
+    _on_char_select_confirm()
+
+
+func _on_char_select_confirm() -> void:
+    var selected = char_select_list.get_selected_items()
+    if selected.size() == 0:
+        return
+    var index = selected[0]
+    if index < 0 or index >= char_select_entries.size():
+        return
+
+    var entry = char_select_entries[index]
+    config["avatar_id"] = entry["id"]
+    _save_config()
+    toggle_char_select(false)
+
+    status_message = "Character set to %s" % entry["name"]
+    _update_status_text()
 
 
 func _refresh_local_ip_label() -> void:
@@ -5740,6 +6588,7 @@ func _on_peer_connected(id: int) -> void:
     status_message = "Peer %s connected" % id
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
+    _refresh_world_runtime_mode()
     _refresh_host_entity_activity_override(999.0)
 
 
@@ -5753,6 +6602,7 @@ func _on_peer_disconnected(id: int) -> void:
     status_message = "Peer %s disconnected" % id
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
+    _refresh_world_runtime_mode()
     if local_downed and not _has_same_instance_reviver_available(multiplayer.get_unique_id()):
         _commit_local_real_death("Your partner disconnected")
 
@@ -5761,6 +6611,7 @@ func _on_connected_to_server() -> void:
     guest_persistent_ready = false
     _install_player_death_hook()
     _mark_host_contact()
+    _refresh_world_runtime_mode()
     status_message = "Connected as peer %s, waiting for host world" % multiplayer.get_unique_id()
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
@@ -6025,6 +6876,33 @@ func _teleport_local_player_near(target_position: Vector3) -> void:
         _broadcast_local_state_now()
 
 
+func _apply_peer_persistent_player_to_snapshot(snapshot_save_data: Dictionary, peer_id: int, target_dimension: int) -> void:
+    if snapshot_save_data.is_empty():
+        return
+
+    var peer_state: Dictionary = peer_states.get(peer_id, {})
+    var player_key: String = str(peer_state.get("player_key", "")).strip_edges()
+    if player_key == "":
+        return
+
+    var guest_data: Dictionary = _get_guest_persistent_state(player_key)
+    if guest_data.is_empty():
+        return
+
+    var global_player_data: Variant = SaveFile._get_data(guest_data, "node/player", null)
+    if global_player_data is Dictionary:
+        # Prevent a dimension snapshot from loading the host player's inventory onto the visiting client.
+        SaveFile._set_data(snapshot_save_data, "node/player", (global_player_data as Dictionary).duplicate(true))
+
+    var dimension_namespace: String = str(SaveFile.DIMENSION_MAP.get(target_dimension, ""))
+    if dimension_namespace == "":
+        return
+
+    var dimensional_player_data: Variant = SaveFile._get_data(guest_data, "%s/node/player" % dimension_namespace, null)
+    if dimensional_player_data is Dictionary:
+        SaveFile._set_data(snapshot_save_data, "%s/node/player" % dimension_namespace, (dimensional_player_data as Dictionary).duplicate(true))
+
+
 func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, target_pocket_owner_key: String = "", follow_host_position: bool = true) -> void:
     if not _can_share_loaded_world():
         return
@@ -6039,10 +6917,12 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
     var register_data: Dictionary = Ref.save_file_manager.loaded_file_register.data.duplicate_deep()
     var actual_dimension: int = target_dimension if target_dimension >= 0 else int(Ref.world.current_dimension)
     register_data["dimension"] = actual_dimension
-    register_data["pocket_owner_key"] = target_pocket_owner_key if actual_dimension == int(LucidBlocksWorld.Dimension.POCKET) else ""
+    register_data["pocket_owner_key"] = target_pocket_owner_key if _is_private_instance_dimension(actual_dimension) else ""
 
     var register_json: String = JSON.stringify(JSON.from_native(register_data))
-    var save_json: String = JSON.stringify(JSON.from_native(Ref.save_file_manager.loaded_file.data))
+    var snapshot_save_data: Dictionary = Ref.save_file_manager.loaded_file.data.duplicate_deep()
+    _apply_peer_persistent_player_to_snapshot(snapshot_save_data, peer_id, actual_dimension)
+    var save_json: String = JSON.stringify(JSON.from_native(snapshot_save_data))
     var save_buffer: PackedByteArray = save_json.to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)
     var chunk_count: int = maxi(1, int(ceil(float(save_buffer.size()) / float(SNAPSHOT_CHUNK_SIZE))))
 
@@ -7144,7 +8024,7 @@ func _apply_client_entity_snapshot(entity, entity_position: Vector3, entity_yaw:
     if uuid != "" and entity_interp_map.has(uuid):
         var existing_interp: Dictionary = entity_interp_map[uuid]
         var previous_receive_time: float = float(existing_interp.get("received_local_time", local_receive_time - duration))
-        duration = clampf(local_receive_time - previous_receive_time, WORLD_STATE_INTERVAL * 0.75, maxf(ENTITY_DR_HEARTBEAT_SEC, WORLD_STATE_INTERVAL * 2.0))
+        duration = clampf(local_receive_time - previous_receive_time, WORLD_STATE_INTERVAL * 0.75, ENTITY_WORLD_STATE_MAX_INTERVAL_SEC)
     var yaw_delta: float = wrapf(entity_yaw - current_yaw + PI, 0.0, TAU) - PI
     if not bool(entity.get_meta("coop_entity_snapshot_initialized", false)) or entity.global_position.distance_squared_to(entity_position) > 36.0:
         entity.global_position = entity_position
@@ -7210,7 +8090,7 @@ func _tick_entity_interpolation(delta: float) -> void:
         var weight: float = clampf(elapsed / duration, 0.0, 1.0)
         var from_position: Vector3 = interp.get("from_position", entity.global_position)
         var to_position: Vector3 = interp.get("to_position", entity.global_position)
-        var predicted_extra: float = minf(maxf(elapsed - duration, 0.0), ENTITY_DR_HEARTBEAT_SEC)
+        var predicted_extra: float = minf(maxf(elapsed - duration, 0.0), ENTITY_WORLD_STATE_MAX_INTERVAL_SEC)
         var predicted_velocity: Vector3 = interp.get("velocity", Vector3.ZERO)
         predicted_velocity.y = 0.0
         entity.global_position = from_position.lerp(to_position, weight) + predicted_velocity * predicted_extra
@@ -7446,6 +8326,43 @@ func _spawn_host_authoritative_explosive_for_peer(sender_id: int, scene_path: St
     return true
 
 
+func _spawn_host_authoritative_capsule_for_peer(sender_id: int, item_id: int, start_position: Vector3, linear_velocity: Vector3) -> bool:
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
+        return false
+
+    var attacker = get_remote_player_proxy(sender_id)
+    if attacker == null or not is_instance_valid(attacker):
+        return false
+
+    var item = ItemMap.map(item_id)
+    if item == null or item.projectile_scene == null:
+        return false
+    if item.entity_scene == null and _object_has_property(item, "entity_path") and str(item.entity_path) != "":
+        item.entity_scene = ResourceLoader.load(item.entity_path)
+    if item.entity_scene == null:
+        return false
+
+    var capsule = item.projectile_scene.instantiate()
+    if capsule == null:
+        return false
+
+    var spawn_position: Vector3 = _resolve_remote_projectile_spawn_position(sender_id, start_position)
+    var spawn_velocity: Vector3 = linear_velocity
+    if spawn_velocity.length() > 48.0:
+        spawn_velocity = spawn_velocity.normalized() * 48.0
+
+    get_tree().get_root().add_child(capsule)
+    if capsule is Node3D:
+        capsule.global_position = spawn_position
+    elif "global_position" in capsule:
+        capsule.global_position = spawn_position
+
+    if capsule.has_method("initialize"):
+        capsule.initialize(spawn_velocity, item, item.entity_scene)
+    return true
+
+
 func _get_compact_anim_request(compact_anim: Dictionary, node_name: String) -> int:
     if compact_anim.is_empty() or node_name == "":
         return 0
@@ -7518,12 +8435,14 @@ func _apply_entity_held_item_state(entity, held_item_id: int, held_item_index: i
     if resolved_index < 0 or resolved_index >= inventory.items.size():
         resolved_index = clampi(int(entity.held_item_index), 0, inventory.items.size() - 1)
     if held_item_id < 0:
-        if inventory.items[resolved_index] != null:
+        var needs_update: bool = inventory.items[resolved_index] != null
+        if needs_update:
             inventory.set_item(resolved_index, null)
-        if entity.has_method("hold_item"):
-            entity.call("hold_item", resolved_index)
-        else:
-            entity.held_item_index = resolved_index
+        if int(entity.held_item_index) != resolved_index or (needs_update and entity.has_method("hold_item")):
+            if entity.has_method("hold_item"):
+                entity.call("hold_item", resolved_index)
+            else:
+                entity.held_item_index = resolved_index
         return
 
     var existing_state = inventory.items[resolved_index]
@@ -7535,7 +8454,10 @@ func _apply_entity_held_item_state(entity, held_item_id: int, held_item_index: i
             inventory.set_item(resolved_index, new_item_state)
 
     if int(entity.held_item_index) != resolved_index:
-        entity.held_item_index = resolved_index
+        if entity.has_method("hold_item"):
+            entity.call("hold_item", resolved_index)
+        else:
+            entity.held_item_index = resolved_index
 
 
 func _find_first_animation_tree(root: Node) -> AnimationTree:
@@ -7944,6 +8866,7 @@ func _apply_loaded_network_place(block_position: Vector3i, block_id: int) -> voi
     if current_block != null and int(current_block.id) == block_id:
         return
     Ref.world.place_block_at(block_position, ItemMap.map(block_id), true, true)
+    _invalidate_host_dynamic_cell_caches()
 
 
 func _apply_network_break(block_position: Vector3i) -> void:
@@ -7964,6 +8887,7 @@ func _apply_loaded_network_break(block_position: Vector3i) -> void:
     if block.id == 0 and block.internal_name != "cutscene block":
         return
     Ref.world.break_block_at(block_position, true, false)
+    _invalidate_host_dynamic_cell_caches()
 
 
 func _apply_network_block_changes(changes: Array) -> void:
@@ -7992,6 +8916,7 @@ func _apply_network_block_changes(changes: Array) -> void:
 func _apply_network_water_cells(changes: Array) -> void:
     if not is_instance_valid(Ref.world):
         return
+    var applied_change: bool = false
     for entry in changes:
         if not (entry is Array) or entry.size() < 2:
             continue
@@ -8001,6 +8926,11 @@ func _apply_network_water_cells(changes: Array) -> void:
             pending_remote_water_changes[block_position] = water_level
             continue
         Ref.world.place_water_at(block_position, water_level)
+        applied_change = true
+    if applied_change:
+        _invalidate_host_dynamic_cell_caches()
+    if applied_change and Ref.world.has_method("queue_coop_dynamic_visual_refresh"):
+        Ref.world.queue_coop_dynamic_visual_refresh(1)
 
 
 func _apply_network_fire_cell(block_position: Vector3i, fire_level: int) -> void:
@@ -8010,6 +8940,29 @@ func _apply_network_fire_cell(block_position: Vector3i, fire_level: int) -> void
         pending_remote_fire_changes[block_position] = fire_level
         return
     Ref.world.place_fire_at(block_position, fire_level)
+    _invalidate_host_dynamic_cell_caches()
+    if Ref.world.has_method("queue_coop_dynamic_visual_refresh"):
+        Ref.world.queue_coop_dynamic_visual_refresh(1)
+
+
+func _apply_network_fire_cells(changes: Array) -> void:
+    if not is_instance_valid(Ref.world):
+        return
+    var applied_change: bool = false
+    for entry in changes:
+        if not (entry is Array) or entry.size() < 2:
+            continue
+        var block_position: Vector3i = entry[0]
+        var fire_level: int = int(entry[1])
+        if not Ref.world.is_position_loaded(block_position):
+            pending_remote_fire_changes[block_position] = fire_level
+            continue
+        Ref.world.place_fire_at(block_position, fire_level)
+        applied_change = true
+    if applied_change:
+        _invalidate_host_dynamic_cell_caches()
+    if applied_change and Ref.world.has_method("queue_coop_dynamic_visual_refresh"):
+        Ref.world.queue_coop_dynamic_visual_refresh(1)
 
 
 func _spawn_network_item(item_state, block_position: Vector3i) -> void:
@@ -8393,6 +9346,17 @@ func request_guest_explosive_throw(scene_path: String, start_position: Vector3, 
     _spawn_host_authoritative_explosive_for_peer(sender_id, scene_path, start_position, linear_velocity)
 
 
+@rpc("any_peer", "call_remote", "reliable")
+func request_guest_capsule_throw(item_id: int, start_position: Vector3, linear_velocity: Vector3) -> void:
+    if not multiplayer.is_server():
+        return
+
+    var sender_id: int = multiplayer.get_remote_sender_id()
+    if sender_id <= 0 or item_id <= 0:
+        return
+    _spawn_host_authoritative_capsule_for_peer(sender_id, item_id, start_position, linear_velocity)
+
+
 func _apply_client_break_feedback(break_behavior, block_position: Vector3i) -> void:
     if break_behavior.entity == null or break_behavior.entity.disabled or not break_behavior.enabled:
         return
@@ -8555,21 +9519,24 @@ func receive_guest_persistent_state(save_data: Dictionary) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_place_block(block_position: Vector3i, block_id: int) -> void:
+func request_place_block(dimension_instance_key: String, block_position: Vector3i, block_id: int) -> void:
     if not multiplayer.is_server():
         return
 
     var sender_id: int = multiplayer.get_remote_sender_id()
     if sender_id <= 0:
         return
+    var active_dimension_key: String = get_active_dimension_instance_key()
+    if dimension_instance_key != active_dimension_key:
+        return
     var sender_state: Dictionary = peer_states.get(sender_id, {})
-    if not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
+    if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
     if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
         return
 
     _apply_network_place(block_position, block_id)
-    sync_place_block.rpc(block_position, block_id)
+    sync_place_block.rpc(active_dimension_key, block_position, block_id)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -8679,25 +9646,30 @@ func _relay_world_patch_to_matching_peers(world_patch: Dictionary, excluded_peer
 
 
 @rpc("authority", "call_remote", "reliable")
-func sync_place_block(block_position: Vector3i, block_id: int) -> void:
+func sync_place_block(dimension_instance_key: String, block_position: Vector3i, block_id: int) -> void:
     if multiplayer.is_server():
         return
     _mark_host_contact()
+    if dimension_instance_key != get_active_dimension_instance_key():
+        return
     if is_instance_valid(Ref.world) and Ref.world.is_position_loaded(block_position) and Ref.world.is_block_solid_at(block_position):
         return
     _apply_network_place(block_position, block_id)
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_break_block(block_position: Vector3i, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
+func request_break_block(dimension_instance_key: String, block_position: Vector3i, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
     if not multiplayer.is_server():
         return
 
     var sender_id: int = multiplayer.get_remote_sender_id()
     if sender_id <= 0:
         return
+    var active_dimension_key: String = get_active_dimension_instance_key()
+    if dimension_instance_key != active_dimension_key:
+        return
     var sender_state: Dictionary = peer_states.get(sender_id, {})
-    if not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
+    if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
     if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
         return
@@ -8708,33 +9680,53 @@ func request_break_block(block_position: Vector3i, pickaxe: bool, axe: bool, sho
     _apply_network_break(block_position)
     if broken_block != null:
         _spawn_break_drops_for_block(broken_block, block_position, pickaxe, axe, shovel, meat, plant)
-    sync_break_block.rpc(block_position)
+    sync_break_block.rpc(active_dimension_key, block_position)
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_water_cells(changes: Array) -> void:
+func request_water_cells(dimension_instance_key: String, changes: Array) -> void:
     if not multiplayer.is_server():
         return
 
+    var sender_id: int = multiplayer.get_remote_sender_id()
+    if sender_id <= 0:
+        return
+    var active_dimension_key: String = get_active_dimension_instance_key()
+    if dimension_instance_key != active_dimension_key:
+        return
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, active_dimension_key):
+        return
     _apply_network_water_cells(changes)
-    sync_water_cells.rpc(changes)
+    sync_water_cells.rpc(active_dimension_key, changes)
 
 
 @rpc("authority", "call_remote", "reliable")
-func sync_water_cells(changes: Array) -> void:
+func sync_water_cells(dimension_instance_key: String, changes: Array) -> void:
     if multiplayer.is_server():
         return
     _mark_host_contact()
+    if dimension_instance_key != get_active_dimension_instance_key():
+        return
     _apply_network_water_cells(changes)
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_fire_cell(block_position: Vector3i, fire_level: int) -> void:
+func request_fire_cell(dimension_instance_key: String, block_position: Vector3i, fire_level: int) -> void:
     if not multiplayer.is_server():
         return
 
+    var sender_id: int = multiplayer.get_remote_sender_id()
+    if sender_id <= 0:
+        return
+    var active_dimension_key: String = get_active_dimension_instance_key()
+    if dimension_instance_key != active_dimension_key:
+        return
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, active_dimension_key):
+        return
     _apply_network_fire_cell(block_position, fire_level)
-    sync_fire_cell.rpc(block_position, fire_level)
+    sync_fire_cell.rpc(active_dimension_key, block_position, fire_level)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -8766,11 +9758,52 @@ func request_ignite_entity(target_uuid: String) -> void:
 
 
 @rpc("authority", "call_remote", "reliable")
-func sync_fire_cell(block_position: Vector3i, fire_level: int) -> void:
+func sync_fire_cell(dimension_instance_key: String, block_position: Vector3i, fire_level: int) -> void:
     if multiplayer.is_server():
         return
     _mark_host_contact()
+    if dimension_instance_key != get_active_dimension_instance_key():
+        return
     _apply_network_fire_cell(block_position, fire_level)
+
+
+@rpc("authority", "call_remote", "reliable")
+func sync_fire_cells(dimension_instance_key: String, changes: Array) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+    if dimension_instance_key != get_active_dimension_instance_key():
+        return
+    _apply_network_fire_cells(changes)
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func request_storage_inventory(dimension_instance_key: String, block_position: Vector3i, serialized_items: Array) -> void:
+    if not multiplayer.is_server():
+        return
+
+    var sender_id: int = multiplayer.get_remote_sender_id()
+    if sender_id <= 0:
+        return
+    var active_dimension_key: String = get_active_dimension_instance_key()
+    if dimension_instance_key != active_dimension_key:
+        return
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, active_dimension_key):
+        return
+
+    _apply_storage_inventory_snapshot(block_position, serialized_items)
+    sync_storage_inventory.rpc(active_dimension_key, block_position, serialized_items)
+
+
+@rpc("authority", "call_remote", "reliable")
+func sync_storage_inventory(dimension_instance_key: String, block_position: Vector3i, serialized_items: Array) -> void:
+    if multiplayer.is_server():
+        return
+    _mark_host_contact()
+    if dimension_instance_key != get_active_dimension_instance_key():
+        return
+    _apply_storage_inventory_snapshot(block_position, serialized_items)
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -8789,8 +9822,18 @@ func sync_world_changes(dimension_instance_key: String, block_changes: Array, fi
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_foliage_break(block_position: Vector3i) -> void:
+func request_foliage_break(dimension_instance_key: String, block_position: Vector3i) -> void:
     if not multiplayer.is_server():
+        return
+
+    var sender_id: int = multiplayer.get_remote_sender_id()
+    if sender_id <= 0:
+        return
+    var active_dimension_key: String = get_active_dimension_instance_key()
+    if dimension_instance_key != active_dimension_key:
+        return
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
 
     var block: Block = Ref.world.get_block_type_at(block_position)
@@ -8803,7 +9846,7 @@ func request_foliage_break(block_position: Vector3i) -> void:
         new_state.initialize(block)
         new_state.count = 1
         _spawn_network_item(new_state, block_position)
-    sync_break_block.rpc(block_position)
+    sync_break_block.rpc(active_dimension_key, block_position)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -8916,10 +9959,12 @@ func request_player_attack(target_peer_id: int, damage_position: Vector3, damage
 
 
 @rpc("authority", "call_remote", "reliable")
-func sync_break_block(block_position: Vector3i) -> void:
+func sync_break_block(dimension_instance_key: String, block_position: Vector3i) -> void:
     if multiplayer.is_server():
         return
     _mark_host_contact()
+    if dimension_instance_key != get_active_dimension_instance_key():
+        return
     _apply_network_break(block_position)
 
 
@@ -8979,7 +10024,7 @@ func server_world_state(sequence: int, drop_snapshots: Array, entity_snapshots: 
     _mark_host_contact()
     
     var host_state = peer_states.get(1, {})
-    if not host_state.is_empty() and not _is_peer_state_same_instance(host_state, get_active_dimension_instance_key()):
+    if not host_state.is_empty() and not _does_peer_state_match_instance(host_state, get_active_dimension_instance_key()):
         return
         
     _apply_client_world_state(sequence, drop_snapshots, entity_snapshots)
@@ -9113,7 +10158,7 @@ func server_snapshot(snapshot_sequence: int, snapshot: Array) -> void:
 
     peer_states.clear()
     for entry in snapshot:
-        if not (entry is Array) or entry.size() < 22:
+        if not (entry is Array) or entry.size() < 23:
             continue
 
         peer_states[int(entry[0])] = {
@@ -9128,16 +10173,17 @@ func server_snapshot(snapshot_sequence: int, snapshot: Array) -> void:
             "crouching": bool(entry[9]),
             "grounded": bool(entry[10]),
             "move_speed": float(entry[11]),
-            "held_item_id": int(entry[12]),
-            "action_state": int(entry[13]),
-            "name": str(entry[14]),
-            "player_key": str(entry[15]),
-            "avatar_id": _normalize_avatar_id(str(entry[16])),
-            "skin_color": entry[17] if entry[17] is Color else Color.WHITE,
-            "breaking": bool(entry[18]),
-            "break_position": entry[19],
-            "break_block_id": int(entry[20]),
-            "break_progress": float(entry[21]),
+            "under_water": bool(entry[12]),
+            "held_item_id": int(entry[13]),
+            "action_state": int(entry[14]),
+            "name": str(entry[15]),
+            "player_key": str(entry[16]),
+            "avatar_id": _normalize_avatar_id(str(entry[17])),
+            "skin_color": entry[18] if entry[18] is Color else Color.WHITE,
+            "breaking": bool(entry[19]),
+            "break_position": entry[20],
+            "break_block_id": int(entry[21]),
+            "break_progress": float(entry[22]),
         }
 
     # if not multiplayer.is_server() and not receiving_host_world and _can_sample_player() and peer_states.has(1):
@@ -9156,7 +10202,7 @@ func server_snapshot_reliable(snapshot_sequence: int, snapshot: Array) -> void:
     server_snapshot(snapshot_sequence, snapshot)
 
 func _execute_help_command() -> void:
-    status_message = "Commands: /tp /gamemode /spawn /spawnlist /spawnmenu /host /join /avatar"
+    status_message = "Commands: /give /tp /visit /gamemode /spawn /spawnlist /spawnmenu /time /weather /host /join /avatar /char-select"
     _update_status_text()
 
 

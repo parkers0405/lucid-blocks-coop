@@ -53,6 +53,7 @@ var command_chat_manager
 func _ready() -> void:
     print("[lucid-blocks-coop] Ref override loaded")
     call_deferred("_bootstrap_coop")
+    call_deferred("_bootstrap_command_chat")
 
 
 func _bootstrap_coop() -> void:
@@ -68,3 +69,17 @@ func _bootstrap_coop() -> void:
     coop_manager = coop_script.new()
     coop_manager.name = "LucidBlocksCoop"
     add_child(coop_manager)
+
+
+func _bootstrap_command_chat() -> void:
+    if has_node("LucidBlocksCommandChat"):
+        command_chat_manager = get_node("LucidBlocksCommandChat")
+        return
+
+    var chat_script = load("res://chat_mod/command_chat_manager.gd")
+    if chat_script == null:
+        return
+
+    command_chat_manager = chat_script.new()
+    command_chat_manager.name = "LucidBlocksCommandChat"
+    add_child(command_chat_manager)

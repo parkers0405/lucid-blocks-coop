@@ -147,7 +147,7 @@ func travel() -> void :
     queue_free()
     Ref.sun.set_time_scale(1.0)
     if Ref.coop_manager != null:
-        Ref.coop_manager.travel_group_to_dimension(int(LucidBlocksWorld.Dimension.FIRMAMENT))
+        Ref.coop_manager.open_dimension_instance(int(LucidBlocksWorld.Dimension.FIRMAMENT))
     else:
         Ref.main.teleport_to_dimension(LucidBlocksWorld.Dimension.FIRMAMENT)
 

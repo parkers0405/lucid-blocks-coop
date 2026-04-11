@@ -31,6 +31,11 @@ var fps_cap: int = 60
 var current_seed: int
 var even: bool = false
 var coop_perf_override_active: bool = false
+var coop_dynamic_visual_refresh_frames: int = 0
+var coop_original_os_low_processor_mode_set: bool = false
+var coop_original_os_low_processor_mode: bool = false
+var coop_original_os_low_processor_sleep_usec_set: bool = false
+var coop_original_os_low_processor_sleep_usec: int = 0
 
 var environment_speed_multiplier: float = 1.0
 
@@ -41,11 +46,13 @@ func _ready() -> void :
         await Ref.player_fuser.fusion_table_done_loading
 
     set_fusion_table(Ref.player_fuser.fusion_table, Ref.player_fuser.fusion_table_width)
-    start_up()
-
     Ref.save_file_manager.settings_updated.connect(_on_settings_updated)
     Ref.player.get_node("%Curse").delusion_changed.connect(_on_delusion_updated)
     Ref.sky.sky_tint_updated.connect(_on_sky_tint_updated)
+    chunk_loaded.connect(_on_chunk_loaded)
+    all_loaded.connect(_on_all_loaded)
+    start_up()
+
     _on_settings_updated()
 
     start_up_done.emit()
@@ -76,10 +83,41 @@ func _is_coop_perf_override_active() -> bool:
     return Ref.coop_manager != null and (Ref.coop_manager.is_client_session() or Ref.coop_manager.has_connected_remote_peers())
 
 
+func _should_force_background_perf_override() -> bool:
+    return coop_perf_override_active and not DisplayServer.window_is_focused()
+
+
+func _apply_background_cpu_override(active: bool) -> void:
+    if not (OS is Object):
+        return
+
+    if active:
+        if not coop_original_os_low_processor_mode_set:
+            coop_original_os_low_processor_mode = bool(OS.get("low_processor_usage_mode"))
+            coop_original_os_low_processor_mode_set = true
+        if not coop_original_os_low_processor_sleep_usec_set:
+            coop_original_os_low_processor_sleep_usec = int(OS.get("low_processor_usage_mode_sleep_usec"))
+            coop_original_os_low_processor_sleep_usec_set = true
+        OS.set("low_processor_usage_mode", false)
+        OS.set("low_processor_usage_mode_sleep_usec", 0)
+        return
+
+    if coop_original_os_low_processor_mode_set:
+        OS.set("low_processor_usage_mode", coop_original_os_low_processor_mode)
+    if coop_original_os_low_processor_sleep_usec_set:
+        OS.set("low_processor_usage_mode_sleep_usec", coop_original_os_low_processor_sleep_usec)
+
+
+func _should_force_background_dynamic_ticks() -> bool:
+    return _should_force_background_perf_override()
+
+
 func _apply_frame_pacing_settings() -> void:
     coop_perf_override_active = _is_coop_perf_override_active()
+    var background_override_active: bool = _should_force_background_perf_override()
+    _apply_background_cpu_override(background_override_active)
     process_mode = Node.PROCESS_MODE_ALWAYS if coop_perf_override_active else Node.PROCESS_MODE_INHERIT
-    if coop_perf_override_active:
+    if background_override_active:
         DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
         fps_cap = 0
         Engine.max_fps = 0
@@ -90,10 +128,16 @@ func _apply_frame_pacing_settings() -> void:
     Engine.max_fps = fps_cap
 
 
+func refresh_multiplayer_runtime_mode() -> void:
+    _apply_frame_pacing_settings()
+
+
 func _notification(what: int) -> void :
     match what:
         MainLoop.NOTIFICATION_APPLICATION_FOCUS_OUT:
-            if not _is_coop_perf_override_active():
+            if _is_coop_perf_override_active():
+                _apply_frame_pacing_settings()
+            else:
                 Engine.max_fps = 15
         MainLoop.NOTIFICATION_APPLICATION_FOCUS_IN:
             _apply_frame_pacing_settings()
@@ -108,9 +152,11 @@ func _physics_process(_delta: float) -> void :
         set_loaded_region_center(load_center)
 
         var pause_blocks_sim: bool = get_tree().paused and not _is_coop_perf_override_active()
-        if simulate_enabled and not pause_blocks_sim and simulate_frame and not (even and Ref.sun.target_time_scale < 1.0):
+        var allow_dynamic_tick: bool = simulate_frame or _should_force_background_dynamic_ticks()
+        if simulate_enabled and not pause_blocks_sim and allow_dynamic_tick and not (even and Ref.sun.target_time_scale < 1.0):
             simulate_dynamic()
-            simulate_frame = false
+            if not _should_force_background_dynamic_ticks():
+                simulate_frame = false
 
 
 func _process(_delta: float) -> void :
@@ -118,6 +164,24 @@ func _process(_delta: float) -> void :
     var coop_override_now: bool = _is_coop_perf_override_active()
     if coop_override_now != coop_perf_override_active:
         _apply_frame_pacing_settings()
+
+
+func _is_guest_visual_refresh_needed() -> bool:
+    return Ref.coop_manager != null and Ref.coop_manager.is_client_session() and not simulate_enabled
+
+
+func queue_coop_dynamic_visual_refresh(frame_count: int = 4) -> void:
+    if not _is_guest_visual_refresh_needed():
+        return
+    coop_dynamic_visual_refresh_frames = maxi(coop_dynamic_visual_refresh_frames, frame_count)
+
+
+func _on_chunk_loaded(_chunk_position: Vector3i) -> void:
+    pass
+
+
+func _on_all_loaded() -> void:
+    pass
 
 
 func _input(event: InputEvent) -> void :
