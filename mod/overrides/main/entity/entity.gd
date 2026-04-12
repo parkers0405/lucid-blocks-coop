@@ -325,6 +325,13 @@ func _should_ignore_visibility_culling() -> bool:
     return _use_session_targeting()
 
 
+func _can_use_session_load_proxy() -> bool:
+    return _use_session_targeting() \
+        and Ref.coop_manager != null \
+        and Ref.coop_manager.has_method("can_use_same_instance_load_proxies") \
+        and bool(Ref.coop_manager.call("can_use_same_instance_load_proxies"))
+
+
 func _refresh_visibility_enabler_target() -> void:
     if _should_ignore_visibility_culling() or not disabled_by_visibility:
         %VisibleOnScreenEnabler3D.enable_node_path = ""
@@ -338,7 +345,7 @@ func _refresh_visibility_enabler_target() -> void:
 func is_session_position_loaded(world_position: Vector3) -> bool:
     if Ref.world.is_position_loaded(world_position):
         return true
-    return _use_session_targeting() and Ref.coop_manager.is_position_near_same_instance_player(world_position, process_distance)
+    return _can_use_session_load_proxy() and Ref.coop_manager.is_position_near_same_instance_player(world_position, process_distance)
 
 
 func is_session_player_entity(entity) -> bool:
@@ -832,13 +839,13 @@ func is_future_position_loaded(delta: float) -> bool:
     var future_position: Vector3 = global_position + velocity * delta
     if Ref.world.is_position_loaded(future_position):
         return true
-    return _use_session_targeting() and Ref.coop_manager.is_position_near_same_instance_player(future_position, process_distance)
+    return _can_use_session_load_proxy() and Ref.coop_manager.is_position_near_same_instance_player(future_position, process_distance)
 
 
 func distance_process_check() -> void :
     var distance: float = Ref.player.global_position.distance_to(global_position)
     var near_session_player: bool = false
-    if _use_session_targeting():
+    if _can_use_session_load_proxy():
         var session_distance: float = Ref.coop_manager.get_nearest_session_player_distance(global_position, distance)
         near_session_player = session_distance < distance
         distance = session_distance
@@ -846,6 +853,6 @@ func distance_process_check() -> void :
         set_physics_process(false)
         set_process(false)
 
-    elif _use_session_targeting() or near_session_player or not disabled_by_visibility or %VisibleOnScreenEnabler3D.is_on_screen():
+    elif near_session_player or not disabled_by_visibility or %VisibleOnScreenEnabler3D.is_on_screen():
         set_physics_process(true)
         set_process(true)

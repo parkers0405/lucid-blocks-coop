@@ -7,9 +7,22 @@ ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
 LEGACY_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
-DEFAULT_MOD_NAME="lucid-blocks-coop-test.pck"
+DEFAULT_MOD_NAME="lucid-blocks-coop.pck"
 DEFAULT_PROJECT_DIR="$ROOT_DIR/mod/overrides"
 DEFAULT_DIST_DIR="$ROOT_DIR/dist"
+
+build_and_install_native_patch() {
+  if [[ "${INSTALL_NATIVE_PATCH:-1}" == "0" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$ROOT_DIR/scripts/build_native_patch_extension.sh" ]]; then
+    return 0
+  fi
+
+  printf 'Building native multi-region patch\n'
+  "$ROOT_DIR/scripts/build_native_patch_extension.sh"
+  "$ROOT_DIR/scripts/install_native_patch_extension.sh"
+}
 
 build_and_copy_pack() {
   local godot_bin="$1"
@@ -99,6 +112,8 @@ main() {
   local target_path="$mods_dir/$mod_name"
   local dist_dir="${DIST_DIR:-$DEFAULT_DIST_DIR}"
   local dist_target_path="$dist_dir/$mod_name"
+
+  build_and_install_native_patch
 
   mkdir -p "$mods_dir" "$dist_dir"
   find "$mods_dir" -maxdepth 1 -type f \

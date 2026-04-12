@@ -31,6 +31,9 @@ const SHARED_BUBBLE_HARD_TETHER_DISTANCE: float = 80.0
 const SHARED_BUBBLE_TETHER_PULL: float = 10.0
 const ENTITY_SYNC_RADIUS: float = 144.0
 const DROP_SYNC_RADIUS: float = 96.0
+const GUEST_LOCAL_ENTITY_AUTHORITY_DISTANCE: float = 192.0
+const GUEST_LOCAL_ENTITY_RELEASE_DISTANCE: float = 160.0
+const GUEST_ENTITY_STATE_INTERVAL: float = 0.35
 const ENTITY_ATTACK_REQUEST_MAX_DISTANCE: float = 6.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
@@ -82,6 +85,7 @@ var send_timer: float = 0.0
 var world_state_timer: float = 0.0
 var water_sync_timer: float = 0.0
 var persist_timer: float = 0.0
+var guest_entity_state_timer: float = 0.0
 var autosave_timer: float = 0.0
 var status_message: String = "Idle"
 var panel_visible: bool = false
@@ -109,6 +113,8 @@ var host_respawning: bool = false
 var remote_host_respawning: bool = false
 var host_respawn_sequence: int = 0
 var last_local_world_authority: bool = true
+var last_local_entity_authority: bool = true
+var guest_authoritative_entity_registry: Dictionary = {}
 var session_load_radius_applied: bool = false
 var session_previous_instance_radius: int = -1
 var session_previous_buffer_instance_radius: int = -1
@@ -280,6 +286,7 @@ func _flush_guest_persistent_state_before_disconnect() -> void:
 
     print("[lucid-blocks-coop][quit-debug] sending guest persistent state before disconnect")
     _send_persistent_state_to_host(true)
+    _send_local_authoritative_entities_to_host(true)
     multiplayer.poll()
     await get_tree().process_frame
     multiplayer.poll()
@@ -473,6 +480,7 @@ func _physics_process(delta: float) -> void:
     world_state_timer += delta
     water_sync_timer += delta
     persist_timer += delta
+    guest_entity_state_timer += delta
     autosave_timer += delta
     client_state_heartbeat_timer += delta
     if multiplayer.is_server() and (WORLD_STATE_INTERVAL <= 0.0 or world_state_timer >= WORLD_STATE_INTERVAL):
@@ -505,6 +513,12 @@ func _physics_process(delta: float) -> void:
     elif not multiplayer.is_server() and client_world_sync_ready and guest_persistent_ready and persist_timer >= PERSIST_INTERVAL:
         persist_timer = 0.0
         _send_persistent_state_to_host()
+
+    if not multiplayer.is_server() and client_world_sync_ready and guest_persistent_ready and _has_local_guest_entity_authority() and (GUEST_ENTITY_STATE_INTERVAL <= 0.0 or guest_entity_state_timer >= GUEST_ENTITY_STATE_INTERVAL):
+        guest_entity_state_timer = 0.0
+        _send_local_authoritative_entities_to_host()
+    elif multiplayer.is_server() or not _has_local_guest_entity_authority():
+        guest_entity_state_timer = 0.0
 
     if multiplayer.is_server() and autosave_timer >= AUTOSAVE_INTERVAL:
         autosave_timer = 0.0
@@ -686,6 +700,7 @@ func disconnect_session(announce: bool = true) -> void:
     var local_double_downed_active: bool = double_downed_recovery_pending
     if _has_live_peer() and not multiplayer.is_server() and guest_persistent_ready:
         _send_persistent_state_to_host()
+        _send_local_authoritative_entities_to_host(true)
     if local_fake_death_active and local_fake_death_save_override.is_empty():
         local_fake_death_save_override = _build_local_fake_death_save_overrides()
     if handling_host_respawn or host_respawning:
@@ -715,6 +730,7 @@ func disconnect_session(announce: bool = true) -> void:
     send_timer = 0.0
     world_state_timer = 0.0
     persist_timer = 0.0
+    guest_entity_state_timer = 0.0
     autosave_timer = 0.0
     water_sync_timer = 0.0
     client_state_heartbeat_timer = 0.0
@@ -725,6 +741,8 @@ func disconnect_session(announce: bool = true) -> void:
     host_entity_last_sent.clear()
     client_world_sync_ready = false
     guest_persistent_ready = false
+    last_local_world_authority = true
+    last_local_entity_authority = true
     client_menu_kick_pending = false
     last_host_contact_time = 0
     last_sent_client_state_hash = 0
@@ -735,6 +753,7 @@ func disconnect_session(announce: bool = true) -> void:
     pending_remote_storage_changes.clear()
     host_water_snapshot_cache.clear()
     host_fire_snapshot_cache.clear()
+    guest_authoritative_entity_registry.clear()
     applying_remote_storage_positions.clear()
     _clear_local_downed_state()
 
@@ -2154,7 +2173,7 @@ func _execute_spawn_command(parts: PackedStringArray) -> void:
     var spawn_origin: Vector3 = Ref.player.global_position
     var look_direction: Vector3 = Ref.player.get_look_direction() if Ref.player.has_method("get_look_direction") else -Ref.player.global_basis.z
 
-    if not _has_live_peer() or multiplayer.is_server():
+    if not _has_live_peer() or multiplayer.is_server() or _has_local_guest_entity_authority():
         status_message = _spawn_debug_entity_from_id(spawn_id, spawn_origin, look_direction)
         _update_status_text()
         return
@@ -2286,6 +2305,8 @@ func _spawn_debug_entity_from_id(spawn_id: String, spawn_origin: Vector3, look_d
 
     entity.global_position = spawn_position
     entity.set_meta("coop_runtime_spawned", true)
+    if not multiplayer.is_server():
+        entity.set_meta("coop_guest_local_authority", true)
     get_tree().get_root().add_child(entity)
     if entity.has_method("allow_swarm"):
         entity.allow_swarm()
@@ -2383,7 +2404,7 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
         _apply_network_place(block_position, block_id)
         if inventory != null:
             inventory.change_amount(inventory_index, -1)
-        sync_place_block.rpc(get_active_dimension_instance_key(), block_position, block_id)
+        sync_place_block.rpc(get_active_dimension_instance_key(), block_position, block_id, _get_living_block_scene_path(block_id))
         return true
 
     if _is_local_world_authority():
@@ -2394,7 +2415,13 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
     _apply_network_place(block_position, block_id)
     if inventory != null:
         inventory.change_amount(inventory_index, -1)
-    request_place_block.rpc_id(1, get_active_dimension_instance_key(), block_position, block_id)
+    request_place_block.rpc_id(
+        1,
+        get_active_dimension_instance_key(),
+        block_position,
+        block_id,
+        _capture_local_chunk_patch_for_world_positions([block_position])
+    )
     return true
 
 
@@ -2428,19 +2455,25 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
         1,
         get_active_dimension_instance_key(),
         block_position,
+        broken_block.id if broken_block != null else 0,
         bool(break_behavior.pickaxe),
         bool(break_behavior.axe),
         bool(break_behavior.shovel),
         bool(break_behavior.meat),
-        bool(break_behavior.plant)
+        bool(break_behavior.plant),
+        _capture_local_chunk_patch_for_world_positions([block_position])
     )
     return true
 
 
-func broadcast_host_block_break(block_position: Vector3i) -> void:
+func broadcast_host_block_break(block_position: Vector3i, broken_block_id: int = 0) -> void:
     if not _has_live_peer() or not multiplayer.is_server():
         return
-    sync_break_block.rpc(get_active_dimension_instance_key(), block_position)
+    sync_break_block.rpc(
+        get_active_dimension_instance_key(),
+        block_position,
+        _is_living_block_id(broken_block_id) or _find_saved_preserve_uuid_at_block_position(block_position) != ""
+    )
 
 
 func broadcast_host_world_changes(block_changes: Array, fire_changes: Array) -> void:
@@ -2625,7 +2658,16 @@ func sync_local_water_cells(changes: Array) -> bool:
         return false
     if _is_client_gameplay_locked():
         return false
-    request_water_cells.rpc_id(1, get_active_dimension_instance_key(), changes)
+    var changed_positions: Array = []
+    for entry in changes:
+        if entry is Array and entry.size() >= 1:
+            changed_positions.append(entry[0])
+    request_water_cells.rpc_id(
+        1,
+        get_active_dimension_instance_key(),
+        changes,
+        _capture_local_chunk_patch_for_world_positions(changed_positions)
+    )
     return true
 
 
@@ -2634,7 +2676,13 @@ func sync_local_fire_cell(block_position: Vector3i, fire_level: int) -> bool:
         return false
     if _is_client_gameplay_locked():
         return false
-    request_fire_cell.rpc_id(1, get_active_dimension_instance_key(), block_position, fire_level)
+    request_fire_cell.rpc_id(
+        1,
+        get_active_dimension_instance_key(),
+        block_position,
+        fire_level,
+        _capture_local_chunk_patch_for_world_positions([block_position])
+    )
     return true
 
 
@@ -2712,7 +2760,13 @@ func sync_local_foliage_break(block_position: Vector3i) -> bool:
         new_state.count = 1
         _spawn_client_predicted_drop(new_state, Vector3(block_position), Vector3.ZERO, false, false, true)
 
-    request_foliage_break.rpc_id(1, get_active_dimension_instance_key(), block_position)
+    request_foliage_break.rpc_id(
+        1,
+        get_active_dimension_instance_key(),
+        block_position,
+        block.id if block != null else 0,
+        _capture_local_chunk_patch_for_world_positions([block_position])
+    )
     return true
 
 
@@ -3352,6 +3406,58 @@ func _is_local_world_authority() -> bool:
     return false
 
 
+func _get_nearest_other_same_instance_player_distance(fallback_distance: float = INF) -> float:
+    if not _can_sample_player() or not _has_live_peer():
+        return fallback_distance
+
+    var active_instance_key: String = get_active_dimension_instance_key()
+    var nearest_distance: float = INF
+    var local_peer_id: int = multiplayer.get_unique_id()
+    for peer_id in peer_states.keys():
+        var int_peer_id: int = int(peer_id)
+        if int_peer_id == local_peer_id:
+            continue
+        var state: Dictionary = peer_states.get(int_peer_id, {})
+        if not _is_peer_state_same_instance(state, active_instance_key):
+            continue
+        var peer_position: Vector3 = state.get("position", Vector3.ZERO)
+        nearest_distance = minf(nearest_distance, Ref.player.global_position.distance_to(peer_position))
+
+    return nearest_distance if nearest_distance < INF else fallback_distance
+
+
+func _has_local_guest_entity_authority() -> bool:
+    if multiplayer.is_server() or reconnect_pending or client_restore_in_progress:
+        return false
+    if not _can_sample_player() or not _has_live_peer() or is_local_player_fake_dead() or is_local_player_downed():
+        return false
+
+    var nearest_other_player_distance: float = _get_nearest_other_same_instance_player_distance()
+    if nearest_other_player_distance >= INF:
+        return false
+
+    var required_distance: float = GUEST_LOCAL_ENTITY_AUTHORITY_DISTANCE
+    if last_local_entity_authority and not _is_local_world_authority():
+        required_distance = GUEST_LOCAL_ENTITY_RELEASE_DISTANCE
+
+    return nearest_other_player_distance > required_distance
+
+
+func _has_local_entity_authority() -> bool:
+    return _is_local_world_authority() or _has_local_guest_entity_authority()
+
+
+func has_local_entity_authority() -> bool:
+    return _has_local_entity_authority()
+
+
+func can_use_same_instance_load_proxies() -> bool:
+    return multiplayer.is_server() \
+        and is_instance_valid(Ref.world) \
+        and Ref.world.has_method("uses_coop_multi_region_loading") \
+        and bool(Ref.world.call("uses_coop_multi_region_loading"))
+
+
 func has_connected_remote_peers() -> bool:
     if multiplayer.multiplayer_peer == null:
         return false
@@ -3363,15 +3469,26 @@ func has_connected_remote_peers() -> bool:
 func _refresh_world_authority_mode() -> void:
     if not _can_sample_player():
         return
-    var has_authority: bool = _is_local_world_authority()
-    Ref.world.simulate_enabled = has_authority
+    var has_world_authority: bool = _is_local_world_authority()
+    var has_entity_authority: bool = _has_local_entity_authority()
+    Ref.world.simulate_enabled = has_world_authority
 
-    if not multiplayer.is_server() and is_instance_valid(Ref.entity_spawner) and has_authority != last_local_world_authority:
-        if has_authority:
+    if not multiplayer.is_server() and has_entity_authority != last_local_entity_authority:
+        client_world_sync_ready = false
+        if has_entity_authority:
+            _promote_host_synced_entities_to_local_authority()
+        else:
+            _send_local_authoritative_entities_to_host(true)
+            _clear_local_guest_authoritative_runtime()
+
+    if not multiplayer.is_server() and is_instance_valid(Ref.entity_spawner) and has_entity_authority != last_local_entity_authority:
+        if has_entity_authority:
             Ref.entity_spawner.start_spawning()
         else:
             Ref.entity_spawner.stop_spawning()
-    last_local_world_authority = has_authority
+
+    last_local_world_authority = has_world_authority
+    last_local_entity_authority = has_entity_authority
 
 
 func _set_host_runtime_process_mode(node: Node, active: bool) -> void:
@@ -3546,6 +3663,8 @@ func get_same_instance_base_load_radius(default_radius: float = 0.0) -> float:
 
 func get_same_instance_activity_radius(default_radius: float = 0.0) -> float:
     var activity_radius: float = maxf(get_same_instance_base_load_radius(default_radius) - 16.0, 16.0)
+    if _supports_multi_region_world_loading():
+        return activity_radius
     if not multiplayer.is_server() or not _has_live_peer() or not _can_sample_player() or not is_instance_valid(Ref.world):
         return activity_radius
 
@@ -3793,18 +3912,7 @@ func is_client_entity_authoritative_change_active(node) -> bool:
 func get_world_load_center(default_center: Vector3) -> Vector3:
     if not multiplayer.is_server() or not _has_live_peer():
         return default_center
-
-    var positions: Array = _get_same_instance_session_positions()
-    if positions.size() <= 1:
-        return default_center
-
-    var min_corner: Vector3 = positions[0]
-    var max_corner: Vector3 = positions[0]
-    for position in positions:
-        min_corner = min_corner.min(position)
-        max_corner = max_corner.max(position)
-
-    return _snap_world_stream_position((min_corner + max_corner) * 0.5)
+    return default_center
 
 
 func _snap_world_stream_position(position: Vector3) -> Vector3:
@@ -3825,6 +3933,8 @@ func _is_near_any_session_position(world_position: Vector3, positions: Array, ra
 
 func get_world_load_radius_target(default_radius: int) -> int:
     var target_radius: int = maxi(default_radius, HOST_SESSION_MIN_LOAD_RADIUS)
+    if _supports_multi_region_world_loading():
+        return mini(default_radius, HOST_SESSION_MAX_LOAD_RADIUS)
     if not multiplayer.is_server() or not _has_live_peer():
         return mini(target_radius, HOST_SESSION_MAX_LOAD_RADIUS)
 
@@ -3843,6 +3953,19 @@ func get_world_load_radius_target(default_radius: int) -> int:
 
 func _refresh_session_load_radius() -> void:
     if not _can_sample_player() or not is_instance_valid(Ref.world):
+        return
+
+    if _supports_multi_region_world_loading():
+        if session_load_radius_applied:
+            if session_previous_instance_radius > 0 and int(Ref.world.instance_radius) != session_previous_instance_radius:
+                Ref.world.instance_radius = session_previous_instance_radius
+                Ref.world.buffer_instance_radius = session_previous_buffer_instance_radius if session_previous_buffer_instance_radius > 0 else Ref.world.buffer_instance_radius
+                Ref.world.force_reload()
+            elif session_previous_buffer_instance_radius > 0 and int(Ref.world.buffer_instance_radius) != session_previous_buffer_instance_radius:
+                Ref.world.buffer_instance_radius = session_previous_buffer_instance_radius
+            session_load_radius_applied = false
+            session_previous_instance_radius = -1
+            session_previous_buffer_instance_radius = -1
         return
 
     if _has_live_peer() and multiplayer.is_server():
@@ -3894,37 +4017,14 @@ func _get_nearest_connected_peer_state() -> Dictionary:
     return nearest_state
 
 
+func _supports_multi_region_world_loading() -> bool:
+    return is_instance_valid(Ref.world) \
+        and Ref.world.has_method("supports_coop_multi_region_loading") \
+        and bool(Ref.world.call("supports_coop_multi_region_loading"))
+
+
 func _enforce_shared_bubble_tether(delta: float) -> void:
-    if not _has_live_peer() or not _can_sample_player():
-        return
-    if int(Ref.world.current_dimension) == int(LucidBlocksWorld.Dimension.POCKET):
-        return
-    if reconnect_pending or client_restore_in_progress or remote_host_respawning or is_local_player_fake_dead() or is_local_player_downed() or Ref.player.dead or Ref.player.disabled:
-        return
-    var nearest_state: Dictionary = _get_nearest_connected_peer_state()
-    if nearest_state.is_empty():
-        return
-
-    var peer_position: Vector3 = nearest_state.get("position", Ref.player.global_position)
-    var to_local: Vector3 = Ref.player.global_position - peer_position
-    var distance: float = to_local.length()
-    if distance <= SHARED_BUBBLE_SOFT_TETHER_DISTANCE:
-        return
-
-    var direction: Vector3 = to_local.normalized() if distance > 0.001 else Vector3.RIGHT
-    if distance > SHARED_BUBBLE_HARD_TETHER_DISTANCE:
-        Ref.player.global_position = peer_position + direction * SHARED_BUBBLE_HARD_TETHER_DISTANCE
-        Ref.player.movement_velocity = Ref.player.movement_velocity.slide(direction)
-        Ref.player.knockback_velocity = Ref.player.knockback_velocity.slide(direction)
-        Ref.player.rope_velocity = Ref.player.rope_velocity.slide(direction)
-        status_message = "Tether limit reached"
-        _update_status_text()
-        return
-
-    var over_soft: float = distance - SHARED_BUBBLE_SOFT_TETHER_DISTANCE
-    var soft_span: float = maxf(SHARED_BUBBLE_HARD_TETHER_DISTANCE - SHARED_BUBBLE_SOFT_TETHER_DISTANCE, 0.001)
-    var pull_strength: float = clampf(over_soft / soft_span, 0.0, 1.0) * SHARED_BUBBLE_TETHER_PULL * delta
-    Ref.player.global_position -= direction * pull_strength
+    return
 
 
 func _get_local_skin_color() -> Color:
@@ -4042,6 +4142,319 @@ func _resolve_storage_inventory(block_position: Vector3i) -> Inventory:
     if living_block == null or not is_instance_valid(living_block):
         return null
     return living_block.get_node_or_null("%Inventory") as Inventory
+
+
+func _get_saved_chunk_to_uuid_map() -> Dictionary:
+    if Ref.preserve_node_manager != null:
+        return Ref.preserve_node_manager.chunk_to_uuid_map
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
+        return {}
+    return Ref.save_file_manager.loaded_file.get_data("world/chunk_to_uuid_map", {}).duplicate(true)
+
+
+func _store_saved_chunk_to_uuid_map(chunk_to_uuid_map: Dictionary) -> void:
+    if Ref.preserve_node_manager != null:
+        Ref.preserve_node_manager.chunk_to_uuid_map = chunk_to_uuid_map.duplicate(true)
+    if Ref.save_file_manager != null and Ref.save_file_manager.loaded_file != null:
+        Ref.save_file_manager.loaded_file.set_data("world/chunk_to_uuid_map", chunk_to_uuid_map.duplicate(true))
+
+
+func _find_saved_preserve_uuid_at_block_position(block_position: Vector3i) -> String:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or not is_instance_valid(Ref.world):
+        return ""
+
+    var chunk_to_uuid_map: Dictionary = _get_saved_chunk_to_uuid_map()
+    var chunk_position: Vector3i = Ref.world.snap_to_chunk(block_position)
+    if not chunk_to_uuid_map.has(chunk_position):
+        return ""
+
+    var uuids: PackedStringArray = chunk_to_uuid_map[chunk_position]
+    for uuid in uuids:
+        var saved_position: Variant = Ref.save_file_manager.loaded_file.get_data("node/%s/global_position" % uuid, null)
+        if saved_position is Vector3 and Vector3i(saved_position) == block_position:
+            return uuid
+    return ""
+
+
+func _remove_saved_preserve_node_at_position(block_position: Vector3i) -> void:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or not is_instance_valid(Ref.world):
+        return
+
+    var uuid: String = _find_saved_preserve_uuid_at_block_position(block_position)
+    if uuid == "":
+        return
+
+    var chunk_to_uuid_map: Dictionary = _get_saved_chunk_to_uuid_map()
+    var chunk_position: Vector3i = Ref.world.snap_to_chunk(block_position)
+    var uuids: PackedStringArray = chunk_to_uuid_map.get(chunk_position, PackedStringArray())
+    var updated_uuids: PackedStringArray = PackedStringArray()
+    for existing_uuid in uuids:
+        if existing_uuid != uuid:
+            updated_uuids.append(existing_uuid)
+
+    if updated_uuids.is_empty():
+        chunk_to_uuid_map.erase(chunk_position)
+    else:
+        chunk_to_uuid_map[chunk_position] = updated_uuids
+    _store_saved_chunk_to_uuid_map(chunk_to_uuid_map)
+
+    Ref.save_file_manager.loaded_file.erase_data("node/%s" % uuid)
+
+
+func _upsert_saved_living_block_at_position(block_position: Vector3i, block_id: int) -> void:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or not is_instance_valid(Ref.world):
+        return
+
+    var block: Block = ItemMap.map(block_id)
+    if block == null or str(block.living_block_scene_path) == "":
+        return
+
+    var uuid: String = _find_saved_preserve_uuid_at_block_position(block_position)
+    if uuid == "":
+        uuid = UUID.v4()
+        var chunk_to_uuid_map: Dictionary = _get_saved_chunk_to_uuid_map()
+        var chunk_position: Vector3i = Ref.world.snap_to_chunk(block_position)
+        var uuids: PackedStringArray = chunk_to_uuid_map.get(chunk_position, PackedStringArray())
+        uuids.append(uuid)
+        chunk_to_uuid_map[chunk_position] = uuids
+        _store_saved_chunk_to_uuid_map(chunk_to_uuid_map)
+
+    Ref.save_file_manager.loaded_file.set_data("node/%s/global_position" % uuid, Vector3(block_position))
+    Ref.save_file_manager.loaded_file.set_data("node/%s/file_path" % uuid, str(block.living_block_scene_path))
+
+
+func _get_living_block_scene_path(block_id: int) -> String:
+    var block: Block = ItemMap.map(block_id)
+    if block == null:
+        return ""
+    return str(block.living_block_scene_path)
+
+
+func _is_living_block_id(block_id: int) -> bool:
+    return _get_living_block_scene_path(block_id) != ""
+
+
+func _serialize_storage_items_for_preserve_save(serialized_items: Array) -> Array:
+    var preserved_items: Array = []
+    for item_data in serialized_items:
+        if item_data is PackedInt32Array and item_data.size() > 0:
+            preserved_items.append(item_data)
+        else:
+            preserved_items.append(PackedInt32Array())
+        preserved_items.append(Vector3i.ZERO)
+    return preserved_items
+
+
+func _store_remote_storage_inventory_snapshot_in_save(block_position: Vector3i, serialized_items: Array) -> void:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
+        return
+
+    var uuid: String = _find_saved_preserve_uuid_at_block_position(block_position)
+    if uuid == "":
+        return
+
+    Ref.save_file_manager.loaded_file.set_data(
+        "node/%s/Inventory/items" % uuid,
+        _serialize_storage_items_for_preserve_save(serialized_items),
+        false
+    )
+    Ref.save_file_manager.loaded_file.set_data("node/%s/Inventory/capacity" % uuid, serialized_items.size(), false)
+
+
+func _bind_sync_uuid(node: Node, uuid: String) -> void:
+    if node == null or not is_instance_valid(node) or uuid == "":
+        return
+    node.set_meta("coop_uuid", uuid)
+    if Ref.preserve_node_manager != null:
+        Ref.preserve_node_manager.node_to_uuid_map[node] = uuid
+
+
+func _capture_entity_save_bundle(entity, uuid: String = "") -> Dictionary:
+    if entity == null or not is_instance_valid(entity) or not (entity is Entity):
+        return {}
+
+    var resolved_uuid: String = uuid if uuid != "" else _assign_sync_uuid(entity)
+    var scene_path: String = _get_sync_scene_path(entity)
+    if resolved_uuid == "" or scene_path == "":
+        return {}
+
+    var temp_file := SaveFile.new()
+    entity.preserve_save(temp_file, resolved_uuid)
+    temp_file.set_data("node/%s/file_path" % resolved_uuid, scene_path, false)
+    return {
+        "uuid": resolved_uuid,
+        "scene_path": scene_path,
+        "position": entity.global_position,
+        "save_data": temp_file.data.duplicate_deep(),
+    }
+
+
+func _remove_uuid_from_chunk_map(chunk_to_uuid_map: Dictionary, chunk_position: Vector3i, uuid: String) -> void:
+    if uuid == "" or not chunk_to_uuid_map.has(chunk_position):
+        return
+
+    var uuids: PackedStringArray = chunk_to_uuid_map.get(chunk_position, PackedStringArray())
+    var index: int = uuids.find(uuid)
+    if index >= 0:
+        uuids.remove_at(index)
+    if uuids.is_empty():
+        chunk_to_uuid_map.erase(chunk_position)
+    else:
+        chunk_to_uuid_map[chunk_position] = uuids
+
+
+func _add_uuid_to_chunk_map(chunk_to_uuid_map: Dictionary, chunk_position: Vector3i, uuid: String) -> void:
+    if uuid == "":
+        return
+
+    var uuids: PackedStringArray = chunk_to_uuid_map.get(chunk_position, PackedStringArray())
+    if uuids.find(uuid) < 0:
+        uuids.append(uuid)
+    chunk_to_uuid_map[chunk_position] = uuids
+
+
+func _merge_save_data_into_loaded_file(save_data: Dictionary) -> void:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
+        return
+
+    for key in save_data.keys():
+        var source_value: Variant = save_data[key]
+        if source_value is Dictionary and Ref.save_file_manager.loaded_file.data.get(key, null) is Dictionary:
+            Ref.save_file_manager.loaded_file.data[key] = _merge_patch_dictionary(Ref.save_file_manager.loaded_file.data.get(key, {}), source_value)
+        else:
+            Ref.save_file_manager.loaded_file.data[key] = source_value.duplicate(true) if (source_value is Dictionary or source_value is Array) else source_value
+
+
+func _materialize_entity_from_save_bundle(bundle: Dictionary, guest_local_authority: bool = false):
+    var uuid: String = str(bundle.get("uuid", ""))
+    var scene_path: String = str(bundle.get("scene_path", ""))
+    var save_data: Variant = bundle.get("save_data", {})
+    if uuid == "" or scene_path == "" or not (save_data is Dictionary):
+        return null
+
+    var existing = _find_existing_entity_by_uuid(uuid)
+    if is_instance_valid(existing) and bool(existing.get_meta("coop_synced_entity", false)):
+        var existing_parent: Node = existing.get_parent()
+        if existing_parent != null:
+            existing_parent.remove_child(existing)
+        existing.queue_free()
+        existing = null
+
+    var entity = existing
+    if not is_instance_valid(entity):
+        var scene = load(scene_path)
+        if not (scene is PackedScene):
+            return null
+        entity = scene.instantiate()
+        if entity == null or not (entity is Entity):
+            if entity != null:
+                entity.queue_free()
+            return null
+        entity.set_meta("coop_source_scene_path", scene_path)
+        get_tree().get_root().add_child(entity)
+
+    _bind_sync_uuid(entity, uuid)
+    entity.remove_meta("coop_synced_entity")
+    entity.remove_meta("coop_candidate_existing")
+    entity.remove_meta("coop_client_runtime_configured")
+    entity.remove_meta("coop_entity_snapshot_initialized")
+    entity.remove_meta("coop_client_authoritative_dead")
+    entity.remove_meta("coop_client_death_visual_played")
+    if guest_local_authority:
+        entity.set_meta("coop_guest_local_authority", true)
+    else:
+        entity.remove_meta("coop_guest_local_authority")
+
+    var temp_file := SaveFile.new()
+    temp_file.data = save_data.duplicate_deep()
+    entity.preserve_load(temp_file, uuid)
+
+    if entity is Entity:
+        entity.disabled = false
+        entity.disabled_by_visibility = false
+        entity.invincible = false
+        entity.invincible_temporary = false
+
+    return entity
+
+
+func _remove_saved_entity_uuid(uuid: String) -> void:
+    if uuid == "" or Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or not is_instance_valid(Ref.world):
+        return
+
+    var previous_position: Variant = Ref.save_file_manager.loaded_file.get_data("node/%s/global_position" % uuid, null, false)
+    var chunk_to_uuid_map: Dictionary = _get_saved_chunk_to_uuid_map()
+    if previous_position is Vector3:
+        _remove_uuid_from_chunk_map(chunk_to_uuid_map, Ref.world.snap_to_chunk(previous_position), uuid)
+        _store_saved_chunk_to_uuid_map(chunk_to_uuid_map)
+
+    Ref.save_file_manager.loaded_file.erase_data("node/%s" % uuid)
+
+    var existing = _find_existing_entity_by_uuid(uuid)
+    if is_instance_valid(existing) and not is_remote_player_proxy(existing):
+        existing.queue_free()
+
+
+func _upsert_saved_entity_bundle(bundle: Dictionary) -> void:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or not is_instance_valid(Ref.world):
+        return
+
+    var uuid: String = str(bundle.get("uuid", ""))
+    var scene_path: String = str(bundle.get("scene_path", ""))
+    var save_data: Variant = bundle.get("save_data", {})
+    var position: Variant = bundle.get("position", Vector3.ZERO)
+    if uuid == "" or scene_path == "" or not (save_data is Dictionary) or not (position is Vector3):
+        return
+
+    var chunk_to_uuid_map: Dictionary = _get_saved_chunk_to_uuid_map()
+    var previous_position: Variant = Ref.save_file_manager.loaded_file.get_data("node/%s/global_position" % uuid, null, false)
+    if previous_position is Vector3:
+        _remove_uuid_from_chunk_map(chunk_to_uuid_map, Ref.world.snap_to_chunk(previous_position), uuid)
+    var chunk_position: Vector3i = Ref.world.snap_to_chunk(position)
+    _add_uuid_to_chunk_map(chunk_to_uuid_map, chunk_position, uuid)
+
+    _merge_save_data_into_loaded_file(save_data)
+    Ref.save_file_manager.loaded_file.set_data("node/%s/file_path" % uuid, scene_path, false)
+
+    if Ref.world.is_position_loaded(position):
+        _remove_uuid_from_chunk_map(chunk_to_uuid_map, chunk_position, uuid)
+        _store_saved_chunk_to_uuid_map(chunk_to_uuid_map)
+        _materialize_entity_from_save_bundle(bundle)
+    else:
+        _store_saved_chunk_to_uuid_map(chunk_to_uuid_map)
+
+
+func _guest_entity_registry_key(player_key: String, dimension_instance_key: String) -> String:
+    return "%s|%s" % [player_key, dimension_instance_key]
+
+
+func _store_guest_authoritative_entities(player_key: String, dimension_instance_key: String, entity_bundles: Array) -> void:
+    if not _can_share_loaded_world() or player_key == "" or dimension_instance_key == "":
+        return
+
+    var registry_key: String = _guest_entity_registry_key(player_key, dimension_instance_key)
+    var previous_uuids: PackedStringArray = guest_authoritative_entity_registry.get(registry_key, PackedStringArray())
+    var current_uuids: PackedStringArray = PackedStringArray()
+
+    for bundle in entity_bundles:
+        if not (bundle is Dictionary):
+            continue
+        var entity_bundle: Dictionary = bundle
+        if str(entity_bundle.get("dimension_instance_key", dimension_instance_key)) != dimension_instance_key:
+            continue
+        var uuid: String = str(entity_bundle.get("uuid", ""))
+        if uuid == "":
+            continue
+        if current_uuids.find(uuid) < 0:
+            current_uuids.append(uuid)
+        _upsert_saved_entity_bundle(entity_bundle)
+
+    for previous_uuid in previous_uuids:
+        if current_uuids.find(previous_uuid) >= 0:
+            continue
+        _remove_saved_entity_uuid(previous_uuid)
+
+    guest_authoritative_entity_registry[registry_key] = current_uuids
 
 
 func is_applying_remote_storage_sync(block_position: Vector3i) -> bool:
@@ -4261,6 +4674,43 @@ func _send_persistent_state_to_host(force_send: bool = false) -> void:
         _get_local_player_name(),
         state
     )
+
+
+func _send_local_authoritative_entities_to_host(force_send: bool = false) -> void:
+    if multiplayer.is_server() or not _has_live_peer() or not _can_sample_player():
+        return
+    var has_live_guest_entity_authority: bool = _has_local_guest_entity_authority()
+    if not force_send:
+        if not guest_persistent_ready or _is_client_gameplay_locked() or not has_live_guest_entity_authority:
+            return
+
+    var entity_bundles: Array = []
+    var dimension_instance_key: String = get_active_dimension_instance_key()
+    for child in _get_live_tracked_entities():
+        if not _is_syncable_entity_node(child):
+            continue
+        if bool(child.get_meta("coop_synced_entity", false)):
+            continue
+        if not has_live_guest_entity_authority and not bool(child.get_meta("coop_guest_local_authority", false)):
+            continue
+        if child.dead:
+            continue
+
+        var uuid: String = _assign_sync_uuid(child)
+        if uuid == "":
+            continue
+        child.set_meta("coop_guest_local_authority", true)
+
+        var bundle: Dictionary = _capture_entity_save_bundle(child, uuid)
+        if bundle.is_empty():
+            continue
+        bundle["dimension_instance_key"] = dimension_instance_key
+        entity_bundles.append(bundle)
+
+    if entity_bundles.is_empty() and not has_live_guest_entity_authority:
+        return
+
+    submit_guest_authoritative_entities.rpc_id(1, _get_local_player_key(), dimension_instance_key, entity_bundles)
 
 
 func _store_guest_persistent_state(player_key: String, player_name: String, save_data: Dictionary) -> void:
@@ -4713,13 +5163,105 @@ func _capture_local_world_patch() -> Dictionary:
     }
 
 
+func _get_unique_chunk_positions_for_world_positions(world_positions: Array) -> Array:
+    if not is_instance_valid(Ref.world):
+        return []
+
+    var chunk_positions: Array = []
+    var seen_positions: Dictionary = {}
+    for world_position in world_positions:
+        var position: Vector3
+        if world_position is Vector3:
+            position = world_position
+        elif world_position is Vector3i:
+            position = Vector3(world_position)
+        else:
+            continue
+
+        var chunk_position: Vector3i = Ref.world.snap_to_chunk(position)
+        if seen_positions.has(chunk_position):
+            continue
+        seen_positions[chunk_position] = true
+        chunk_positions.append(chunk_position)
+
+    return chunk_positions
+
+
+func _filter_world_data_to_chunk_positions(world_data: Dictionary, prefix: String, chunk_positions: Array) -> Dictionary:
+    var source_root: Variant = world_data.get(prefix + "world", null)
+    if not (source_root is Dictionary):
+        return {}
+
+    var filtered_root: Dictionary = {}
+    var source_world: Dictionary = source_root
+    for suffix in ["chunk_block", "chunk_water", "chunk_water_awake", "chunk_fire"]:
+        var source_key: String = prefix + suffix
+        var source_entries: Variant = source_world.get(source_key, null)
+        if not (source_entries is Dictionary):
+            continue
+
+        var filtered_entries: Dictionary = {}
+        for chunk_position in chunk_positions:
+            if source_entries.has(chunk_position):
+                filtered_entries[chunk_position] = source_entries[chunk_position].duplicate(true)
+
+        if not filtered_entries.is_empty():
+            filtered_root[source_key] = filtered_entries
+
+    if filtered_root.is_empty():
+        return {}
+    return {prefix + "world": filtered_root}
+
+
+func _capture_local_chunk_patch_for_world_positions(world_positions: Array) -> Dictionary:
+    if not _can_sample_player():
+        return {}
+
+    var chunk_positions: Array = _get_unique_chunk_positions_for_world_positions(world_positions)
+    if chunk_positions.is_empty():
+        return {}
+
+    var dimension: int = int(Ref.world.current_dimension)
+    var pocket_owner_key: String = get_active_pocket_owner_key()
+    var prefix: String = _resolve_dimension_namespace(dimension, pocket_owner_key) + "_"
+    var world_data: Dictionary = {}
+    Ref.world.save_data(world_data, prefix)
+
+    var filtered_world_data: Dictionary = _filter_world_data_to_chunk_positions(world_data, prefix, chunk_positions)
+    if filtered_world_data.is_empty():
+        return {}
+
+    return {
+        "dimension": dimension,
+        "pocket_owner_key": pocket_owner_key,
+        "dimension_instance_key": get_dimension_instance_key(dimension, pocket_owner_key),
+        "world_data": filtered_world_data,
+    }
+
+
+func _merge_patch_dictionary(target: Dictionary, source: Dictionary) -> Dictionary:
+    var merged: Dictionary = target.duplicate(true)
+    for key in source.keys():
+        var source_value: Variant = source[key]
+        if source_value is Dictionary and merged.get(key, null) is Dictionary:
+            merged[key] = _merge_patch_dictionary(merged.get(key, {}), source_value)
+        else:
+            merged[key] = source_value.duplicate(true) if (source_value is Dictionary or source_value is Array) else source_value
+    return merged
+
+
 func _merge_world_patch_into_save(world_patch: Dictionary) -> void:
     if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
         return
 
     var world_data: Variant = world_patch.get("world_data", {})
     if world_data is Dictionary:
-        Ref.save_file_manager.loaded_file.data.merge(world_data, true)
+        for key in world_data.keys():
+            var source_value: Variant = world_data[key]
+            if source_value is Dictionary and Ref.save_file_manager.loaded_file.data.get(key, null) is Dictionary:
+                Ref.save_file_manager.loaded_file.data[key] = _merge_patch_dictionary(Ref.save_file_manager.loaded_file.data.get(key, {}), source_value)
+            else:
+                Ref.save_file_manager.loaded_file.data[key] = source_value.duplicate(true) if (source_value is Dictionary or source_value is Array) else source_value
 
     var dimension_namespace: String = _resolve_dimension_namespace(int(world_patch.get("dimension", -1)), str(world_patch.get("pocket_owner_key", "")))
     SaveFile._set_data(Ref.save_file_manager.loaded_file.data, dimension_namespace + "/respawn_positions", world_patch.get("respawn_positions", {}))
@@ -4736,8 +5278,7 @@ func _apply_world_patch_locally(world_patch: Dictionary) -> void:
 
     _merge_world_patch_into_save(world_patch)
     Ref.world.respawn_positions = world_patch.get("respawn_positions", {}).duplicate(true)
-    Ref.world.load_data(world_patch.get("world_data", {}), _resolve_dimension_namespace(dimension, pocket_owner_key) + "_")
-    Ref.world.force_reload()
+    Ref.world.load_data(Ref.save_file_manager.loaded_file.data, _resolve_dimension_namespace(dimension, pocket_owner_key) + "_")
 
 
 func _send_local_world_patch_if_needed(force_send: bool = false) -> void:
@@ -7201,12 +7742,12 @@ func _prepare_client_world_sync() -> void:
         return
 
     if is_instance_valid(Ref.entity_spawner):
-        if _is_local_world_authority():
+        if _has_local_entity_authority():
             Ref.entity_spawner.start_spawning()
         else:
             Ref.entity_spawner.stop_spawning()
 
-    if _is_local_world_authority():
+    if _has_local_entity_authority():
         synced_entities.clear()
         synced_dropped_items.clear()
         client_world_sync_ready = true
@@ -7229,17 +7770,62 @@ func _clear_client_world_entities_and_drops() -> void:
     client_last_world_state_sequence = -1
 
     for child in _get_live_tracked_entities():
-        child.call_deferred("queue_free")
-    for child in _get_live_tracked_drops():
-        child.call_deferred("queue_free")
-    tracked_root_entities.clear()
-    tracked_root_drops.clear()
-
-    for child in get_tree().get_root().get_children():
-        if child is Player:
-            continue
-        if child is Entity or child is DroppedItem:
+        if bool(child.get_meta("coop_synced_entity", false)) or bool(child.get_meta("coop_candidate_existing", false)):
             child.call_deferred("queue_free")
+    for child in _get_live_tracked_drops():
+        if bool(child.get_meta("coop_synced_drop", false)) or bool(child.get_meta("coop_predicted_drop", false)):
+            child.call_deferred("queue_free")
+
+
+func _clear_local_guest_authoritative_runtime() -> void:
+    if multiplayer.is_server():
+        return
+
+    for child in _get_live_tracked_entities():
+        if not _is_syncable_entity_node(child):
+            continue
+        if bool(child.get_meta("coop_synced_entity", false)):
+            continue
+        child.remove_meta("coop_guest_local_authority")
+        _prepare_existing_client_entity(child)
+
+    for child in _get_live_tracked_drops():
+        if bool(child.get_meta("coop_synced_drop", false)):
+            continue
+        child.call_deferred("queue_free")
+
+
+func _promote_host_synced_entities_to_local_authority() -> void:
+    if multiplayer.is_server():
+        return
+
+    var bundles: Array = []
+    for child in _get_live_tracked_entities():
+        if not _is_syncable_entity_node(child):
+            continue
+        if not bool(child.get_meta("coop_synced_entity", false)):
+            continue
+
+        var uuid: String = _assign_sync_uuid(child)
+        var bundle: Dictionary = _capture_entity_save_bundle(child, uuid)
+        if not bundle.is_empty():
+            bundles.append(bundle)
+
+        var parent: Node = child.get_parent()
+        if parent != null:
+            parent.remove_child(child)
+        child.queue_free()
+
+    for dropped_item in _get_live_tracked_drops():
+        if bool(dropped_item.get_meta("coop_synced_drop", false)):
+            dropped_item.call_deferred("queue_free")
+
+    synced_entities.clear()
+    synced_dropped_items.clear()
+    entity_interp_map.clear()
+
+    for bundle in bundles:
+        _materialize_entity_from_save_bundle(bundle, true)
 
 
 func _adopt_existing_client_world_entities_and_drops() -> void:
@@ -9493,6 +10079,22 @@ func submit_guest_persistent_state(player_key: String, player_name: String, save
 
 
 @rpc("any_peer", "call_remote", "reliable")
+func submit_guest_authoritative_entities(player_key: String, dimension_instance_key: String, entity_bundles: Array) -> void:
+    if not multiplayer.is_server() or player_key == "" or dimension_instance_key == "":
+        return
+
+    var sender_id: int = multiplayer.get_remote_sender_id()
+    if sender_id <= 0:
+        return
+
+    var sender_state: Dictionary = peer_states.get(sender_id, {})
+    if not _is_peer_state_same_instance(sender_state, dimension_instance_key):
+        return
+
+    _store_guest_authoritative_entities(player_key, dimension_instance_key, entity_bundles)
+
+
+@rpc("any_peer", "call_remote", "reliable")
 func request_guest_persistent_state(player_key: String, player_name: String) -> void:
     if not multiplayer.is_server() or player_key == "":
         return
@@ -9519,7 +10121,7 @@ func receive_guest_persistent_state(save_data: Dictionary) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_place_block(dimension_instance_key: String, block_position: Vector3i, block_id: int) -> void:
+func request_place_block(dimension_instance_key: String, block_position: Vector3i, block_id: int, world_patch: Dictionary = {}) -> void:
     if not multiplayer.is_server():
         return
 
@@ -9532,11 +10134,18 @@ func request_place_block(dimension_instance_key: String, block_position: Vector3
     var sender_state: Dictionary = peer_states.get(sender_id, {})
     if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
-    if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
+    if not is_instance_valid(Ref.world):
         return
 
-    _apply_network_place(block_position, block_id)
-    sync_place_block.rpc(active_dimension_key, block_position, block_id)
+    var is_loaded: bool = Ref.world.is_position_loaded(block_position)
+    if is_loaded:
+        _apply_network_place(block_position, block_id)
+    else:
+        _remove_saved_preserve_node_at_position(block_position)
+        _apply_world_patch_locally(world_patch)
+        _upsert_saved_living_block_at_position(block_position, block_id)
+
+    sync_place_block.rpc(active_dimension_key, block_position, block_id, _get_living_block_scene_path(block_id))
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -9646,7 +10255,7 @@ func _relay_world_patch_to_matching_peers(world_patch: Dictionary, excluded_peer
 
 
 @rpc("authority", "call_remote", "reliable")
-func sync_place_block(dimension_instance_key: String, block_position: Vector3i, block_id: int) -> void:
+func sync_place_block(dimension_instance_key: String, block_position: Vector3i, block_id: int, living_block_scene_path: String = "") -> void:
     if multiplayer.is_server():
         return
     _mark_host_contact()
@@ -9655,10 +10264,14 @@ func sync_place_block(dimension_instance_key: String, block_position: Vector3i, 
     if is_instance_valid(Ref.world) and Ref.world.is_position_loaded(block_position) and Ref.world.is_block_solid_at(block_position):
         return
     _apply_network_place(block_position, block_id)
+    if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
+        _remove_saved_preserve_node_at_position(block_position)
+        if living_block_scene_path != "":
+            _upsert_saved_living_block_at_position(block_position, block_id)
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_break_block(dimension_instance_key: String, block_position: Vector3i, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool) -> void:
+func request_break_block(dimension_instance_key: String, block_position: Vector3i, broken_block_id: int, pickaxe: bool, axe: bool, shovel: bool, meat: bool, plant: bool, world_patch: Dictionary = {}) -> void:
     if not multiplayer.is_server():
         return
 
@@ -9671,20 +10284,24 @@ func request_break_block(dimension_instance_key: String, block_position: Vector3
     var sender_state: Dictionary = peer_states.get(sender_id, {})
     if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
-    if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
+    if not is_instance_valid(Ref.world):
         return
 
-    var broken_block = Ref.world.get_block_type_at(block_position)
+    var broken_block = Ref.world.get_block_type_at(block_position) if Ref.world.is_position_loaded(block_position) else ItemMap.map(broken_block_id)
     if broken_block == null:
         return
-    _apply_network_break(block_position)
+    if Ref.world.is_position_loaded(block_position):
+        _apply_network_break(block_position)
+    else:
+        _remove_saved_preserve_node_at_position(block_position)
+        _apply_world_patch_locally(world_patch)
     if broken_block != null:
         _spawn_break_drops_for_block(broken_block, block_position, pickaxe, axe, shovel, meat, plant)
-    sync_break_block.rpc(active_dimension_key, block_position)
+    sync_break_block.rpc(active_dimension_key, block_position, _is_living_block_id(broken_block_id) or _find_saved_preserve_uuid_at_block_position(block_position) != "")
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_water_cells(dimension_instance_key: String, changes: Array) -> void:
+func request_water_cells(dimension_instance_key: String, changes: Array, world_patch: Dictionary = {}) -> void:
     if not multiplayer.is_server():
         return
 
@@ -9697,7 +10314,17 @@ func request_water_cells(dimension_instance_key: String, changes: Array) -> void
     var sender_state: Dictionary = peer_states.get(sender_id, {})
     if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
-    _apply_network_water_cells(changes)
+    var all_loaded: bool = true
+    if not is_instance_valid(Ref.world):
+        return
+    for entry in changes:
+        if not (entry is Array) or entry.size() < 1 or not Ref.world.is_position_loaded(entry[0]):
+            all_loaded = false
+            break
+    if all_loaded:
+        _apply_network_water_cells(changes)
+    else:
+        _apply_world_patch_locally(world_patch)
     sync_water_cells.rpc(active_dimension_key, changes)
 
 
@@ -9712,7 +10339,7 @@ func sync_water_cells(dimension_instance_key: String, changes: Array) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_fire_cell(dimension_instance_key: String, block_position: Vector3i, fire_level: int) -> void:
+func request_fire_cell(dimension_instance_key: String, block_position: Vector3i, fire_level: int, world_patch: Dictionary = {}) -> void:
     if not multiplayer.is_server():
         return
 
@@ -9725,7 +10352,12 @@ func request_fire_cell(dimension_instance_key: String, block_position: Vector3i,
     var sender_state: Dictionary = peer_states.get(sender_id, {})
     if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
-    _apply_network_fire_cell(block_position, fire_level)
+    if not is_instance_valid(Ref.world):
+        return
+    if Ref.world.is_position_loaded(block_position):
+        _apply_network_fire_cell(block_position, fire_level)
+    else:
+        _apply_world_patch_locally(world_patch)
     sync_fire_cell.rpc(active_dimension_key, block_position, fire_level)
 
 
@@ -9792,7 +10424,10 @@ func request_storage_inventory(dimension_instance_key: String, block_position: V
     if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
 
-    _apply_storage_inventory_snapshot(block_position, serialized_items)
+    if is_instance_valid(Ref.world) and Ref.world.is_position_loaded(block_position):
+        _apply_storage_inventory_snapshot(block_position, serialized_items)
+    else:
+        _store_remote_storage_inventory_snapshot_in_save(block_position, serialized_items)
     sync_storage_inventory.rpc(active_dimension_key, block_position, serialized_items)
 
 
@@ -9822,7 +10457,7 @@ func sync_world_changes(dimension_instance_key: String, block_changes: Array, fi
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func request_foliage_break(dimension_instance_key: String, block_position: Vector3i) -> void:
+func request_foliage_break(dimension_instance_key: String, block_position: Vector3i, broken_block_id: int, world_patch: Dictionary = {}) -> void:
     if not multiplayer.is_server():
         return
 
@@ -9836,17 +10471,21 @@ func request_foliage_break(dimension_instance_key: String, block_position: Vecto
     if not _is_peer_state_same_instance(sender_state, active_dimension_key):
         return
 
-    var block: Block = Ref.world.get_block_type_at(block_position)
+    var block: Block = Ref.world.get_block_type_at(block_position) if is_instance_valid(Ref.world) and Ref.world.is_position_loaded(block_position) else ItemMap.map(broken_block_id)
     if block == null or not block.foliage:
         return
 
-    _apply_network_break(block_position)
+    if is_instance_valid(Ref.world) and Ref.world.is_position_loaded(block_position):
+        _apply_network_break(block_position)
+    else:
+        _remove_saved_preserve_node_at_position(block_position)
+        _apply_world_patch_locally(world_patch)
     if block.can_drop:
         var new_state := ItemState.new()
         new_state.initialize(block)
         new_state.count = 1
         _spawn_network_item(new_state, block_position)
-    sync_break_block.rpc(active_dimension_key, block_position)
+    sync_break_block.rpc(active_dimension_key, block_position, _is_living_block_id(broken_block_id) or _find_saved_preserve_uuid_at_block_position(block_position) != "")
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -9959,13 +10598,15 @@ func request_player_attack(target_peer_id: int, damage_position: Vector3, damage
 
 
 @rpc("authority", "call_remote", "reliable")
-func sync_break_block(dimension_instance_key: String, block_position: Vector3i) -> void:
+func sync_break_block(dimension_instance_key: String, block_position: Vector3i, remove_saved_node: bool = false) -> void:
     if multiplayer.is_server():
         return
     _mark_host_contact()
     if dimension_instance_key != get_active_dimension_instance_key():
         return
     _apply_network_break(block_position)
+    if remove_saved_node:
+        _remove_saved_preserve_node_at_position(block_position)
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -10019,7 +10660,7 @@ func sync_remove_drop(drop_uuid: String) -> void:
 
 @rpc("authority", "call_remote", "unreliable")
 func server_world_state(sequence: int, drop_snapshots: Array, entity_snapshots: Array = []) -> void:
-    if multiplayer.is_server() or receiving_host_world or _is_local_world_authority():
+    if multiplayer.is_server() or receiving_host_world or _is_local_world_authority() or _has_local_guest_entity_authority():
         return
     _mark_host_contact()
     

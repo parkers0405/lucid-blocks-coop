@@ -30,8 +30,12 @@ var last_discovery_spawn_attempt_msec: int = 0
 
 
 func _can_use_multi_region_logic() -> bool:
-    return Ref.coop_manager != null \
-        and Ref.coop_manager.has_connected_remote_peers()
+    return multiplayer.is_server() \
+        and Ref.coop_manager != null \
+        and Ref.coop_manager.has_connected_remote_peers() \
+        and Ref.world != null \
+        and Ref.world.has_method("uses_coop_multi_region_loading") \
+        and bool(Ref.world.call("uses_coop_multi_region_loading"))
 
 
 func _ready() -> void :
@@ -280,6 +284,8 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
     entity.transform.origin = spawn_position
     entity.allow_swarm()
     entity.set_meta("coop_runtime_spawned", true)
+    if not multiplayer.is_server():
+        entity.set_meta("coop_guest_local_authority", true)
     get_tree().get_root().add_child(entity)
 
     entities.append(entity)

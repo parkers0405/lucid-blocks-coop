@@ -30,6 +30,9 @@ var buffer_instance_radius: int = 80
 var fps_cap: int = 60
 var current_seed: int
 var even: bool = false
+var session_region_anchor_index: int = 0
+var session_region_anchor_chunk: Vector3i = Vector3i.ZERO
+var session_region_anchor_valid: bool = false
 var coop_perf_override_active: bool = false
 var coop_dynamic_visual_refresh_frames: int = 0
 var coop_original_os_low_processor_mode_set: bool = false
@@ -147,9 +150,20 @@ func _physics_process(_delta: float) -> void :
     if load_enabled:
         even = not even
         var load_center: Vector3 = Ref.player.global_position
-        if Ref.coop_manager != null:
-            load_center = Ref.coop_manager.get_world_load_center(load_center)
-        set_loaded_region_center(load_center)
+        var using_multi_region: bool = _should_use_host_multi_region_loading()
+        if using_multi_region and Ref.coop_manager != null:
+            var session_positions: Array = Ref.coop_manager.get_same_instance_session_positions()
+            if session_positions.size() >= 2:
+                _do_multi_region_frame(session_positions)
+            else:
+                _clear_native_multi_region()
+                load_center = Ref.coop_manager.get_world_load_center(load_center)
+                set_loaded_region_center(load_center)
+        else:
+            _clear_native_multi_region()
+            if Ref.coop_manager != null:
+                load_center = Ref.coop_manager.get_world_load_center(load_center)
+            set_loaded_region_center(load_center)
 
         var pause_blocks_sim: bool = get_tree().paused and not _is_coop_perf_override_active()
         var allow_dynamic_tick: bool = simulate_frame or _should_force_background_dynamic_ticks()
@@ -157,6 +171,136 @@ func _physics_process(_delta: float) -> void :
             simulate_dynamic()
             if not _should_force_background_dynamic_ticks():
                 simulate_frame = false
+
+
+func _do_multi_region_frame(session_positions: Array) -> void:
+    var effective_session_positions: Array = _ensure_local_player_region_center(session_positions)
+    _push_native_multi_region_centers(effective_session_positions)
+
+    var anchor_center: Vector3 = _select_multi_region_anchor(effective_session_positions)
+    set_loaded_region_center(anchor_center)
+
+
+func _ensure_local_player_region_center(session_positions: Array) -> Array:
+    var effective_positions: Array = []
+    var local_center: Vector3 = Ref.player.global_position
+    effective_positions.append(local_center)
+
+    for position in session_positions:
+        if position is Vector3 and snap_to_chunk(position) != snap_to_chunk(local_center):
+            effective_positions.append(position)
+
+    return effective_positions
+
+
+func _select_multi_region_anchor(session_positions: Array) -> Vector3:
+    if session_positions.is_empty():
+        session_region_anchor_valid = false
+        return Ref.player.global_position
+
+    var current_anchor_position: Variant = null
+    var current_anchor_missing_probes: int = 0
+    if session_region_anchor_valid:
+        for position in session_positions:
+            if snap_to_chunk(position) == session_region_anchor_chunk:
+                current_anchor_position = position
+                current_anchor_missing_probes = _get_player_region_missing_probe_count(position)
+                break
+
+    if current_anchor_position != null and (not is_all_loaded() or current_anchor_missing_probes > 0):
+        session_region_anchor_chunk = snap_to_chunk(current_anchor_position)
+        session_region_anchor_valid = true
+        return current_anchor_position
+
+    var best_index: int = -1
+    var best_missing_probe_count: int = 0
+    for index in range(session_positions.size()):
+        var candidate_missing_probe_count: int = _get_player_region_missing_probe_count(session_positions[index])
+        if candidate_missing_probe_count > best_missing_probe_count:
+            best_missing_probe_count = candidate_missing_probe_count
+            best_index = index
+
+    if best_index >= 0:
+        var best_position: Vector3 = session_positions[best_index]
+        session_region_anchor_index = (best_index + 1) % session_positions.size()
+        session_region_anchor_chunk = snap_to_chunk(best_position)
+        session_region_anchor_valid = true
+        return best_position
+
+    if session_region_anchor_index >= session_positions.size():
+        session_region_anchor_index = 0
+
+    var fallback_index: int = mini(session_region_anchor_index, session_positions.size() - 1)
+    var fallback_position: Vector3 = session_positions[fallback_index]
+    session_region_anchor_index = (fallback_index + 1) % session_positions.size()
+    session_region_anchor_chunk = snap_to_chunk(fallback_position)
+    session_region_anchor_valid = true
+    return fallback_position
+
+
+func _player_region_needs_loading(player_position: Vector3) -> bool:
+    return _get_player_region_missing_probe_count(player_position) > 0
+
+
+func _get_player_region_missing_probe_count(player_position: Vector3) -> int:
+    var missing_probe_count: int = 0
+    if not is_position_loaded(player_position):
+        missing_probe_count += 1
+
+    var edge_probe_radius: float = maxf(float(instance_radius) - 24.0, 16.0)
+    var probe_offsets: Array[Vector3] = [
+        Vector3.ZERO,
+        Vector3(edge_probe_radius, 0.0, 0.0),
+        Vector3(-edge_probe_radius, 0.0, 0.0),
+        Vector3(0.0, 0.0, edge_probe_radius),
+        Vector3(0.0, 0.0, -edge_probe_radius),
+        Vector3(edge_probe_radius * 0.7, 0.0, edge_probe_radius * 0.7),
+        Vector3(edge_probe_radius * 0.7, 0.0, -edge_probe_radius * 0.7),
+        Vector3(-edge_probe_radius * 0.7, 0.0, edge_probe_radius * 0.7),
+        Vector3(-edge_probe_radius * 0.7, 0.0, -edge_probe_radius * 0.7),
+    ]
+
+    for offset in probe_offsets:
+        if not is_position_loaded(player_position + offset):
+            missing_probe_count += 1
+
+    return missing_probe_count
+
+
+func _push_native_multi_region_centers(centers: Array) -> void:
+    if Ref.coop_native_patch == null:
+        return
+    if Ref.coop_native_patch.has_method("set_world_active_region_centers"):
+        Ref.coop_native_patch.call("set_world_active_region_centers", self, centers)
+    if Ref.coop_native_patch.has_method("set_active_region_centers"):
+        Ref.coop_native_patch.call("set_active_region_centers", centers)
+
+
+func _clear_native_multi_region() -> void:
+    session_region_anchor_valid = false
+    if Ref.coop_native_patch == null:
+        return
+    if Ref.coop_native_patch.has_method("clear_world_active_region_centers"):
+        Ref.coop_native_patch.call("clear_world_active_region_centers", self)
+    if Ref.coop_native_patch.has_method("clear_active_region_centers"):
+        Ref.coop_native_patch.call("clear_active_region_centers")
+
+
+func supports_coop_multi_region_loading() -> bool:
+    if Ref.coop_native_patch == null or not Ref.coop_native_patch.has_method("get_status"):
+        return false
+    var status: Variant = Ref.coop_native_patch.call("get_status")
+    if not (status is Dictionary):
+        return false
+    return bool(status.get("module_loaded", false)) and bool(status.get("multi_region_hooks_installed", false))
+
+
+func uses_coop_multi_region_loading() -> bool:
+    return _should_use_host_multi_region_loading()
+
+
+func _should_use_host_multi_region_loading() -> bool:
+    return false
 
 
 func _process(_delta: float) -> void :
@@ -181,7 +325,17 @@ func _on_chunk_loaded(_chunk_position: Vector3i) -> void:
 
 
 func _on_all_loaded() -> void:
-    pass
+    if not _should_use_host_multi_region_loading() or Ref.coop_manager == null:
+        return
+
+    var session_positions: Array = Ref.coop_manager.get_same_instance_session_positions()
+    if session_positions.size() < 2:
+        return
+
+    for position in session_positions:
+        if _player_region_needs_loading(position):
+            call_deferred("_do_multi_region_frame", session_positions)
+            return
 
 
 func _input(event: InputEvent) -> void :

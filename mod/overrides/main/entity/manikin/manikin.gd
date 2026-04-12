@@ -131,20 +131,20 @@ func _use_session_targeting() -> bool:
 func _is_session_position_loaded(world_position: Vector3) -> bool:
     if Ref.world.is_position_loaded(world_position):
         return true
-    return _use_session_targeting() and Ref.coop_manager.is_position_near_same_instance_player(world_position, process_distance)
+    return _can_use_session_load_proxy() and Ref.coop_manager.is_position_near_same_instance_player(world_position, process_distance)
 
 
 func is_future_position_loaded(delta: float) -> bool:
     var future_position: Vector3 = global_position + velocity * delta
     if Ref.world.is_position_loaded(future_position):
         return true
-    return _use_session_targeting() and Ref.coop_manager.is_position_near_same_instance_player(future_position, process_distance)
+    return _can_use_session_load_proxy() and Ref.coop_manager.is_position_near_same_instance_player(future_position, process_distance)
 
 
 func distance_process_check() -> void:
     var distance: float = Ref.player.global_position.distance_to(global_position)
     var near_session_player: bool = false
-    if _use_session_targeting():
+    if _can_use_session_load_proxy():
         var session_distance: float = Ref.coop_manager.get_nearest_session_player_distance(global_position, distance)
         near_session_player = session_distance < distance
         distance = session_distance

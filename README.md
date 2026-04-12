@@ -7,8 +7,8 @@ Multiplayer Co-op mod For Lucid Blocks.
 
 1) Download From Github
 2) Unzip, and open "dist"
-4) Copy both 'lucid-blocks-coop-test.pck', and 'zzz-lucid-blocks-command-chat.pck'.
-5) Paste into your mods folder (EX:'SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/mods')
+4) Copy `lucid-blocks-coop.pck`.
+5) Paste it into your mods folder (EX:'SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/mods')
 
 
 ## How To Join Co-op

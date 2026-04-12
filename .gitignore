@@ -1,6 +1,10 @@
 work/logs/
 work/recovered/
 work/tools/
+native_patch/runtime_extension/build/
+native_patch/runtime_extension/godot-cpp/
+native_patch/runtime_extension/extension_api.double.json
+native_patch/runtime_extension/.sconsign.dblite
 dist/*.pck
 dist/*.zip
 mod/overrides/.godot/
