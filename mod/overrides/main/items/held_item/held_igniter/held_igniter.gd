@@ -46,6 +46,7 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
 
         if Ref.coop_manager != null:
             Ref.coop_manager.sync_local_fire_cell(Vector3i(data.target_position), 1)
+            Ref.coop_manager.notify_local_world_state_dirty([Vector3i(data.target_position)])
         return true
 
     return false

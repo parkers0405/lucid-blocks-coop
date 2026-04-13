@@ -39,6 +39,7 @@ PROTON_BIN="${PROTON_BIN:-$STEAM_ROOT/steamapps/common/Proton - Experimental/pro
 RUNTIME_DIR="${RUNTIME_DIR:-$STEAM_ROOT/steamapps/common/SteamLinuxRuntime_sniper}"
 SECOND_PREFIX="${SECOND_PREFIX:-$STEAM_ROOT/steamapps/compatdata/lucid-blocks-coop-second}"
 SECOND_SHADERCACHE="${SECOND_SHADERCACHE:-$STEAM_ROOT/steamapps/shadercache/lucid-blocks-coop-second}"
+COOP_PLAYER_KEY_SUFFIX="${COOP_PLAYER_KEY_SUFFIX:-second}"
 GAME_LIBRARY_DIR=$(dirname "$(dirname "$GAME_EXE")")
 COMPAT_LIBRARY_PATHS="$STEAM_ROOT/steamapps"
 
@@ -68,8 +69,10 @@ printf 'Launching second Lucid Blocks instance...\n'
 printf 'Game exe: %s\n' "$GAME_EXE"
 printf 'Second prefix: %s\n' "$SECOND_PREFIX"
 printf 'Second shadercache: %s\n' "$SECOND_SHADERCACHE"
+printf 'Coop player key suffix: %s\n' "$COOP_PLAYER_KEY_SUFFIX"
 
 steam-run env \
+  COOP_PLAYER_KEY_SUFFIX="$COOP_PLAYER_KEY_SUFFIX" \
   STEAM_COMPAT_APP_ID=3495730 \
   STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" \
   STEAM_COMPAT_DATA_PATH="$SECOND_PREFIX" \

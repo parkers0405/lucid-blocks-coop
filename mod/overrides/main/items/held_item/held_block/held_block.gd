@@ -86,6 +86,8 @@ func place_block() -> void :
         place_position = final_place_position
         inventory.change_amount(inventory_index, -1)
         Ref.world.place_block_at(place_position, to_place, true, true)
+        if holder == Ref.player and Ref.coop_manager != null:
+            Ref.coop_manager.notify_local_world_state_dirty([place_position])
 
     if holder == Ref.player:
         Steamworks.increment_statistic("blocks_placed")

@@ -31,6 +31,8 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
             return true
 
         Ref.world.break_block_at(place_position, true, false)
+        if Ref.coop_manager != null and holder == Ref.player:
+            Ref.coop_manager.notify_local_world_state_dirty([Vector3i(place_position)])
         if block.can_drop:
             var new_state: ItemState = ItemState.new()
             new_state.initialize(block)

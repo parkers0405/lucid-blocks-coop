@@ -72,6 +72,11 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
 
         if Ref.coop_manager != null:
             Ref.coop_manager.sync_local_water_cells(applied_changes)
+            var dirty_positions: Array = []
+            for change in applied_changes:
+                if change is Array and change.size() >= 1:
+                    dirty_positions.append(change[0])
+            Ref.coop_manager.notify_local_world_state_dirty(dirty_positions)
         return true
     return false
 

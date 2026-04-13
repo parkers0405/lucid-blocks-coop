@@ -107,6 +107,7 @@ func break_block_instant(block_position: Vector3i) -> void:
     drop_item()
 
     if entity == Ref.player and Ref.coop_manager != null:
+        Ref.coop_manager.notify_local_world_state_dirty([block_position])
         Ref.coop_manager.broadcast_host_block_break(block_position, block.id if block != null else 0)
 
 

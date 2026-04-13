@@ -515,17 +515,43 @@ func select_generator() -> void :
     generator.seed = current_seed
 
 
+func _get_private_instance_owner_key() -> String:
+    if current_dimension != Dimension.POCKET and current_dimension != Dimension.FIRMAMENT:
+        return ""
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file_register == null:
+        return ""
+    return str(Ref.save_file_manager.loaded_file_register.get_data("pocket_owner_key", "")).strip_edges()
+
+
+func _get_dimension_save_namespace() -> String:
+    var dimension_namespace: String = SaveFile.DIMENSION_MAP[current_dimension]
+    var owner_key: String = _get_private_instance_owner_key()
+    if owner_key != "":
+        dimension_namespace = "%s__%s" % [dimension_namespace, owner_key]
+    return dimension_namespace
+
+
 func save_file(file: SaveFile) -> void :
-    save_data(file.data, SaveFile.DIMENSION_MAP[current_dimension] + "_")
-    file.set_data("respawn_positions", respawn_positions)
+    var dimension_namespace: String = _get_dimension_save_namespace()
+    save_data(file.data, dimension_namespace + "_")
+    var owner_key: String = _get_private_instance_owner_key()
+    if owner_key != "":
+        file.set_data("%s/respawn_positions" % dimension_namespace, respawn_positions, false)
+    else:
+        file.set_data("respawn_positions", respawn_positions)
 
 
 func load_file(file: SaveFile) -> void :
     select_generator()
-    load_data(file.data, SaveFile.DIMENSION_MAP[current_dimension] + "_")
+    var dimension_namespace: String = _get_dimension_save_namespace()
+    load_data(file.data, dimension_namespace + "_")
 
     var default_positions: Dictionary[Vector3i, bool] = {}
-    respawn_positions = file.get_data("respawn_positions", default_positions)
+    var owner_key: String = _get_private_instance_owner_key()
+    if owner_key != "":
+        respawn_positions = file.get_data("%s/respawn_positions" % dimension_namespace, file.get_data("respawn_positions", default_positions), false)
+    else:
+        respawn_positions = file.get_data("respawn_positions", default_positions)
 
 
 func load_file_register(file_register: SaveFileRegister) -> void :
