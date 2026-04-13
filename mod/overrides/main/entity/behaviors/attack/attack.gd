@@ -62,7 +62,8 @@ func attack(target, damage_position: Vector3, knockback_strength: float = 22.0, 
         and target is Entity \
         and not (target is Player) \
         and not Ref.coop_manager.is_remote_player_proxy(target)
-    if should_sync_local_entity_attack:
+    var target_is_guest_local_authority: bool = bool(target.get_meta("coop_guest_local_authority", false)) if is_instance_valid(target) else false
+    if should_sync_local_entity_attack and not target_is_guest_local_authority:
         return Ref.coop_manager.sync_local_attack_on_entity(entity, target, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect)
 
     var attacker_velocity: Vector3 = entity.velocity

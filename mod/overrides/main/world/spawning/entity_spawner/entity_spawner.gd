@@ -287,6 +287,8 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
     if not multiplayer.is_server():
         entity.set_meta("coop_guest_local_authority", true)
     get_tree().get_root().add_child(entity)
+    if Ref.coop_manager != null and Ref.coop_manager.has_method("ensure_runtime_entity_uuid"):
+        Ref.coop_manager.call("ensure_runtime_entity_uuid", entity)
 
     entities.append(entity)
 

@@ -2,6 +2,7 @@ extends Node
 
 
 const AvatarRegistry = preload("res://coop_mod/avatar_registry.gd")
+const RemotePlayerMarkerScript = preload("res://coop_mod/remote_player_marker.gd")
 const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_CLIENTS: int = 4
@@ -34,6 +35,7 @@ const DROP_SYNC_RADIUS: float = 96.0
 const GUEST_LOCAL_ENTITY_AUTHORITY_DISTANCE: float = 192.0
 const GUEST_LOCAL_ENTITY_RELEASE_DISTANCE: float = 160.0
 const GUEST_ENTITY_STATE_INTERVAL: float = 0.35
+const SESSION_TARGET_STICK_DISTANCE: float = 8.0
 const ENTITY_ATTACK_REQUEST_MAX_DISTANCE: float = 6.0
 const BREAK_OUTLINE_SCENE_PATH: String = "res://main/entity/behaviors/break_blocks/break_block_outline.tscn"
 const DROPPED_ITEM_SCENE_PATH: String = "res://main/items/dropped_item/dropped_item.tscn"
@@ -168,6 +170,7 @@ var double_downed_recovery_pending: bool = false
 var revive_hold_progress: float = 0.0
 var revive_target_peer_id: int = -1
 var revive_request_pending: bool = false
+var downed_respawn_key_down: bool = false
 var host_water_snapshot_cache: Dictionary = {}
 var host_fire_snapshot_cache: Dictionary = {}
 var applying_remote_storage_positions: Dictionary = {}
@@ -839,6 +842,7 @@ func _clear_local_downed_state() -> void:
     local_downed_position_valid = false
     local_downed_started_msec = 0
     double_downed_recovery_pending = false
+    downed_respawn_key_down = false
     _set_local_player_combat_targetable(true)
 
 
@@ -984,6 +988,36 @@ func _enter_local_downed_state() -> void:
     _try_begin_double_downed_recovery()
 
 
+func _can_offer_manual_partner_respawn() -> bool:
+    return local_downed \
+        and _has_live_peer() \
+        and _can_sample_player() \
+        and _has_same_instance_reviver_available(multiplayer.get_unique_id()) \
+        and _has_remote_respawn_anchor(false)
+
+
+func _refresh_local_downed_overlay() -> void:
+    if death_overlay == null or not death_overlay.visible or not local_downed:
+        return
+
+    var subtitle: String = "Hold on. Your partner can revive you."
+    if _can_offer_manual_partner_respawn():
+        subtitle += " Press R to respawn near them."
+    _set_death_overlay_visible(true, subtitle, "DOWNED")
+
+
+func _respawn_local_downed_near_partner() -> void:
+    if not _can_offer_manual_partner_respawn() or not _can_sample_player():
+        return
+
+    var fallback_position: Vector3 = _resolve_default_respawn_fallback_position(local_downed_position if local_downed_position_valid else Ref.player.global_position)
+    var remote_anchor: Vector3 = _get_remote_respawn_anchor(false, fallback_position)
+    var respawn_position: Vector3 = _find_safe_respawn_position_near(remote_anchor, fallback_position)
+    _finish_local_revive(respawn_position, "Respawn")
+    status_message = "Respawned near partner"
+    _update_status_text()
+
+
 func _finish_local_revive(revive_position: Vector3, source_label: String = "Partner") -> void:
     if not _can_sample_player():
         return
@@ -1077,6 +1111,15 @@ func _tick_local_downed_state(_delta: float) -> void:
     Ref.player.dead = false
     Ref.player.disabled = true
     _set_local_player_combat_targetable(false)
+    _refresh_local_downed_overlay()
+
+    var respawn_key_pressed: bool = Input.is_physical_key_pressed(KEY_R)
+    if _can_offer_manual_partner_respawn() and respawn_key_pressed and not downed_respawn_key_down:
+        downed_respawn_key_down = true
+        _respawn_local_downed_near_partner()
+        return
+    if not respawn_key_pressed:
+        downed_respawn_key_down = false
 
     var grace_active: bool = local_downed_started_msec > 0 and (Time.get_ticks_msec() - local_downed_started_msec) < int(DOWNED_REVIVER_GRACE_SEC * 1000.0)
     if _has_live_peer() and not grace_active and not _has_same_instance_reviver_available(multiplayer.get_unique_id()):
@@ -1606,10 +1649,29 @@ func execute_command(raw_text: String) -> void:
             else:
                 config["avatar_id"] = _normalize_avatar_id(parts[1])
                 _save_config()
+                _refresh_local_hand_color()
+                _refresh_local_avatar_sounds()
                 status_message = "Avatar set to %s" % config["avatar_id"]
             _update_status_text()
         "/char-select", "/charselect", "/characters":
-            toggle_char_select(true)
+            if parts.size() >= 2:
+                var target_id: String = _normalize_avatar_id(parts[1])
+                config["avatar_id"] = target_id
+                _save_config()
+                _refresh_local_hand_color()
+                _refresh_local_avatar_sounds()
+                status_message = "Switched to %s" % target_id
+                _update_status_text()
+            else:
+                toggle_char_select(true)
+        "/fly":
+            if is_instance_valid(Ref.player):
+                Ref.player.fly_enabled = not Ref.player.fly_enabled
+                Ref.player.flying = Ref.player.fly_enabled
+                status_message = "Fly mode: %s (double-tap space to toggle mid-air)" % ("ON" if Ref.player.fly_enabled else "OFF")
+            else:
+                status_message = "No player"
+            _update_status_text()
         _:
             status_message = "Unknown command: %s" % text
             _update_status_text()
@@ -2308,6 +2370,7 @@ func _spawn_debug_entity_from_id(spawn_id: String, spawn_origin: Vector3, look_d
     if not multiplayer.is_server():
         entity.set_meta("coop_guest_local_authority", true)
     get_tree().get_root().add_child(entity)
+    ensure_runtime_entity_uuid(entity)
     if entity.has_method("allow_swarm"):
         entity.allow_swarm()
     if multiplayer.is_server():
@@ -2496,7 +2559,7 @@ func sync_host_attack_on_remote_player(attacker: Entity, target, damage_position
     receive_remote_player_attack.rpc_id(
         peer_id,
         _get_sync_uuid(attacker) if is_instance_valid(attacker) else "",
-        attacker.global_position if is_instance_valid(attacker) else Vector3.ZERO,
+        _get_safe_node3d_global_position(attacker, Vector3.ZERO),
         get_attack_impulse_velocity(attacker) if is_instance_valid(attacker) else Vector3.ZERO,
         damage_position,
         maxi(1, damage),
@@ -2535,7 +2598,7 @@ func sync_host_direct_hit_on_remote_player(attacker: Entity, target, damage_posi
     receive_remote_player_direct_hit.rpc_id(
         peer_id,
         _get_sync_uuid(attacker) if is_instance_valid(attacker) else "",
-        attacker.global_position if is_instance_valid(attacker) else Vector3.ZERO,
+        _get_safe_node3d_global_position(attacker, Vector3.ZERO),
         knockback_delta,
         damage_position,
         damage,
@@ -2569,11 +2632,14 @@ func sync_local_attack_on_entity(attacker: Entity, target, damage_position: Vect
 
     var target_uuid: String = _get_sync_uuid(target)
     if target_uuid == "":
+        target_uuid = ensure_runtime_entity_uuid(target)
+    if target_uuid == "":
         print("[lucid-blocks-coop][attack-debug] guest target missing uuid name=", target.name if target is Node else str(target), " class=", target.get_class())
         return false
 
     var actual_damage: int = maxi(1, damage)
-    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target, attacker.global_position, get_attack_impulse_velocity(attacker), knockback_strength, fly_strength)
+    var predicted_attacker_velocity: Vector3 = Vector3.ZERO
+    var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target, attacker.global_position, predicted_attacker_velocity, knockback_strength, fly_strength)
     _predict_client_entity_knockback(target_uuid, target, knockback_velocity)
     _play_client_entity_hit_feedback(target, attacker, damage_position, actual_damage)
 
@@ -3218,6 +3284,25 @@ func _capture_local_state_for_send() -> Dictionary:
     return state
 
 
+func get_local_avatar_id() -> String:
+    return _normalize_avatar_id(str(config.get("avatar_id", DEFAULT_AVATAR_ID)))
+
+
+func _refresh_local_hand_color() -> void:
+    if not is_instance_valid(Ref.player):
+        return
+    var hand_node: Node = Ref.player.get_node_or_null("%PlayerHand")
+    if hand_node != null and hand_node.has_method("set_hand_color"):
+        hand_node.call("set_hand_color")
+
+
+func _refresh_local_avatar_sounds() -> void:
+    if not is_instance_valid(Ref.player):
+        return
+    if Ref.player.has_method("_apply_avatar_sound_overrides"):
+        Ref.player.call("_apply_avatar_sound_overrides")
+
+
 func _normalize_avatar_id(raw_avatar_id: String) -> String:
     var normalized: String = raw_avatar_id.strip_edges().to_lower()
     return normalized if normalized != "" else DEFAULT_AVATAR_ID
@@ -3777,12 +3862,39 @@ func _is_preferred_session_player_targetable(preferred_target, active_instance_k
     return _is_remote_session_player_targetable(get_remote_player_proxy_peer_id(preferred_target), active_instance_key)
 
 
+func _get_safe_node3d_global_position(node, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
+    if node == null or not is_instance_valid(node) or not (node is Node3D) or not node.is_inside_tree():
+        return fallback_position
+    return (node as Node3D).global_position
+
+
+func _get_session_player_head_position(target, fallback_position: Vector3) -> Vector3:
+    if target == null or not is_instance_valid(target):
+        return fallback_position
+    var base_position: Vector3 = _get_safe_node3d_global_position(target, fallback_position)
+    if target == Ref.player:
+        return _get_safe_node3d_global_position(Ref.player.head, base_position + Vector3(0.0, 1.45, 0.0))
+    var head_node = target.get("head") if _object_has_property(target, "head") else null
+    return _get_safe_node3d_global_position(head_node, base_position + Vector3(0.0, 1.45, 0.0))
+
+
+func _should_keep_preferred_session_player(world_position: Vector3, preferred_target, active_instance_key: String) -> bool:
+    if not _is_preferred_session_player_targetable(preferred_target, active_instance_key):
+        return false
+
+    var preferred_position: Vector3 = _get_safe_node3d_global_position(preferred_target, world_position)
+    var nearest_position: Vector3 = get_nearest_session_player_position(world_position, preferred_position)
+    var preferred_distance: float = world_position.distance_to(preferred_position)
+    var nearest_distance: float = world_position.distance_to(nearest_position)
+    return preferred_distance <= nearest_distance + SESSION_TARGET_STICK_DISTANCE
+
+
 func get_preferred_session_player_position(world_position: Vector3, preferred_target = null, fallback_position: Vector3 = Vector3.ZERO) -> Vector3:
     if not _has_live_peer() and not _is_local_world_authority():
         return fallback_position
     var active_instance_key: String = get_active_dimension_instance_key()
-    if _is_preferred_session_player_targetable(preferred_target, active_instance_key):
-        return preferred_target.global_position
+    if _should_keep_preferred_session_player(world_position, preferred_target, active_instance_key):
+        return _get_safe_node3d_global_position(preferred_target, fallback_position)
     return get_nearest_session_player_position(world_position, fallback_position)
 
 
@@ -3790,10 +3902,8 @@ func get_preferred_session_player_head_position(world_position: Vector3, preferr
     if not _has_live_peer() and not _is_local_world_authority():
         return fallback_position
     var active_instance_key: String = get_active_dimension_instance_key()
-    if _is_preferred_session_player_targetable(preferred_target, active_instance_key):
-        if is_instance_valid(preferred_target.head):
-            return preferred_target.head.global_position
-        return preferred_target.global_position + Vector3(0, 1.45, 0)
+    if _should_keep_preferred_session_player(world_position, preferred_target, active_instance_key):
+        return _get_session_player_head_position(preferred_target, fallback_position)
     return get_nearest_session_player_head_position(world_position, fallback_position)
 
 
@@ -3801,7 +3911,7 @@ func get_preferred_session_player_entity(world_position: Vector3, preferred_targ
     if not _has_live_peer() and not _is_local_world_authority():
         return fallback
     var active_instance_key: String = get_active_dimension_instance_key()
-    if _is_preferred_session_player_targetable(preferred_target, active_instance_key):
+    if _should_keep_preferred_session_player(world_position, preferred_target, active_instance_key):
         return preferred_target
     return get_nearest_session_player_entity(world_position, fallback)
 
@@ -3811,7 +3921,7 @@ func get_nearest_session_player_head_position(world_position: Vector3, fallback_
     var nearest_distance_squared: float = INF
 
     if _is_local_session_player_targetable():
-        var local_head: Vector3 = Ref.player.head.global_position if is_instance_valid(Ref.player.head) else Ref.player.global_position + Vector3(0, 1.45, 0)
+        var local_head: Vector3 = _get_session_player_head_position(Ref.player, Ref.player.global_position + Vector3(0, 1.45, 0))
         nearest_head_position = local_head
         nearest_distance_squared = world_position.distance_squared_to(Ref.player.global_position)
 
@@ -3832,7 +3942,7 @@ func get_nearest_session_player_head_position(world_position: Vector3, fallback_
         if distance_squared >= nearest_distance_squared:
             continue
         nearest_distance_squared = distance_squared
-        nearest_head_position = proxy.head.global_position if is_instance_valid(proxy.head) else peer_position + Vector3(0, 1.45, 0)
+        nearest_head_position = _get_session_player_head_position(proxy, peer_position + Vector3(0, 1.45, 0))
 
     return nearest_head_position
 
@@ -6004,6 +6114,18 @@ func get_attack_impulse_velocity(attacker, reported_move_speed: float = -1.0) ->
         horizontal_velocity = attacker.get("movement_velocity")
         horizontal_velocity.y = 0.0
 
+    if is_remote_player_proxy(attacker):
+        var remote_speed_cap: float = maxf(reported_move_speed, 0.0)
+        if remote_speed_cap > 0.0 and horizontal_velocity.length() > remote_speed_cap:
+            horizontal_velocity = horizontal_velocity.normalized() * remote_speed_cap
+        elif remote_speed_cap <= 0.0:
+            horizontal_velocity = Vector3.ZERO
+
+        attack_velocity.x = horizontal_velocity.x * 0.35
+        attack_velocity.z = horizontal_velocity.z * 0.35
+        attack_velocity.y = 0.0
+        return attack_velocity
+
     if reported_move_speed >= 0.0 and horizontal_velocity.length() > reported_move_speed + 1.25:
         if not horizontal_velocity.is_zero_approx():
             horizontal_velocity = horizontal_velocity.normalized() * (reported_move_speed + 1.25)
@@ -6625,7 +6747,7 @@ func _build_char_select_ui() -> void:
     var fade := ColorRect.new()
     fade.anchor_right = 1.0
     fade.anchor_bottom = 1.0
-    fade.color = Color(0.0, 0.0, 0.0, 0.65)
+    fade.color = Color(0.0, 0.0, 0.0, 0.7)
     char_select_overlay.add_child(fade)
 
     var center := CenterContainer.new()
@@ -6634,115 +6756,82 @@ func _build_char_select_ui() -> void:
     char_select_overlay.add_child(center)
 
     char_select_panel = PanelContainer.new()
-    char_select_panel.custom_minimum_size = Vector2(520.0, 420.0)
+    char_select_panel.custom_minimum_size = Vector2(420.0, 320.0)
+    var panel_style := StyleBoxFlat.new()
+    panel_style.bg_color = Color(0.12, 0.12, 0.15, 0.95)
+    panel_style.corner_radius_top_left = 8
+    panel_style.corner_radius_top_right = 8
+    panel_style.corner_radius_bottom_left = 8
+    panel_style.corner_radius_bottom_right = 8
+    panel_style.border_width_left = 1
+    panel_style.border_width_right = 1
+    panel_style.border_width_top = 1
+    panel_style.border_width_bottom = 1
+    panel_style.border_color = Color(0.3, 0.3, 0.35)
+    char_select_panel.add_theme_stylebox_override("panel", panel_style)
     center.add_child(char_select_panel)
 
     var margin := MarginContainer.new()
-    margin.add_theme_constant_override("margin_left", 14)
-    margin.add_theme_constant_override("margin_right", 14)
-    margin.add_theme_constant_override("margin_top", 14)
-    margin.add_theme_constant_override("margin_bottom", 14)
+    margin.add_theme_constant_override("margin_left", 16)
+    margin.add_theme_constant_override("margin_right", 16)
+    margin.add_theme_constant_override("margin_top", 12)
+    margin.add_theme_constant_override("margin_bottom", 12)
     char_select_panel.add_child(margin)
 
     var main_col := VBoxContainer.new()
-    main_col.add_theme_constant_override("separation", 10)
+    main_col.add_theme_constant_override("separation", 8)
     margin.add_child(main_col)
 
-    # Title row
-    var title_row := HBoxContainer.new()
-    main_col.add_child(title_row)
-
+    # Title
     var title := Label.new()
-    title.text = "Character Select"
-    title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-    title.add_theme_font_size_override("font_size", 18)
-    title_row.add_child(title)
+    title.text = "SELECT CHARACTER"
+    title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    title.add_theme_font_size_override("font_size", 14)
+    title.add_theme_color_override("font_color", Color(0.8, 0.8, 0.85))
+    main_col.add_child(title)
 
-    var close_btn := Button.new()
-    close_btn.text = "X"
-    close_btn.custom_minimum_size = Vector2(30, 0)
-    close_btn.pressed.connect(toggle_char_select.bind(false))
-    title_row.add_child(close_btn)
+    # Hint
+    var hint := Label.new()
+    hint.text = "Click to select, double-click or press Enter to confirm"
+    hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    hint.add_theme_font_size_override("font_size", 10)
+    hint.add_theme_color_override("font_color", Color(0.5, 0.5, 0.55))
+    main_col.add_child(hint)
 
-    # Content: preview on left, list on right
-    var content_row := HBoxContainer.new()
-    content_row.size_flags_vertical = Control.SIZE_EXPAND_FILL
-    content_row.add_theme_constant_override("separation", 12)
-    main_col.add_child(content_row)
-
-    # 3D preview using SubViewport
-    var preview_panel := PanelContainer.new()
-    preview_panel.custom_minimum_size = Vector2(260, 360)
-    content_row.add_child(preview_panel)
-
-    char_select_preview_container = SubViewportContainer.new()
-    char_select_preview_container.stretch = true
-    char_select_preview_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-    char_select_preview_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
-    preview_panel.add_child(char_select_preview_container)
-
-    char_select_preview_viewport = SubViewport.new()
-    char_select_preview_viewport.size = Vector2i(260, 360)
-    char_select_preview_viewport.transparent_bg = true
-    char_select_preview_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
-    char_select_preview_container.add_child(char_select_preview_viewport)
-
-    # Add camera and light to the preview viewport
-    var cam := Camera3D.new()
-    cam.name = "CharPreviewCam"
-    cam.position = Vector3(0, 1.0, 2.8)
-    cam.rotation_degrees = Vector3(-8, 0, 0)
-    cam.current = true
-    char_select_preview_viewport.add_child(cam)
-
-    var light := DirectionalLight3D.new()
-    light.rotation_degrees = Vector3(-40, 25, 0)
-    char_select_preview_viewport.add_child(light)
-
-    var env_node := WorldEnvironment.new()
-    var env := Environment.new()
-    env.background_mode = Environment.BG_COLOR
-    env.background_color = Color(0.15, 0.15, 0.2)
-    env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-    env.ambient_light_color = Color(0.5, 0.55, 0.6)
-    env.ambient_light_energy = 0.8
-    env_node.environment = env
-    char_select_preview_viewport.add_child(env_node)
-
-    # Character list on the right
-    var right_col := VBoxContainer.new()
-    right_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-    right_col.add_theme_constant_override("separation", 8)
-    content_row.add_child(right_col)
-
-    var list_label := Label.new()
-    list_label.text = "Available Characters:"
-    list_label.add_theme_font_size_override("font_size", 13)
-    right_col.add_child(list_label)
-
+    # Character list - simple and clean
     char_select_list = ItemList.new()
     char_select_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+    char_select_list.custom_minimum_size = Vector2(0, 180)
     char_select_list.allow_reselect = true
+    char_select_list.add_theme_font_size_override("font_size", 13)
     char_select_list.item_selected.connect(_on_char_select_item_selected)
     char_select_list.item_activated.connect(_on_char_select_item_activated)
-    right_col.add_child(char_select_list)
+    main_col.add_child(char_select_list)
 
-    # Select button
+    # Buttons
     var btn_row := HBoxContainer.new()
     btn_row.add_theme_constant_override("separation", 8)
     main_col.add_child(btn_row)
 
     var select_btn := Button.new()
-    select_btn.text = "Select Character"
+    select_btn.text = "Select"
     select_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
     select_btn.pressed.connect(_on_char_select_confirm)
     btn_row.add_child(select_btn)
 
     var cancel_btn := Button.new()
-    cancel_btn.text = "Close"
+    cancel_btn.text = "Cancel"
     cancel_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
     cancel_btn.pressed.connect(toggle_char_select.bind(false))
     btn_row.add_child(cancel_btn)
+
+    # Tip at bottom
+    var tip := Label.new()
+    tip.text = "Tip: /char-select pim  to switch instantly"
+    tip.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    tip.add_theme_font_size_override("font_size", 9)
+    tip.add_theme_color_override("font_color", Color(0.4, 0.4, 0.45))
+    main_col.add_child(tip)
 
     _refresh_char_select_entries()
 
@@ -6757,14 +6846,14 @@ func _refresh_char_select_entries() -> void:
     char_select_entries = AvatarRegistry.list_avatar_entries()
 
     for entry in char_select_entries:
-        char_select_list.add_item(entry["name"])
+        var display_name: String = str(entry.get("name", entry.get("id", "?")))
+        char_select_list.add_item(display_name)
 
     # Highlight current selection
     var current_id = _normalize_avatar_id(str(config.get("avatar_id", DEFAULT_AVATAR_ID)))
     for i in range(char_select_entries.size()):
         if char_select_entries[i]["id"] == current_id:
             char_select_list.select(i)
-            _update_char_preview(i)
             break
 
 
@@ -6781,7 +6870,6 @@ func toggle_char_select(show: bool = true) -> void:
         char_select_overlay.visible = false
         if char_select_restore_capture_on_close:
             Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
-        _clear_char_preview()
 
 
 func _update_char_preview(index: int) -> void:
@@ -6790,28 +6878,60 @@ func _update_char_preview(index: int) -> void:
     _clear_char_preview()
 
     var entry = char_select_entries[index]
-    var scene = load(entry["path"])
-    if scene is PackedScene:
-        char_select_preview_instance = scene.instantiate() as Node3D
-        if char_select_preview_instance:
-            # Auto-scale to fit preview
-            var aabb: AABB = _get_preview_bounds(char_select_preview_instance)
-            var height: float = aabb.size.y if aabb.size.y > 0.001 else 1.0
-            var preview_height: float = float(entry.get("preview_height", 1.8))
-            var scale_factor: float = preview_height / height
-            char_select_preview_instance.scale = Vector3.ONE * scale_factor
-            char_select_preview_instance.position = Vector3(0, -aabb.position.y * scale_factor, 0)
-            char_select_preview_instance.rotation_degrees = Vector3(0, float(entry.get("preview_yaw", 160.0)), 0)
-            char_select_preview_viewport.add_child(char_select_preview_instance)
+    if char_select_preview_container != null:
+        var preview_size: Vector2 = char_select_preview_container.size
+        if preview_size.x >= 32.0 and preview_size.y >= 32.0:
+            char_select_preview_viewport.size = Vector2i(preview_size)
 
-            var cam: Camera3D = char_select_preview_viewport.get_node_or_null("CharPreviewCam") as Camera3D
-            if cam != null:
-                var scaled_center: Vector3 = (aabb.position + aabb.size * 0.5) * scale_factor
-                var scaled_size: Vector3 = aabb.size * scale_factor
-                var max_span: float = maxf(maxf(scaled_size.x, scaled_size.y), scaled_size.z)
-                var distance: float = maxf(2.1, max_span * 2.35)
-                cam.position = Vector3(0.0, scaled_center.y + scaled_size.y * 0.08, distance)
-                cam.look_at(Vector3(0.0, scaled_center.y + scaled_size.y * 0.02, 0.0), Vector3.UP)
+    char_select_preview_instance = RemotePlayerMarkerScript.new()
+    if char_select_preview_instance != null:
+        char_select_preview_viewport.add_child(char_select_preview_instance)
+        if char_select_preview_instance.has_method("setup"):
+            char_select_preview_instance.call("setup", -999)
+        if char_select_preview_instance.has_method("set_label_enabled"):
+            char_select_preview_instance.call("set_label_enabled", false)
+        if char_select_preview_instance.has_method("set_display_name"):
+            char_select_preview_instance.call("set_display_name", str(entry.get("name", "")))
+        if char_select_preview_instance.has_method("set_skin_color"):
+            char_select_preview_instance.call("set_skin_color", _get_local_skin_color())
+        if char_select_preview_instance.has_method("set_avatar_id"):
+            char_select_preview_instance.call("set_avatar_id", str(entry.get("id", DEFAULT_AVATAR_ID)))
+        if char_select_preview_instance.has_method("apply_state"):
+            char_select_preview_instance.call(
+                "apply_state",
+                true,
+                Vector3.ZERO,
+                deg_to_rad(float(entry.get("preview_yaw", 160.0))),
+                0.0,
+                false,
+                true,
+                0.0,
+                0
+            )
+        call_deferred("_refresh_char_preview_camera", entry.duplicate(true))
+
+
+func _refresh_char_preview_camera(entry: Dictionary) -> void:
+    if char_select_preview_instance == null or not is_instance_valid(char_select_preview_instance):
+        return
+
+    var aabb: AABB = _get_preview_bounds(char_select_preview_instance)
+    var height: float = aabb.size.y if aabb.size.y > 0.001 else 1.0
+    var preview_height: float = float(entry.get("preview_height", 1.8))
+    var scale_factor: float = preview_height / height
+    char_select_preview_instance.scale = Vector3.ONE * scale_factor
+    char_select_preview_instance.position = Vector3(0.0, -aabb.position.y * scale_factor, 0.0)
+
+    var cam: Camera3D = char_select_preview_viewport.get_node_or_null("CharPreviewCam") as Camera3D
+    if cam == null:
+        return
+
+    var scaled_center: Vector3 = (aabb.position + aabb.size * 0.5) * scale_factor
+    var scaled_size: Vector3 = aabb.size * scale_factor
+    var max_span: float = maxf(maxf(scaled_size.x, scaled_size.y), scaled_size.z)
+    var distance: float = maxf(2.35, max_span * 2.6)
+    cam.position = Vector3(0.0, scaled_center.y + scaled_size.y * 0.12, distance)
+    cam.look_at(Vector3(0.0, scaled_center.y + scaled_size.y * 0.05, 0.0), Vector3.UP)
 
 
 func _get_preview_bounds(root: Node3D) -> AABB:
@@ -6865,11 +6985,11 @@ func _clear_char_preview() -> void:
         char_select_preview_instance = null
 
 
-func _on_char_select_item_selected(index: int) -> void:
-    _update_char_preview(index)
+func _on_char_select_item_selected(_index: int) -> void:
+    pass
 
 
-func _on_char_select_item_activated(index: int) -> void:
+func _on_char_select_item_activated(_index: int) -> void:
     _on_char_select_confirm()
 
 
@@ -6884,6 +7004,8 @@ func _on_char_select_confirm() -> void:
     var entry = char_select_entries[index]
     config["avatar_id"] = entry["id"]
     _save_config()
+    _refresh_local_hand_color()
+    _refresh_local_avatar_sounds()
     toggle_char_select(false)
 
     status_message = "Character set to %s" % entry["name"]
@@ -8281,6 +8403,12 @@ func _assign_sync_uuid(node: Node) -> String:
     if Ref.preserve_node_manager != null:
         Ref.preserve_node_manager.node_to_uuid_map[node] = new_uuid
     return new_uuid
+
+
+func ensure_runtime_entity_uuid(entity) -> String:
+    if entity == null or not is_instance_valid(entity) or not _is_syncable_entity_node(entity):
+        return ""
+    return _assign_sync_uuid(entity)
 
 
 func _remove_unlisted_client_entities(visible_uuids: Dictionary) -> void:

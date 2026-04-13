@@ -145,6 +145,9 @@ func _physics_process(delta: float) -> void:
 		else:
 			move_and_collide(displacement)
 
+	var horizontal_speed: float = Vector3(movement_velocity.x, 0.0, movement_velocity.z).length()
+	is_sprinting = horizontal_speed > maxf(minimum_sprint_speed, speed * 1.1)
+
 	if is_instance_valid(rotation_pivot):
 		rotation_pivot.rotation.y = _target_yaw
 
@@ -167,3 +170,8 @@ func begin_direct_damage_cooldown(duration: float = 0.33) -> void:
 
 func _on_direct_damage_timeout() -> void:
 	direct_damage_cooldown = false
+
+
+func update_walk_animation() -> void:
+	# Remote proxies do not have the local first-person AnimationPlayer tree.
+	return

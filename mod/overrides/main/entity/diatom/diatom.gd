@@ -133,4 +133,6 @@ func initialize_state() -> void :
 
 
 func get_look_direction() -> Vector3:
-    return - %Core.get_global_transform().basis.z
+    if not is_inside_tree() or not %Core.is_inside_tree():
+        return Vector3.FORWARD
+    return -%Core.get_global_transform().basis.z

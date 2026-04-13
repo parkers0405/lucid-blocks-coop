@@ -125,10 +125,28 @@ func _is_session_player_entity(entity) -> bool:
 
 
 func _get_chase_target():
-    var fallback = chase_target_override if is_instance_valid(chase_target_override) else (Ref.player if is_instance_valid(Ref.player) else null)
+    var fallback = chase_target_override if is_instance_valid(chase_target_override) else null
     if not _use_session_targeting():
-        return fallback
-    return Ref.coop_manager.get_preferred_session_player_entity(global_position, chase_target_override, fallback)
+        return fallback if is_instance_valid(fallback) else (Ref.player if is_instance_valid(Ref.player) else null)
+
+    if _is_session_player_entity(chase_target_override) and is_instance_valid(chase_target_override) and not chase_target_override.dead and not chase_target_override.disabled:
+        return chase_target_override
+
+    var nearest_session_target = null
+    var nearest_distance_squared: float = INF
+    for entity in near_entities:
+        if not _is_session_player_entity(entity) or entity.dead or entity.disabled:
+            continue
+        var distance_squared: float = entity.global_position.distance_squared_to(global_position)
+        if distance_squared >= nearest_distance_squared:
+            continue
+        nearest_distance_squared = distance_squared
+        nearest_session_target = entity
+
+    if is_instance_valid(nearest_session_target):
+        return nearest_session_target
+
+    return Ref.coop_manager.get_nearest_session_player_entity(global_position, Ref.player if is_instance_valid(Ref.player) else fallback)
 
 
 func _on_body_entered_attack(body: Node3D) -> void:

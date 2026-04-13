@@ -191,35 +191,32 @@ func _get_forced_session_target():
 
 
 func _get_target_position() -> Vector3:
-    var preferred_target = _get_forced_session_target()
-    if not is_instance_valid(preferred_target):
-        preferred_target = player
+    var preferred_target = _get_session_target_player()
     var fallback: Vector3 = preferred_target.global_position if is_instance_valid(preferred_target) else global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_preferred_session_player_position(global_position, preferred_target, fallback)
+    return Ref.coop_manager.get_nearest_session_player_position(global_position, fallback)
 
 
 func _get_target_head_position() -> Vector3:
     var fallback: Vector3 = global_position + Vector3(0, 1.45, 0)
-    var preferred_target = _get_forced_session_target()
-    if not is_instance_valid(preferred_target):
-        preferred_target = player
+    var preferred_target = _get_session_target_player()
     if is_instance_valid(preferred_target) and is_instance_valid(preferred_target.head):
         fallback = preferred_target.head.global_position
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_preferred_session_player_head_position(global_position, preferred_target, fallback)
+    return Ref.coop_manager.get_nearest_session_player_head_position(global_position, fallback)
 
 
 func _get_session_target_player():
     var preferred_target = _get_forced_session_target()
-    if not is_instance_valid(preferred_target):
-        preferred_target = player
-    var fallback = preferred_target if is_instance_valid(preferred_target) else Ref.player
+    if is_instance_valid(preferred_target):
+        return preferred_target
+
+    var fallback = player if is_instance_valid(player) else Ref.player
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_preferred_session_player_entity(global_position, preferred_target, fallback)
+    return Ref.coop_manager.get_nearest_session_player_entity(global_position, fallback)
 
 
 func get_coop_locked_target_peer_id() -> int:
@@ -646,7 +643,11 @@ func preserve_load(file: SaveFile, uuid: String) -> void:
 
 
 func get_look_direction() -> Vector3:
-    return %RotationPivot.get_global_transform().basis.z if not _has_active_target() else hand.global_position.direction_to(_get_target_head_position() + Vector3(0, 0.1, 0))
+    if not is_inside_tree() or not %RotationPivot.is_inside_tree():
+        return Vector3.FORWARD
+    if not _has_active_target() or not is_instance_valid(hand) or not hand.is_inside_tree():
+        return %RotationPivot.get_global_transform().basis.z
+    return hand.global_position.direction_to(_get_target_head_position() + Vector3(0, 0.1, 0))
 
 
 func is_spacer() -> bool:
@@ -654,4 +655,6 @@ func is_spacer() -> bool:
 
 
 func is_facing_player() -> bool:
+    if not is_inside_tree() or not %RotationPivot.is_inside_tree():
+        return false
     return %RotationPivot.get_global_transform().basis.z.dot(global_position.direction_to(_get_target_position())) > 0.2

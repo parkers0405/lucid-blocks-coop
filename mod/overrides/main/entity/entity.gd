@@ -358,7 +358,7 @@ func get_session_target_entity(default_target = null):
         fallback = Ref.player
     if not _use_session_targeting():
         return fallback
-    return Ref.coop_manager.get_preferred_session_player_entity(global_position, fallback, fallback)
+    return Ref.coop_manager.get_nearest_session_player_entity(global_position, fallback)
 
 
 func get_session_target_position(default_position: Vector3) -> Vector3:
@@ -823,7 +823,9 @@ func is_interacting() -> bool:
 
 
 func get_look_direction() -> Vector3:
-    return - %RotationPivot.get_global_transform().basis.z
+    if not is_inside_tree() or not %RotationPivot.is_inside_tree():
+        return Vector3.FORWARD
+    return -%RotationPivot.get_global_transform().basis.z
 
 
 func looked_at_by_player() -> void :

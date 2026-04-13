@@ -19,6 +19,13 @@ class_name Player extends Entity
 @export var sprint_difference_threshold: float = 0.1
 @export var starter_kit: Array[Item]
 
+const DOUBLE_TAP_SPRINT_WINDOW_MSEC: int = 260
+const GROUND_SPRINT_SPEED_MULTIPLIER: float = 1.22
+const SPRINT_CAMERA_BOB_FREQUENCY: float = 13.0
+const SPRINT_CAMERA_BOB_X: float = 0.018
+const SPRINT_CAMERA_BOB_Y: float = 0.028
+const SPRINT_CAMERA_BOB_ROLL_DEG: float = 1.35
+
 
 var sprint_toggle: bool = false
 var crouch_toggle: bool = false
@@ -34,6 +41,7 @@ var controller_camera_sensitivity: float = 1.0
 
 var consumed_actions: Array[String] = []
 var flying: bool = false
+var fly_enabled: bool = false
 var is_sprinting_requested: bool = false
 var is_croucing_requested: bool = false
 var is_sprinting: bool = false
@@ -57,6 +65,7 @@ var can_interact_using_item: bool = false:
 
 var camera_height: float = 0.0
 var camera_fov: float = 0.0
+var camera_pitch: float = 0.0
 
 
 var teleport_location: Vector3
@@ -65,6 +74,11 @@ var teleport: bool = false
 
 var push_bodies: Dictionary[Entity, bool]
 var coop_interact_release_grace_timer: float = 0.0
+var last_forward_press_msec: int = 0
+var double_tap_sprint_requested: bool = false
+var sprint_camera_bob_phase: float = 0.0
+var sprint_camera_bob_weight: float = 0.0
+var first_person_pitch_debug_cooldown: float = 0.0
 
 signal structure_changed(new_structure: Structure)
 signal can_interact_with_block_changed(value: bool)
@@ -97,7 +111,129 @@ func _ready() -> void :
     damage_taken.connect(_on_damage_taken)
 
     Ref.main.new_game_loaded.connect(_on_new_game)
+    camera_pitch = %Camera3D.rotation.x
+    call_deferred("_apply_avatar_sound_overrides")
+    call_deferred("_apply_avatar_hand_color")
     print("Player ready.")
+
+
+func _get_coop_manager() -> Node:
+    var ref: Node = get_node_or_null("/root/Ref")
+    if ref != null and ref.get("coop_manager") != null:
+        return ref.get("coop_manager")
+    return null
+
+
+var _avatar_voice_player: AudioStreamPlayer
+var _avatar_voice_streams: Dictionary = {}
+var _avatar_voice_cooldown: float = 0.0
+const AVATAR_VOICE_CHANCES: Dictionary = {
+    "jump": 0.005,
+    "hurt": 0.015,
+    "attack": 0.008,
+    "death": 0.25,
+    "fall": 0.01,
+}
+const AVATAR_VOICE_COOLDOWNS: Dictionary = {
+    "jump": 20.0,
+    "hurt": 12.0,
+    "attack": 15.0,
+    "death": 10.0,
+    "fall": 15.0,
+}
+
+
+func _apply_avatar_sound_overrides() -> void:
+    var coop_manager: Node = _get_coop_manager()
+    if coop_manager == null or not coop_manager.has_method("get_local_avatar_id"):
+        return
+    var avatar_id: String = coop_manager.call("get_local_avatar_id")
+    var AvatarRegistryScript = load("res://coop_mod/avatar_registry.gd")
+    if AvatarRegistryScript == null:
+        return
+    var entry: Dictionary = AvatarRegistryScript.get_avatar_entry(avatar_id)
+    var sounds_config: Dictionary = entry.get("sounds", {})
+    if sounds_config.is_empty():
+        return
+
+    # Don't replace base sounds - add a separate voice player for occasional character lines
+    _avatar_voice_player = AudioStreamPlayer.new()
+    _avatar_voice_player.bus = "SFX"
+    _avatar_voice_player.volume_db = -6.0
+    add_child(_avatar_voice_player)
+
+    for action_name in sounds_config.keys():
+        var paths: Array = sounds_config[action_name]
+        var streams: Array = []
+        for path in paths:
+            var stream = load(str(path))
+            if stream is AudioStream:
+                streams.append(stream)
+        if not streams.is_empty():
+            _avatar_voice_streams[action_name] = streams
+
+    # Hook into damage signal for hurt/death voice lines
+    if not damage_taken.is_connected(_on_avatar_damage_voice):
+        damage_taken.connect(_on_avatar_damage_voice)
+    print("[avatar] Loaded %d voice categories for %s" % [_avatar_voice_streams.size(), avatar_id])
+
+
+func _play_avatar_voice(action: String) -> void:
+    if _avatar_voice_player == null or _avatar_voice_cooldown > 0.0:
+        return
+    if not _avatar_voice_streams.has(action):
+        return
+    var chance: float = AVATAR_VOICE_CHANCES.get(action, 0.15)
+    if randf() > chance:
+        return
+    var streams: Array = _avatar_voice_streams[action]
+    if streams.is_empty():
+        return
+    _avatar_voice_player.stream = streams[randi() % streams.size()]
+    _avatar_voice_player.play()
+    _avatar_voice_cooldown = AVATAR_VOICE_COOLDOWNS.get(action, 2.0)
+
+
+func _on_avatar_damage_voice(_damage: int) -> void:
+    if health <= 0:
+        _play_avatar_voice("death")
+    else:
+        _play_avatar_voice("hurt")
+
+
+func _apply_avatar_hand_color() -> void:
+    var hand_node: Node = get_node_or_null("%PlayerHand")
+    if hand_node != null and hand_node.has_method("set_hand_color"):
+        hand_node.call("set_hand_color")
+    else:
+        # Retry after a short delay - hand might not be ready yet
+        await get_tree().create_timer(0.5).timeout
+        hand_node = get_node_or_null("%PlayerHand")
+        if hand_node != null and hand_node.has_method("set_hand_color"):
+            hand_node.call("set_hand_color")
+
+
+func _set_camera_pitch(new_pitch: float) -> void:
+    camera_pitch = clampf(new_pitch, -deg_to_rad(90), deg_to_rad(90))
+    %Camera3D.rotation.x = camera_pitch
+
+
+func _debug_first_person_pitch_state() -> void:
+    if first_person_pitch_debug_cooldown > 0.0:
+        return
+    if absf(rad_to_deg(camera_pitch)) < 80.0:
+        return
+
+    first_person_pitch_debug_cooldown = 0.75
+    print(
+        "[lucid-blocks-coop][fp-debug] pitch_deg=%.2f hand_world=%s hand_screen=%s cam_rot=%s arm_rot=%s" % [
+            rad_to_deg(camera_pitch),
+            str(%Hand.global_position),
+            str(%PlayerHand.position),
+            str(%Camera3D.rotation),
+            str(%Arm.rotation)
+        ]
+    )
 
 
 func _on_settings_updated() -> void :
@@ -222,6 +358,10 @@ func _process(delta: float) -> void :
     if disabled:
         return
 
+    first_person_pitch_debug_cooldown = maxf(0.0, first_person_pitch_debug_cooldown - delta)
+    if _avatar_voice_cooldown > 0.0:
+        _avatar_voice_cooldown -= delta
+
 
     if Ref.main.debug and Input.is_action_just_pressed("debug_jump"):
         global_position.y += 256 if not is_crouching else -256
@@ -235,8 +375,7 @@ func _process(delta: float) -> void :
     if local_movement_enabled and is_processing_input() and joy_input != Vector2.ZERO:
         %RotationPivot.rotate_y( - joy_input.x * controller_camera_sensitivity * delta)
         var y_direction: float = -1.0 if not invert_mouse_y else 1.0
-        %Camera3D.rotate_x(y_direction * joy_input.y * controller_camera_sensitivity * delta)
-        %Camera3D.rotation.x = clampf( %Camera3D.rotation.x, - deg_to_rad(90), deg_to_rad(90))
+        _set_camera_pitch(camera_pitch + y_direction * joy_input.y * controller_camera_sensitivity * delta)
 
     check_water()
     camera_process(delta)
@@ -261,6 +400,7 @@ func _process(delta: float) -> void :
     update_pointer_visual.call_deferred()
     hand_process()
     %PlayerHand.position = ( %Camera3D.unproject_position( %Hand.global_position) - %PlayerHand.scale * %PlayerHand.offset)
+    _debug_first_person_pitch_state()
 
 
 func _physics_process(delta: float) -> void :
@@ -280,18 +420,28 @@ func _physics_process(delta: float) -> void :
         health -= 1
     var input: Vector2 = Input.get_vector("left", "right", "up", "down") if local_movement_enabled else Vector2()
     var movement_dir: Vector3 = %RotationPivot.global_transform.basis * Vector3(input.x, 0, input.y)
+    var moving_forward: bool = input.y < -0.5 and absf(input.x) <= 0.9
 
+    var hold_sprint_requested: bool = is_action_pressed_safe("sprint")
     if not sprint_toggle:
-        is_sprinting_requested = is_action_pressed_safe("sprint")
+        if not moving_forward or is_action_pressed_safe("down") or not local_movement_enabled:
+            double_tap_sprint_requested = false
+        is_sprinting_requested = hold_sprint_requested or double_tap_sprint_requested
     if not crouch_toggle:
         is_croucing_requested = is_action_pressed_safe("crouch")
-    if local_movement_enabled and might_double_jump and is_action_pressed_safe("jump") and Input.is_action_just_pressed("jump"):
+    if fly_enabled and local_movement_enabled and might_double_jump and is_action_pressed_safe("jump") and Input.is_action_just_pressed("jump"):
         might_double_jump = false
         %FlyTimer.stop()
         flying = not flying
-    flying = flying and (Ref.main.debug or invincible)
+    if not fly_enabled:
+        flying = false
 
-    is_sprinting = flying and not is_interacting() and local_movement_enabled and is_sprinting_requested
+    is_sprinting = not is_interacting() \
+        and local_movement_enabled \
+        and is_sprinting_requested \
+        and moving_forward \
+        and not is_croucing_requested \
+        and (flying or Vector3(movement_velocity.x, 0.0, movement_velocity.z).length() >= minimum_sprint_speed)
 
     is_crouching = is_croucing_requested and not is_sprinting and local_movement_enabled
 
@@ -314,6 +464,8 @@ func _physics_process(delta: float) -> void :
             target_speed *= sprint_speed_multiplier
         static_gravity_modifier = 0.0
     else:
+        if is_sprinting:
+            target_speed *= GROUND_SPRINT_SPEED_MULTIPLIER
         static_gravity_modifier = 1.0
 
     default_entity_movement(
@@ -362,11 +514,18 @@ func _input(event: InputEvent) -> void :
         %RotationPivot.rotate_y( - event.relative.x * mouse_sensitivity)
 
         var y_direction: float = -1.0 if not invert_mouse_y else 1.0
-        %Camera3D.rotate_x(y_direction * event.relative.y * mouse_sensitivity)
-        %Camera3D.rotation.x = clampf( %Camera3D.rotation.x, - deg_to_rad(90), deg_to_rad(90))
+        _set_camera_pitch(camera_pitch + y_direction * event.relative.y * mouse_sensitivity)
 
     if sprint_toggle and event.is_action_pressed("sprint", false):
         is_sprinting_requested = not is_sprinting_requested
+
+    if local_movement_enabled and event.is_action_pressed("up", false):
+        var is_repeat_press: bool = event is InputEventKey and (event as InputEventKey).echo
+        if not is_repeat_press:
+            var now_msec: int = Time.get_ticks_msec()
+            if now_msec - last_forward_press_msec <= DOUBLE_TAP_SPRINT_WINDOW_MSEC:
+                double_tap_sprint_requested = true
+            last_forward_press_msec = now_msec
 
     if crouch_toggle and event.is_action_pressed("crouch", false):
         is_croucing_requested = not is_croucing_requested
@@ -384,6 +543,8 @@ func initialize() -> void :
     is_sprinting_requested = false
     is_croucing_requested = false
     is_sprinting = false
+    double_tap_sprint_requested = false
+    last_forward_press_msec = 0
     is_crouching = false
     under_water = false
     head_under_water = false
@@ -393,11 +554,15 @@ func initialize() -> void :
     dead = false
     camera_height = 0.0
     camera_fov = 0.0
+    camera_pitch = 0.0
     static_speed_modifier = 1.0
     static_accel_modifier = 1.0
     static_gravity_modifier = 1.0
     glider_gravity_modifier = 1.0
     glider_speed_modifier = 1.0
+    sprint_camera_bob_phase = 0.0
+    sprint_camera_bob_weight = 0.0
+    first_person_pitch_debug_cooldown = 0.0
     first_frame = true
     current_biome = null
     push_bodies.clear()
@@ -425,14 +590,14 @@ func save_file(file: SaveFile) -> void :
     super.preserve_save(file, "player")
 
     file.set_data("node/player/global_position", global_position, false)
-    file.set_data("node/player/camera_angle", %Camera3D.rotation.x, false)
+    file.set_data("node/player/camera_angle", camera_pitch, false)
     file.set_data("node/player/flying", flying, true)
 
 
 func load_file(file: SaveFile) -> void :
     super.preserve_load(file, "player")
 
-    %Camera3D.rotation.x = file.get_data("node/player/camera_angle", %Camera3D.rotation.x, false)
+    _set_camera_pitch(file.get_data("node/player/camera_angle", camera_pitch, false))
     global_position = file.get_data("node/player/global_position", Vector3(0, 0, 0), false)
     flying = file.get_data("node/player/flying", false, true)
 
@@ -510,10 +675,25 @@ func camera_process(delta: float) -> void :
         camera_height -= delta / crouch_time
 
     camera_height = clamp(camera_height, 0.0, 1.0)
-    %CameraPivot.position = lerp( %HeadPointNormal.position, %HeadPointCrouch.position, ease(camera_height, -2.0))
+    var camera_pivot_position: Vector3 = lerp(%HeadPointNormal.position, %HeadPointCrouch.position, ease(camera_height, -2.0))
+    var horizontal_speed: float = Vector3(velocity.x, 0.0, velocity.z).length()
+    var sprint_bob_target: float = 1.0 if is_sprinting and is_on_floor() and horizontal_speed > minimum_sprint_speed else 0.0
+    sprint_camera_bob_weight = move_toward(sprint_camera_bob_weight, sprint_bob_target, delta * 6.0)
+    if sprint_camera_bob_weight > 0.001:
+        var sprint_ratio: float = clampf(horizontal_speed / maxf(speed * GROUND_SPRINT_SPEED_MULTIPLIER, 0.001), 0.0, 1.0)
+        sprint_camera_bob_phase = wrapf(sprint_camera_bob_phase + delta * SPRINT_CAMERA_BOB_FREQUENCY * lerpf(0.92, 1.1, sprint_ratio), 0.0, TAU)
+
+    camera_pivot_position.x += cos(sprint_camera_bob_phase * 0.5) * SPRINT_CAMERA_BOB_X * sprint_camera_bob_weight
+    camera_pivot_position.y += absf(sin(sprint_camera_bob_phase)) * SPRINT_CAMERA_BOB_Y * sprint_camera_bob_weight
+    %CameraPivot.position = camera_pivot_position
+    %Camera3D.rotation = Vector3(
+        camera_pitch,
+        0.0,
+        deg_to_rad(sin(sprint_camera_bob_phase * 0.5) * SPRINT_CAMERA_BOB_ROLL_DEG * sprint_camera_bob_weight)
+    )
 
     %Arm.position = %CameraPivot.position
-    %Arm.rotation.x = %Camera3D.rotation.x
+    %Arm.rotation.x = camera_pitch
     %Arm.rotation.y = %RotationPivot.rotation.y
 
 
@@ -527,6 +707,7 @@ func attack_process(data: Dictionary) -> void :
                 data.ball_target.apply_impulse(velocity * 0.25 + get_look_direction() * 28.0)
                 data.ball_target.attacked()
                 %WhiffPlayer.play()
+                _play_avatar_voice("attack")
                 %PlayerHand.current_hand.hit()
             if "target" in data:
                 if Ref.coop_manager != null and not multiplayer.is_server():
@@ -536,6 +717,7 @@ func attack_process(data: Dictionary) -> void :
                     print("[lucid-blocks-coop][attack-debug] guest target=", target_name, " class=", target.get_class(), " uuid=", target_uuid)
                 attack_used = true
                 %WhiffPlayer.play()
+                _play_avatar_voice("attack")
                 %Attack.attack(data.target, data.get("attack_position", %InteractRayCast3D.get_collision_point()))
                 %PlayerHand.current_hand.hit()
                 %Camera3D.camera_shake()
@@ -547,6 +729,7 @@ func attack_process(data: Dictionary) -> void :
                 if Ref.coop_manager != null and not multiplayer.is_server():
                     print("[lucid-blocks-coop][attack-debug] guest whiff collider=", data.get("debug_collider", "<none>"), " resolved=", data.get("debug_resolved", "<none>"))
                 %WhiffPlayer.play()
+                _play_avatar_voice("attack")
                 %PlayerHand.hit()
 
         var debug_always_breaking: bool = false
@@ -648,9 +831,12 @@ func crouch_snap(delta: float) -> void :
 
 
 func update_walk_animation() -> void :
-    %AnimationPlayer.speed_scale = (0.5 if is_crouching else 1.25)
+    %AnimationPlayer.speed_scale = 0.5 if is_crouching else (1.45 if is_sprinting else 1.25)
     if Vector3(velocity.x, 0, velocity.z).length() > 0.1 and not in_air:
-        %AnimationPlayer.current_animation = "walk"
+        if is_sprinting and %AnimationPlayer.has_animation("run"):
+            %AnimationPlayer.current_animation = "run"
+        else:
+            %AnimationPlayer.current_animation = "walk"
     else:
         %AnimationPlayer.stop()
 

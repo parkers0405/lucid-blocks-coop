@@ -121,6 +121,35 @@ func idle() -> void :
 
 
 func set_hand_color() -> void :
+    var color: Color = Ref.save_file_manager.settings_file.get_data("skin_modulate", Color.WHITE)
+
+    # Override hand color based on avatar
+    var coop_manager: Node = _get_coop_manager()
+    if coop_manager != null and coop_manager.has_method("get_local_avatar_id"):
+        var avatar_id: String = coop_manager.call("get_local_avatar_id")
+        var avatar_hand_color: Color = _get_avatar_hand_color(avatar_id)
+        if avatar_hand_color != Color.WHITE:
+            color = avatar_hand_color
+
     for hand in %VariantHolder.get_children():
         for sprite in hand.get_children():
-            sprite.set_instance_shader_parameter("modulate", Ref.save_file_manager.settings_file.get_data("skin_modulate", Color.WHITE))
+            sprite.set_instance_shader_parameter("modulate", color)
+
+
+func _get_coop_manager() -> Node:
+    var ref: Node = get_node_or_null("/root/Ref")
+    if ref != null and ref.get("coop_manager") != null:
+        return ref.get("coop_manager")
+    return null
+
+
+static func _get_avatar_hand_color(avatar_id: String) -> Color:
+    match avatar_id:
+        "pim":
+            return Color(0.97, 0.72, 0.97)  # Light pink/lavender - from pim's actual texture
+        "charlie":
+            return Color(0.95, 0.88, 0.45)  # Yellow - charlie's actual skin color
+        "mr_frog":
+            return Color(0.45, 0.75, 0.35)  # Green - mr frog's skin
+        _:
+            return Color.WHITE
