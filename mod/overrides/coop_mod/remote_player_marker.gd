@@ -316,18 +316,6 @@ func _try_build_avatar() -> bool:
     _load_runtime_clips()
     _setup_avatar_sounds()
     _rebuild_held_item_visual()
-    # Debug: dump what we built
-    var mesh_count: int = _count_mesh_instances(avatar_instance)
-    print("[avatar] id=%s skeleton=%s bones=%d meshes=%d" % [avatar_id, str(avatar_skeleton.name) if avatar_skeleton else "null", avatar_skeleton.get_bone_count() if avatar_skeleton else 0, mesh_count])
-    if avatar_skeleton:
-        for bi in range(min(6, avatar_skeleton.get_bone_count())):
-            print("[avatar]   bone[%d]=%s" % [bi, avatar_skeleton.get_bone_name(bi)])
-    _dump_tree(avatar_instance, "  ")
-    if avatar_animation_player:
-        print("[avatar] anims=%s" % str(avatar_animation_player.get_animation_list()))
-    var bounds: AABB = _get_bounds(avatar_instance)
-    print("[avatar] bounds_pos=%s bounds_size=%s" % [bounds.position, bounds.size])
-    print("[avatar] instance_pos=%s instance_scale=%s instance_rot=%s" % [avatar_instance.position, avatar_instance.scale, avatar_instance.rotation_degrees])
     return true
 
 
@@ -378,9 +366,6 @@ func _scale_avatar_to_player_height() -> void:
     # Position so feet sit at Y=0
     var ground_lift: float = float(avatar_entry.get("ground_offset", 0.0))
     avatar_instance.position = Vector3(0.0, -floor_y * scale_factor + ground_lift, 0.0)
-    print("[avatar] scale: model_h=%.4f scale=%.3f floor_y=%.4f pos_y=%.3f" % [model_height, scale_factor, floor_y, avatar_instance.position.y])
-
-
 # ---------------------------------------------------------------------------
 # Runtime animation clips - loaded directly, no remapping
 # ---------------------------------------------------------------------------
@@ -418,7 +403,6 @@ func _load_runtime_clips() -> void:
             continue
         var clip: Animation = _extract_mixamo_animation(str(clip_paths[clip_name]))
         if clip == null:
-            print("[avatar] FAILED to load clip: %s from %s" % [clip_name, str(clip_paths[clip_name])])
             continue
         # Only remap if using shared default clips on a non-default skeleton
         if not custom_clips.has(clip_name):
@@ -752,8 +736,9 @@ func _force_visible_recursive(root: Node) -> void:
     if root is GeometryInstance3D:
         var geometry := root as GeometryInstance3D
         geometry.visible = true
-        geometry.extra_cull_margin = 12.0
-        geometry.ignore_occlusion_culling = true
+        geometry.extra_cull_margin = 2.0
+        geometry.ignore_occlusion_culling = false
+        geometry.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
     for child in root.get_children():
         _force_visible_recursive(child)
 
@@ -771,28 +756,6 @@ func _make_texture_material(texture: Texture2D) -> Material:
 # ---------------------------------------------------------------------------
 # Scene tree helpers
 # ---------------------------------------------------------------------------
-
-func _dump_tree(node: Node, indent: String) -> void:
-    var extra: String = ""
-    if node is MeshInstance3D:
-        extra = " [MESH vis=%s]" % str(node.visible)
-    elif node is Skeleton3D:
-        extra = " [SKEL bones=%d]" % (node as Skeleton3D).get_bone_count()
-    print("[avatar] %s%s (%s)%s" % [indent, node.name, node.get_class(), extra])
-    for child in node.get_children():
-        _dump_tree(child, indent + "  ")
-
-
-func _count_mesh_instances(root: Node) -> int:
-    var count: int = 0
-    if root is MeshInstance3D:
-        var mi := root as MeshInstance3D
-        print("[avatar]   mesh: %s visible=%s mesh_valid=%s surfaces=%d" % [mi.name, mi.visible, str(mi.mesh != null), mi.mesh.get_surface_count() if mi.mesh != null else 0])
-        count += 1
-    for child in root.get_children():
-        count += _count_mesh_instances(child)
-    return count
-
 
 func _find_first_skeleton(root: Node) -> Skeleton3D:
     if root is Skeleton3D:

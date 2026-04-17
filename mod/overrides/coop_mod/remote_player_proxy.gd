@@ -138,12 +138,11 @@ func _physics_process(delta: float) -> void:
 	_apply_crouching(crouching)
 
 	if displacement.length_squared() > 0.0:
-		if displacement.length() > 8.0:
-			global_position = desired_position
-			if has_method("force_update_transform"):
-				force_update_transform()
-		else:
-			move_and_collide(displacement)
+		# This proxy is invisible and only exists for hit/revive targeting, so avoid
+		# per-frame collision sweeps that get expensive when players are close together.
+		global_position = desired_position
+		if has_method("force_update_transform"):
+			force_update_transform()
 
 	var horizontal_speed: float = Vector3(movement_velocity.x, 0.0, movement_velocity.z).length()
 	is_sprinting = horizontal_speed > maxf(minimum_sprint_speed, speed * 1.1)

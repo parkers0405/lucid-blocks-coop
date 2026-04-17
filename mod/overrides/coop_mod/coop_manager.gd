@@ -16,7 +16,7 @@ const ENTITY_WORLD_STATE_MAX_INTERVAL_SEC: float = 1.25
 const ENTITY_VISUAL_STATE_INTERVAL: float = 0.15
 const CLIENT_ENTITY_SYNC_GRACE_SEC: float = 0.5
 const PERSIST_INTERVAL: float = 1.0
-const AUTOSAVE_INTERVAL: float = 12.0
+const AUTOSAVE_INTERVAL: float = 15.0 * 60.0
 const HOST_TIMEOUT_SECONDS: float = 30.0
 const AUTO_RECONNECT_INTERVAL: float = 2.0
 const PANEL_WIDTH: float = 224.0
@@ -60,11 +60,16 @@ const CLIENT_PICKUP_PULL_OFFSET: Vector3 = Vector3(0.0, 0.95, 0.0)
 const CLIENT_ENTITY_QUERY_LAYER: int = 16
 const CLIENT_ENTITY_HIT_COOLDOWN_SEC: float = 0.33
 const WATER_SYNC_INTERVAL: float = 0.12
+const HOST_DYNAMIC_CELL_RESAMPLE_INTERVAL_SEC: float = 0.35
 const LOCAL_WORLD_PATCH_FLUSH_INTERVAL: float = 0.18
 const GUEST_WORLD_PATCH_FLUSH_TIMEOUT_SEC: float = 0.4
 const WATER_SYNC_HORIZONTAL_RADIUS: int = 12
 const WATER_SYNC_VERTICAL_RADIUS: int = 10
 const WATER_SYNC_BUCKET_SIZE: float = 4.0
+const CLIENT_SYNCED_ENTITY_VISUAL_NEAR_RADIUS: float = 48.0
+const CLIENT_SYNCED_ENTITY_VISUAL_MID_RADIUS: float = 88.0
+const CLIENT_SYNCED_ENTITY_VISUAL_MID_INTERVAL: float = 1.0 / 30.0
+const CLIENT_SYNCED_ENTITY_VISUAL_FAR_INTERVAL: float = 1.0 / 15.0
 const DEBUG_SPAWN_DISTANCE: float = 6.0
 const DEBUG_SPAWN_RESOURCE_DIR: String = "res://main/items/data/spawners"
 const DEBUG_SPAWN_FALLBACK_IDS: PackedStringArray = [
@@ -125,6 +130,7 @@ var session_previous_buffer_instance_radius: int = -1
 var local_quit_in_progress: bool = false
 var guest_persistent_ready: bool = false
 var autosave_in_progress: bool = false
+var deferred_host_autosave_pending: bool = false
 var last_host_contact_time: int = 0
 var last_sent_client_state_hash: int = 0
 var client_state_heartbeat_timer: float = 0.0
@@ -540,9 +546,15 @@ func _physics_process(delta: float) -> void:
     elif multiplayer.is_server() or not _has_local_guest_entity_authority():
         guest_entity_state_timer = 0.0
 
-    if multiplayer.is_server() and autosave_timer >= AUTOSAVE_INTERVAL:
-        autosave_timer = 0.0
-        _autosave_host_world_if_needed()
+    if multiplayer.is_server():
+        if _should_defer_host_periodic_autosave():
+            if autosave_timer >= AUTOSAVE_INTERVAL:
+                autosave_timer = 0.0
+                deferred_host_autosave_pending = true
+        elif _has_pending_host_periodic_autosave() and _can_run_host_periodic_autosave_now():
+            autosave_timer = 0.0
+            deferred_host_autosave_pending = false
+            _autosave_host_world_if_needed()
 
     if _has_host_timed_out():
         print("[lucid-blocks-coop] host heartbeat timed out")
@@ -653,6 +665,7 @@ func host_session() -> void:
     guest_persistent_ready = true
     last_host_contact_time = Time.get_ticks_msec()
     autosave_timer = 0.0
+    deferred_host_autosave_pending = false
     client_state_heartbeat_timer = 0.0
     last_sent_client_state_hash = 0
     host_rehost_pending = false
@@ -685,6 +698,7 @@ func join_session() -> void:
     guest_persistent_ready = false
     last_host_contact_time = 0
     autosave_timer = 0.0
+    deferred_host_autosave_pending = false
     client_state_heartbeat_timer = 0.0
     last_sent_client_state_hash = 0
     host_rehost_pending = false
@@ -761,6 +775,7 @@ func disconnect_session(announce: bool = true) -> void:
     persist_timer = 0.0
     guest_entity_state_timer = 0.0
     autosave_timer = 0.0
+    deferred_host_autosave_pending = false
     water_sync_timer = 0.0
     client_state_heartbeat_timer = 0.0
     host_entity_activity_refresh_timer = 0.0
@@ -3178,6 +3193,36 @@ func _has_host_timed_out() -> bool:
     return (Time.get_ticks_msec() - last_host_contact_time) > int(timeout_seconds * 1000.0)
 
 
+func _has_pending_host_periodic_autosave() -> bool:
+    return deferred_host_autosave_pending or autosave_timer >= AUTOSAVE_INTERVAL
+
+
+func _should_defer_host_periodic_autosave() -> bool:
+    # Full world saves serialize a lot of scene state and hitch active co-op sessions.
+    return has_connected_remote_peers()
+
+
+func _get_host_autosave_manager():
+    if not is_instance_valid(Ref.main):
+        return null
+    return Ref.main.get_node_or_null("%AutosaveManager")
+
+
+func _can_run_host_periodic_autosave_now() -> bool:
+    if autosave_in_progress or not multiplayer.is_server() or _should_defer_host_periodic_autosave():
+        return false
+    if not _has_pending_host_periodic_autosave():
+        return false
+
+    var autosave_manager = _get_host_autosave_manager()
+    if autosave_manager != null and autosave_manager.has_method("can_save"):
+        return bool(autosave_manager.call("can_save"))
+
+    if get_tree() == null or get_tree().paused or not _can_share_loaded_world() or not _can_sample_player():
+        return false
+    return not Ref.player.is_interacting() and not Ref.player.disabled and not Ref.player.dead
+
+
 func _autosave_host_world_if_needed() -> void:
     if autosave_in_progress or local_fake_death_pending or handling_host_respawn or host_respawning or not multiplayer.is_server() or not _can_share_loaded_world():
         return
@@ -3229,8 +3274,12 @@ func _run_host_autosave() -> void:
         return
 
     autosave_in_progress = true
+    var autosave_started_msec: int = Time.get_ticks_msec()
     await Ref.save_file_manager.save_file(true)
     autosave_in_progress = false
+    var autosave_elapsed_msec: int = Time.get_ticks_msec() - autosave_started_msec
+    if autosave_elapsed_msec >= 150:
+        print("[lucid-blocks-coop] host autosave took %d ms" % autosave_elapsed_msec)
 
 
 func _capture_local_state() -> Dictionary:
@@ -4802,6 +4851,8 @@ func _capture_host_water_changes(peer_id: int, center_position: Vector3, dimensi
     var force_full_sync: bool = cache.is_empty() or str(cache.get("dimension_instance_key", "")) != dimension_instance_key
     if str(cache.get("dimension_instance_key", "")) != dimension_instance_key:
         previous_levels = {}
+    elif _can_skip_host_dynamic_cell_rescan(cache, bucket):
+        return []
 
     var current_levels: Dictionary = {}
     var changes: Array = []
@@ -4831,6 +4882,7 @@ func _capture_host_water_changes(peer_id: int, center_position: Vector3, dimensi
     host_water_snapshot_cache[peer_id] = {
         "dimension_instance_key": dimension_instance_key,
         "bucket": bucket,
+        "last_scan_msec": Time.get_ticks_msec(),
         "levels": current_levels,
     }
     return changes
@@ -4843,6 +4895,8 @@ func _capture_host_fire_changes(peer_id: int, center_position: Vector3, dimensio
     var force_full_sync: bool = cache.is_empty() or str(cache.get("dimension_instance_key", "")) != dimension_instance_key
     if str(cache.get("dimension_instance_key", "")) != dimension_instance_key:
         previous_levels = {}
+    elif _can_skip_host_dynamic_cell_rescan(cache, bucket):
+        return []
 
     var current_levels: Dictionary = {}
     var changes: Array = []
@@ -4872,9 +4926,19 @@ func _capture_host_fire_changes(peer_id: int, center_position: Vector3, dimensio
     host_fire_snapshot_cache[peer_id] = {
         "dimension_instance_key": dimension_instance_key,
         "bucket": bucket,
+        "last_scan_msec": Time.get_ticks_msec(),
         "levels": current_levels,
     }
     return changes
+
+
+func _can_skip_host_dynamic_cell_rescan(cache: Dictionary, bucket: Vector3i) -> bool:
+    if cache.is_empty() or cache.get("bucket", Vector3i.ZERO) != bucket:
+        return false
+    var last_scan_msec: int = int(cache.get("last_scan_msec", 0))
+    if last_scan_msec <= 0:
+        return false
+    return (Time.get_ticks_msec() - last_scan_msec) < int(HOST_DYNAMIC_CELL_RESAMPLE_INTERVAL_SEC * 1000.0)
 
 
 func _sync_host_water_state_for_peer(peer_id: int, peer_state: Dictionary) -> void:
@@ -9058,7 +9122,35 @@ func _tick_client_synced_entity_visuals(delta: float) -> void:
             var interp = entity_interp_map[uuid]
             if interp is Dictionary:
                 entity_velocity = interp.get("velocity", entity_velocity)
-        _update_client_entity_visuals(entity, entity_velocity, delta)
+        var visual_delta: float = _consume_client_entity_visual_update_delta(entity, delta)
+        if visual_delta <= 0.0:
+            continue
+        _update_client_entity_visuals(entity, entity_velocity, visual_delta)
+
+
+func _consume_client_entity_visual_update_delta(entity, delta: float) -> float:
+    if entity == null or not is_instance_valid(entity):
+        return 0.0
+
+    var update_interval: float = 0.0
+    if _can_sample_player():
+        var distance_squared: float = entity.global_position.distance_squared_to(Ref.player.global_position)
+        if distance_squared > CLIENT_SYNCED_ENTITY_VISUAL_MID_RADIUS * CLIENT_SYNCED_ENTITY_VISUAL_MID_RADIUS:
+            update_interval = CLIENT_SYNCED_ENTITY_VISUAL_FAR_INTERVAL
+        elif distance_squared > CLIENT_SYNCED_ENTITY_VISUAL_NEAR_RADIUS * CLIENT_SYNCED_ENTITY_VISUAL_NEAR_RADIUS:
+            update_interval = CLIENT_SYNCED_ENTITY_VISUAL_MID_INTERVAL
+
+    if update_interval <= 0.0:
+        entity.set_meta("coop_client_visual_delta_accum", 0.0)
+        return delta
+
+    var accumulated_delta: float = float(entity.get_meta("coop_client_visual_delta_accum", 0.0)) + delta
+    if accumulated_delta + 0.0001 < update_interval:
+        entity.set_meta("coop_client_visual_delta_accum", accumulated_delta)
+        return 0.0
+
+    entity.set_meta("coop_client_visual_delta_accum", fmod(accumulated_delta, update_interval))
+    return accumulated_delta
 
 
 func _apply_interp_animation(entity, walk_val: float, compact_anim: Dictionary) -> void:

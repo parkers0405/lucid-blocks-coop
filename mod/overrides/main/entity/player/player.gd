@@ -78,7 +78,6 @@ var last_forward_press_msec: int = 0
 var double_tap_sprint_requested: bool = false
 var sprint_camera_bob_phase: float = 0.0
 var sprint_camera_bob_weight: float = 0.0
-var first_person_pitch_debug_cooldown: float = 0.0
 
 signal structure_changed(new_structure: Structure)
 signal can_interact_with_block_changed(value: bool)
@@ -218,24 +217,6 @@ func _set_camera_pitch(new_pitch: float) -> void:
     %Camera3D.rotation.x = camera_pitch
 
 
-func _debug_first_person_pitch_state() -> void:
-    if first_person_pitch_debug_cooldown > 0.0:
-        return
-    if absf(rad_to_deg(camera_pitch)) < 80.0:
-        return
-
-    first_person_pitch_debug_cooldown = 0.75
-    print(
-        "[lucid-blocks-coop][fp-debug] pitch_deg=%.2f hand_world=%s hand_screen=%s cam_rot=%s arm_rot=%s" % [
-            rad_to_deg(camera_pitch),
-            str(%Hand.global_position),
-            str(%PlayerHand.position),
-            str(%Camera3D.rotation),
-            str(%Arm.rotation)
-        ]
-    )
-
-
 func _on_settings_updated() -> void :
     fov = int(Ref.save_file_manager.settings_file.get_data("fov", 86))
     sprint_toggle = Ref.save_file_manager.settings_file.get_data("sprint_toggle", false)
@@ -358,7 +339,6 @@ func _process(delta: float) -> void :
     if disabled:
         return
 
-    first_person_pitch_debug_cooldown = maxf(0.0, first_person_pitch_debug_cooldown - delta)
     if _avatar_voice_cooldown > 0.0:
         _avatar_voice_cooldown -= delta
 
@@ -400,7 +380,6 @@ func _process(delta: float) -> void :
     update_pointer_visual.call_deferred()
     hand_process()
     %PlayerHand.position = ( %Camera3D.unproject_position( %Hand.global_position) - %PlayerHand.scale * %PlayerHand.offset)
-    _debug_first_person_pitch_state()
 
 
 func _physics_process(delta: float) -> void :
@@ -562,7 +541,6 @@ func initialize() -> void :
     glider_speed_modifier = 1.0
     sprint_camera_bob_phase = 0.0
     sprint_camera_bob_weight = 0.0
-    first_person_pitch_debug_cooldown = 0.0
     first_frame = true
     current_biome = null
     push_bodies.clear()
