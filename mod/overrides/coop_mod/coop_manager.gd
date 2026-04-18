@@ -6,6 +6,8 @@ const RemotePlayerMarkerScript = preload("res://coop_mod/remote_player_marker.gd
 const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_CLIENTS: int = 4
+const SESSION_TRANSPORT_LAN: String = "lan"
+const SESSION_TRANSPORT_STEAM: String = "steam"
 const SEND_INTERVAL: float = 0.025
 const WORLD_STATE_INTERVAL: float = 0.05
 const ENTITY_DR_POS_ERR_SQ: float = 0.0225
@@ -72,6 +74,15 @@ const CLIENT_SYNCED_ENTITY_VISUAL_MID_INTERVAL: float = 1.0 / 30.0
 const CLIENT_SYNCED_ENTITY_VISUAL_FAR_INTERVAL: float = 1.0 / 15.0
 const DEBUG_SPAWN_DISTANCE: float = 6.0
 const DEBUG_SPAWN_RESOURCE_DIR: String = "res://main/items/data/spawners"
+const STEAM_LOBBY_TYPE_FRIENDS_ONLY: int = 1
+const STEAM_RESULT_OK: int = 1
+const STEAM_CHAT_ROOM_ENTER_RESPONSE_SUCCESS: int = 1
+const STEAM_LOBBY_DATA_NAME: String = "name"
+const STEAM_LOBBY_DATA_TRANSPORT: String = "lb_transport"
+const STEAM_LOBBY_DATA_HOST_NAME: String = "lb_host_name"
+const STEAM_RICH_PRESENCE_CONNECT_KEY: String = "connect"
+const STEAM_RICH_PRESENCE_STATUS_KEY: String = "status"
+const STEAM_CONNECT_LOBBY_PREFIX: String = "+connect_lobby "
 const DEBUG_SPAWN_FALLBACK_IDS: PackedStringArray = [
     "agni", "archangel", "baal", "bee", "blasphemy", "boid", "bubble", "bubblebear", "chicken", "diatom", "egg_bubblebear", "egg_chicken", "fish", "floating_fish", "fruit_girl", "fungus_bubblebear", "gel", "glaggler", "golem", "hamsa", "kali", "kodama", "leviathan", "manikin", "meeshuu", "metal_gel", "metal_golem", "mimic", "mini_gel", "moccos", "ofanim", "plastic_sheep", "preta", "shark", "sheep", "sunny", "vyrm", "wildebeest", "worm", "yhvh"
 ]
@@ -87,6 +98,14 @@ var config: Dictionary = {
     "port": DEFAULT_PORT,
     "avatar_id": DEFAULT_AVATAR_ID,
 }
+var active_session_transport: String = SESSION_TRANSPORT_LAN
+var active_steam_lobby_id: int = 0
+var active_steam_host_id: int = 0
+var pending_steam_action: String = ""
+var pending_steam_lobby_id: int = 0
+var pending_steam_open_invite_dialog: bool = false
+var reconnect_steam_lobby_id: int = 0
+var reconnect_steam_host_id: int = 0
 
 var peer_states: Dictionary = {}
 var markers: Dictionary = {}
@@ -223,6 +242,14 @@ var local_ip_label: Label
 var status_label: Label
 var address_input: LineEdit
 var port_input: SpinBox
+var pause_menu_owner: Control
+var pause_menu_container: Control
+var pause_menu_resume_button: Button
+var pause_menu_coop_button: Button
+var pause_menu_coop_panel: PanelContainer
+var pause_menu_coop_status_label: Label
+var pause_menu_coop_address_input: LineEdit
+var pause_menu_coop_port_input: SpinBox
 
 
 func _ready() -> void:
@@ -245,6 +272,8 @@ func _ready() -> void:
     multiplayer.connected_to_server.connect(_on_connected_to_server)
     multiplayer.connection_failed.connect(_on_connection_failed)
     multiplayer.server_disconnected.connect(_on_server_disconnected)
+    _install_steam_integration()
+    call_deferred("_ensure_pause_menu_coop_ui")
 
     get_tree().get_root().child_entered_tree.connect(_on_root_child_entered)
     get_tree().get_root().child_exiting_tree.connect(_on_root_child_exiting)
@@ -252,6 +281,686 @@ func _ready() -> void:
 
     print("[lucid-blocks-coop] manager ready")
     _update_status_text()
+
+
+func _get_steam_api() -> Object:
+    var steamworks_node: Node = get_node_or_null("/root/Steamworks")
+    if steamworks_node != null and (
+        steamworks_node.has_method("createLobby")
+        or steamworks_node.has_method("create_lobby")
+        or steamworks_node.has_method("joinLobby")
+        or steamworks_node.has_method("join_lobby")
+    ):
+        return steamworks_node
+    if Engine.has_singleton("Steam"):
+        return Engine.get_singleton("Steam")
+    if steamworks_node != null:
+        return steamworks_node
+    return null
+
+
+func _steam_has_any_method(method_names: Array[String]) -> bool:
+    var steam_api: Object = _get_steam_api()
+    if steam_api == null:
+        return false
+    for method_name in method_names:
+        if steam_api.has_method(method_name):
+            return true
+    return false
+
+
+func _steam_call(method_name: String, args: Array = []) -> Variant:
+    return _steam_call_alias([method_name], args)
+
+
+func _steam_call_alias(method_names: Array[String], args: Array = []) -> Variant:
+    var steam_api: Object = _get_steam_api()
+    if steam_api == null:
+        return null
+    for method_name in method_names:
+        if steam_api.has_method(method_name):
+            return steam_api.callv(method_name, args)
+    return null
+
+
+func _has_steam_multiplayer_peer_support() -> bool:
+    return ClassDB.can_instantiate("SteamMultiplayerPeer")
+
+
+func _can_use_steam_sessions() -> bool:
+    return _steam_has_any_method(["createLobby", "create_lobby"]) \
+        and _steam_has_any_method(["joinLobby", "join_lobby"]) \
+        and _has_steam_multiplayer_peer_support()
+
+
+func _connect_steam_signal(signal_name: String, method_name: String) -> void:
+    var steam_api: Object = _get_steam_api()
+    if steam_api == null or not steam_api.has_signal(signal_name):
+        return
+    var callable := Callable(self, method_name)
+    if not steam_api.is_connected(signal_name, callable):
+        steam_api.connect(signal_name, callable)
+
+
+func _install_steam_integration() -> void:
+    if _get_steam_api() == null:
+        return
+    _connect_steam_signal("lobby_created", "_on_steam_lobby_created")
+    _connect_steam_signal("lobby_joined", "_on_steam_lobby_joined")
+    _connect_steam_signal("join_requested", "_on_steam_join_requested")
+    _connect_steam_signal("game_lobby_join_requested", "_on_steam_join_requested")
+    _connect_steam_signal("join_game_requested", "_on_steam_join_game_requested")
+    _connect_steam_signal("lobby_invite", "_on_steam_lobby_invite")
+    call_deferred("_handle_pending_steam_launch_invite")
+
+
+func _handle_pending_steam_launch_invite() -> void:
+    var launch_lobby_id: int = _extract_lobby_id_from_connect_string(" ".join(OS.get_cmdline_args()))
+    if launch_lobby_id <= 0:
+        return
+    _join_steam_lobby_by_id(launch_lobby_id, false)
+
+
+func _extract_lobby_id_from_connect_string(raw_text: String) -> int:
+    var text: String = raw_text.strip_edges()
+    if text == "":
+        return 0
+    if text.is_valid_int():
+        return int(text)
+
+    var connect_index: int = text.find(STEAM_CONNECT_LOBBY_PREFIX)
+    if connect_index >= 0:
+        var suffix: String = text.substr(connect_index + STEAM_CONNECT_LOBBY_PREFIX.length()).strip_edges()
+        var lobby_text: String = suffix.get_slice(" ", 0)
+        if lobby_text.is_valid_int():
+            return int(lobby_text)
+
+    var marker_index: int = text.find("steam_lobby=")
+    if marker_index >= 0:
+        var marker_suffix: String = text.substr(marker_index + len("steam_lobby=")).strip_edges()
+        var marker_lobby_text: String = marker_suffix.get_slice(" ", 0)
+        if marker_lobby_text.is_valid_int():
+            return int(marker_lobby_text)
+
+    return 0
+
+
+func _prepare_session_start_state(is_host: bool) -> void:
+    local_quit_in_progress = false
+    local_fake_death_save_override.clear()
+    local_fake_death_respawn_target_valid = false
+    clear_fake_death_override_after_shutdown = false
+    _clear_local_downed_state()
+    guest_persistent_ready = is_host
+    last_host_contact_time = Time.get_ticks_msec() if is_host else 0
+    autosave_timer = 0.0
+    deferred_host_autosave_pending = false
+    client_state_heartbeat_timer = 0.0
+    last_sent_client_state_hash = 0
+    host_rehost_pending = false
+    if is_host:
+        host_rehost_port = int(config.get("port", DEFAULT_PORT))
+
+
+func _get_local_steam_id() -> int:
+    if Steamworks != null and int(Steamworks.steam_id) > 0:
+        return int(Steamworks.steam_id)
+    var steam_id_value: Variant = _steam_call_alias(["getSteamID", "get_steam_id"])
+    return int(steam_id_value) if steam_id_value != null else 0
+
+
+func _create_steam_multiplayer_peer() -> MultiplayerPeer:
+    if not _has_steam_multiplayer_peer_support():
+        return null
+    return ClassDB.instantiate("SteamMultiplayerPeer") as MultiplayerPeer
+
+
+func _configure_hosted_steam_lobby(lobby_id: int) -> void:
+    if lobby_id <= 0:
+        return
+    _steam_call_alias(["setLobbyData", "set_lobby_data"], [lobby_id, STEAM_LOBBY_DATA_NAME, "%s's Co-op" % _get_local_player_name()])
+    _steam_call_alias(["setLobbyData", "set_lobby_data"], [lobby_id, STEAM_LOBBY_DATA_TRANSPORT, SESSION_TRANSPORT_STEAM])
+    _steam_call_alias(["setLobbyData", "set_lobby_data"], [lobby_id, STEAM_LOBBY_DATA_HOST_NAME, _get_local_player_name()])
+    _steam_call_alias(["setLobbyJoinable", "set_lobby_joinable"], [lobby_id, true])
+    _steam_call_alias(["setRichPresence", "set_rich_presence"], [STEAM_RICH_PRESENCE_STATUS_KEY, "Hosting co-op"])
+    _steam_call_alias(["setRichPresence", "set_rich_presence"], [STEAM_RICH_PRESENCE_CONNECT_KEY, "%s%d" % [STEAM_CONNECT_LOBBY_PREFIX, lobby_id]])
+
+
+func _clear_steam_presence() -> void:
+    var steam_api: Object = _get_steam_api()
+    if steam_api == null:
+        return
+    if steam_api.has_method("clearRichPresence"):
+        steam_api.call("clearRichPresence")
+        return
+    if steam_api.has_method("clear_rich_presence"):
+        steam_api.call("clear_rich_presence")
+        return
+    if steam_api.has_method("setRichPresence"):
+        steam_api.call("setRichPresence", STEAM_RICH_PRESENCE_STATUS_KEY, "")
+        steam_api.call("setRichPresence", STEAM_RICH_PRESENCE_CONNECT_KEY, "")
+    elif steam_api.has_method("set_rich_presence"):
+        steam_api.call("set_rich_presence", STEAM_RICH_PRESENCE_STATUS_KEY, "")
+        steam_api.call("set_rich_presence", STEAM_RICH_PRESENCE_CONNECT_KEY, "")
+
+
+func _leave_active_steam_lobby() -> void:
+    if active_steam_lobby_id > 0:
+        _steam_call_alias(["leaveLobby", "leave_lobby"], [active_steam_lobby_id])
+
+
+func _clear_active_steam_session_state(leave_lobby: bool = true) -> void:
+    if leave_lobby:
+        _leave_active_steam_lobby()
+    _clear_steam_presence()
+    active_steam_lobby_id = 0
+    active_steam_host_id = 0
+    active_session_transport = SESSION_TRANSPORT_LAN
+
+
+func _start_steam_host_peer(lobby_id: int) -> void:
+    var peer := _create_steam_multiplayer_peer()
+    if peer == null:
+        status_message = "Steam host unavailable"
+        _update_status_text()
+        _clear_active_steam_session_state(true)
+        return
+
+    var err: Error = ERR_UNAVAILABLE
+    if peer.has_method("host_with_lobby"):
+        err = peer.call("host_with_lobby", lobby_id)
+    elif peer.has_method("create_host"):
+        err = peer.call("create_host", 0)
+    if err != OK:
+        status_message = "Steam host failed (%s)" % err
+        _update_status_text()
+        _clear_active_steam_session_state(true)
+        return
+
+    multiplayer.multiplayer_peer = peer
+    peer_states.clear()
+    active_session_transport = SESSION_TRANSPORT_STEAM
+    active_steam_lobby_id = lobby_id
+    active_steam_host_id = _get_local_steam_id()
+    reconnect_steam_lobby_id = active_steam_lobby_id
+    reconnect_steam_host_id = active_steam_host_id
+    _install_player_death_hook()
+    status_message = "Hosting Steam lobby"
+    _update_status_text()
+    if pending_steam_open_invite_dialog:
+        pending_steam_open_invite_dialog = false
+        _open_steam_invite_dialog()
+
+
+func _start_steam_client_peer(lobby_id: int) -> void:
+    var peer := _create_steam_multiplayer_peer()
+    if peer == null:
+        status_message = "Steam join unavailable"
+        _update_status_text()
+        _clear_active_steam_session_state(true)
+        return
+
+    active_steam_host_id = int(_steam_call_alias(["getLobbyOwner", "get_lobby_owner"], [lobby_id]))
+
+    var err: Error = ERR_UNAVAILABLE
+    if peer.has_method("connect_to_lobby"):
+        err = peer.call("connect_to_lobby", lobby_id)
+    elif peer.has_method("create_client"):
+        err = peer.call("create_client", active_steam_host_id, 0)
+    if err != OK:
+        status_message = "Steam join failed (%s)" % err
+        _update_status_text()
+        _clear_active_steam_session_state(true)
+        return
+
+    multiplayer.multiplayer_peer = peer
+    peer_states.clear()
+    active_session_transport = SESSION_TRANSPORT_STEAM
+    active_steam_lobby_id = lobby_id
+    reconnect_steam_lobby_id = active_steam_lobby_id
+    reconnect_steam_host_id = active_steam_host_id
+    _install_player_death_hook()
+    status_message = "Joining Steam lobby"
+    _update_status_text()
+
+
+func host_steam_session(auto_open_invite_dialog: bool = true) -> void:
+    if not _can_share_loaded_world():
+        status_message = "Open Steam co-op from inside a loaded world"
+        _update_status_text()
+        return
+    if not _can_use_steam_sessions():
+        status_message = "Steam co-op is unavailable"
+        _update_status_text()
+        return
+
+    reconnect_pending = false
+    reconnect_attempt_count = 0
+    reconnect_retry_timer = 0.0
+    reconnect_reason = ""
+    reconnect_steam_lobby_id = 0
+    reconnect_steam_host_id = 0
+    pending_steam_action = "host"
+    pending_steam_lobby_id = 0
+    pending_steam_open_invite_dialog = auto_open_invite_dialog
+    _set_reconnect_overlay_visible(false)
+    _prepare_session_start_state(true)
+    _apply_ui_to_config()
+    disconnect_session(false)
+    status_message = "Creating Steam lobby..."
+    _update_status_text()
+    _steam_call_alias(["createLobby", "create_lobby"], [STEAM_LOBBY_TYPE_FRIENDS_ONLY, MAX_CLIENTS])
+
+
+func _join_steam_lobby_by_id(lobby_id: int, reset_reconnect_state: bool = true) -> void:
+    if lobby_id <= 0:
+        status_message = "Invalid Steam lobby"
+        _update_status_text()
+        return
+    if not _can_use_steam_sessions():
+        status_message = "Steam co-op is unavailable"
+        _update_status_text()
+        return
+
+    if reset_reconnect_state:
+        reconnect_pending = false
+        reconnect_attempt_count = 0
+        reconnect_retry_timer = 0.0
+        reconnect_reason = ""
+        reconnect_steam_lobby_id = 0
+        reconnect_steam_host_id = 0
+        _set_reconnect_overlay_visible(false)
+
+    pending_steam_action = "join"
+    pending_steam_lobby_id = lobby_id
+    pending_steam_open_invite_dialog = false
+    _prepare_session_start_state(false)
+    disconnect_session(false)
+    status_message = "Joining Steam lobby %s..." % lobby_id
+    _update_status_text()
+    _steam_call_alias(["joinLobby", "join_lobby"], [lobby_id])
+
+
+func _open_steam_invite_dialog() -> void:
+    if active_session_transport != SESSION_TRANSPORT_STEAM or active_steam_lobby_id <= 0:
+        status_message = "Host a Steam session first"
+        _update_status_text()
+        return
+    if not multiplayer.is_server():
+        status_message = "Only the host can invite via Steam"
+        _update_status_text()
+        return
+
+    var steam_api: Object = _get_steam_api()
+    if steam_api == null:
+        status_message = "Steam overlay unavailable"
+        _update_status_text()
+        return
+    if steam_api.has_method("activateGameOverlayInviteDialog"):
+        steam_api.call("activateGameOverlayInviteDialog", active_steam_lobby_id)
+        status_message = "Steam invite dialog opened"
+    elif steam_api.has_method("activate_game_overlay_invite_dialog"):
+        steam_api.call("activate_game_overlay_invite_dialog", active_steam_lobby_id)
+        status_message = "Steam invite dialog opened"
+    elif steam_api.has_method("activateGameOverlay"):
+        steam_api.call("activateGameOverlay", "Friends")
+        status_message = "Opened Steam friends overlay"
+    elif steam_api.has_method("activate_game_overlay"):
+        steam_api.call("activate_game_overlay", "Friends")
+        status_message = "Opened Steam friends overlay"
+    else:
+        status_message = "Steam invite dialog unavailable"
+    _update_status_text()
+
+
+func _on_steam_lobby_created(connect_status = null, lobby_id = null) -> void:
+    if pending_steam_action != "host":
+        return
+    pending_steam_action = ""
+
+    var created_lobby_id: int = int(lobby_id)
+    var status_code: int = int(connect_status)
+    if created_lobby_id <= 0 or (status_code not in [0, STEAM_RESULT_OK]):
+        pending_steam_open_invite_dialog = false
+        status_message = "Steam lobby creation failed"
+        _update_status_text()
+        return
+
+    active_steam_lobby_id = created_lobby_id
+    _configure_hosted_steam_lobby(created_lobby_id)
+    _start_steam_host_peer(created_lobby_id)
+
+
+func _on_steam_lobby_joined(lobby_id = null, _permissions = null, _locked = null, response = null, connection_failure = false) -> void:
+    if pending_steam_action != "join":
+        return
+
+    var joined_lobby_id: int = int(lobby_id)
+    var response_code: int = int(response)
+    if bool(connection_failure) or joined_lobby_id <= 0 or (response != null and response_code != STEAM_CHAT_ROOM_ENTER_RESPONSE_SUCCESS):
+        pending_steam_action = ""
+        status_message = "Steam lobby join failed"
+        _update_status_text()
+        return
+
+    pending_steam_action = ""
+    active_steam_lobby_id = joined_lobby_id
+    _start_steam_client_peer(joined_lobby_id)
+
+
+func _on_steam_join_requested(arg0 = null, arg1 = null, arg2 = null) -> void:
+    var lobby_id: int = 0
+    for value in [arg0, arg1, arg2]:
+        if value == null:
+            continue
+        var candidate: int = _extract_lobby_id_from_connect_string(str(value))
+        if candidate > 0:
+            lobby_id = candidate
+            break
+    if lobby_id <= 0:
+        return
+    _join_steam_lobby_by_id(lobby_id, true)
+
+
+func _on_steam_join_game_requested(arg0 = null, arg1 = null, arg2 = null) -> void:
+    var lobby_id: int = 0
+    for value in [arg0, arg1, arg2]:
+        if value == null:
+            continue
+        lobby_id = _extract_lobby_id_from_connect_string(str(value))
+        if lobby_id > 0:
+            break
+    if lobby_id <= 0:
+        return
+    _join_steam_lobby_by_id(lobby_id, true)
+
+
+func _on_steam_lobby_invite(_arg0 = null, _arg1 = null, _arg2 = null) -> void:
+    status_message = "Steam invite received"
+    _update_status_text()
+
+
+func _get_game_menu_node() -> Control:
+    if is_instance_valid(Ref.main):
+        var main_game_menu: Control = Ref.main.get_node_or_null("%GameMenu") as Control
+        if main_game_menu != null:
+            return main_game_menu
+    if is_instance_valid(Ref.game_menu):
+        return Ref.game_menu as Control
+    return null
+
+
+func _clear_pause_menu_coop_ui() -> void:
+    if is_instance_valid(pause_menu_coop_button):
+        pause_menu_coop_button.queue_free()
+    if is_instance_valid(pause_menu_coop_panel):
+        pause_menu_coop_panel.queue_free()
+    pause_menu_owner = null
+    pause_menu_container = null
+    pause_menu_resume_button = null
+    pause_menu_coop_button = null
+    pause_menu_coop_panel = null
+    pause_menu_coop_status_label = null
+    pause_menu_coop_address_input = null
+    pause_menu_coop_port_input = null
+
+
+func _copy_pause_menu_button_style(source: Button, target: Button) -> void:
+    if source == null or target == null:
+        return
+    target.theme = source.theme
+    target.theme_type_variation = source.theme_type_variation
+    target.focus_mode = source.focus_mode
+    target.custom_minimum_size = source.custom_minimum_size
+    target.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    target.flat = source.flat
+
+
+func _copy_pause_menu_label_style(source: Label, target: Label, font_size: int = -1) -> void:
+    if source == null or target == null:
+        return
+    target.theme = source.theme
+    target.theme_type_variation = source.theme_type_variation
+    target.horizontal_alignment = source.horizontal_alignment
+    var resolved_font_size: int = font_size if font_size > 0 else source.get_theme_font_size("font_size")
+    if resolved_font_size > 0:
+        target.add_theme_font_size_override("font_size", resolved_font_size)
+
+
+func _build_pause_menu_coop_panel(sample_button: Button, sample_title: Label) -> PanelContainer:
+    var submenu_panel := PanelContainer.new()
+    submenu_panel.visible = false
+    submenu_panel.anchor_left = 0.5
+    submenu_panel.anchor_top = 0.5
+    submenu_panel.anchor_right = 0.5
+    submenu_panel.anchor_bottom = 0.5
+    submenu_panel.offset_left = -210.0
+    submenu_panel.offset_top = -176.0
+    submenu_panel.offset_right = 210.0
+    submenu_panel.offset_bottom = 176.0
+    submenu_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+    submenu_panel.focus_mode = Control.FOCUS_ALL
+
+    var margin := MarginContainer.new()
+    margin.add_theme_constant_override("margin_left", 18)
+    margin.add_theme_constant_override("margin_right", 18)
+    margin.add_theme_constant_override("margin_top", 18)
+    margin.add_theme_constant_override("margin_bottom", 18)
+    submenu_panel.add_child(margin)
+
+    var column := VBoxContainer.new()
+    column.add_theme_constant_override("separation", 10)
+    margin.add_child(column)
+
+    var title := Label.new()
+    title.text = "CO-OP"
+    title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    if sample_title != null:
+        _copy_pause_menu_label_style(sample_title, title, sample_title.get_theme_font_size("font_size"))
+    else:
+        title.add_theme_font_size_override("font_size", 18)
+    column.add_child(title)
+
+    var subtitle := Label.new()
+    subtitle.text = "Invite friends through Steam or connect over your local network"
+    subtitle.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    subtitle.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    if sample_title != null:
+        _copy_pause_menu_label_style(sample_title, subtitle, max(10, sample_title.get_theme_font_size("font_size") - 6))
+    else:
+        subtitle.add_theme_font_size_override("font_size", 11)
+    column.add_child(subtitle)
+
+    var steam_heading := Label.new()
+    steam_heading.text = "STEAM"
+    steam_heading.add_theme_font_size_override("font_size", 11)
+    column.add_child(steam_heading)
+
+    var steam_buttons := HBoxContainer.new()
+    steam_buttons.add_theme_constant_override("separation", 8)
+    column.add_child(steam_buttons)
+
+    var steam_host_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, steam_host_button)
+    steam_host_button.text = "Host Steam"
+    steam_host_button.pressed.connect(host_steam_session)
+    steam_buttons.add_child(steam_host_button)
+
+    var steam_invite_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, steam_invite_button)
+    steam_invite_button.text = "Invite"
+    steam_invite_button.pressed.connect(_open_steam_invite_dialog)
+    steam_buttons.add_child(steam_invite_button)
+
+    var local_heading := Label.new()
+    local_heading.text = "LOCAL"
+    local_heading.add_theme_font_size_override("font_size", 11)
+    column.add_child(local_heading)
+
+    var local_hint := Label.new()
+    local_hint.text = "Join another machine on your LAN with an IP and port"
+    local_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    local_hint.add_theme_font_size_override("font_size", 10)
+    column.add_child(local_hint)
+
+    var local_join_row := HBoxContainer.new()
+    local_join_row.add_theme_constant_override("separation", 8)
+    column.add_child(local_join_row)
+
+    pause_menu_coop_address_input = LineEdit.new()
+    pause_menu_coop_address_input.placeholder_text = "192.168.x.x"
+    pause_menu_coop_address_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    pause_menu_coop_address_input.custom_minimum_size = Vector2(0.0, max(24.0, sample_button.custom_minimum_size.y))
+    pause_menu_coop_address_input.text_submitted.connect(_on_join_text_submitted)
+    local_join_row.add_child(pause_menu_coop_address_input)
+
+    pause_menu_coop_port_input = SpinBox.new()
+    pause_menu_coop_port_input.min_value = 1
+    pause_menu_coop_port_input.max_value = 65535
+    pause_menu_coop_port_input.step = 1
+    pause_menu_coop_port_input.rounded = true
+    pause_menu_coop_port_input.custom_minimum_size = Vector2(88.0, max(24.0, sample_button.custom_minimum_size.y))
+    local_join_row.add_child(pause_menu_coop_port_input)
+
+    var local_buttons := HBoxContainer.new()
+    local_buttons.add_theme_constant_override("separation", 8)
+    column.add_child(local_buttons)
+
+    var local_host_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, local_host_button)
+    local_host_button.text = "Host Local"
+    local_host_button.pressed.connect(host_session)
+    local_buttons.add_child(local_host_button)
+
+    var local_join_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, local_join_button)
+    local_join_button.text = "Join Local"
+    local_join_button.pressed.connect(join_session)
+    local_buttons.add_child(local_join_button)
+
+    pause_menu_coop_status_label = Label.new()
+    pause_menu_coop_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    pause_menu_coop_status_label.custom_minimum_size = Vector2(0.0, 54.0)
+    pause_menu_coop_status_label.add_theme_font_size_override("font_size", 10)
+    column.add_child(pause_menu_coop_status_label)
+
+    var footer_buttons := HBoxContainer.new()
+    footer_buttons.add_theme_constant_override("separation", 8)
+    column.add_child(footer_buttons)
+
+    var leave_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, leave_button)
+    leave_button.text = "Leave Session"
+    leave_button.pressed.connect(leave_session)
+    footer_buttons.add_child(leave_button)
+
+    var back_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, back_button)
+    back_button.text = "Back"
+    back_button.pressed.connect(_close_pause_menu_coop_panel)
+    footer_buttons.add_child(back_button)
+
+    return submenu_panel
+
+
+func _ensure_pause_menu_coop_ui() -> void:
+    var game_menu: Control = _get_game_menu_node()
+    if game_menu == null or not game_menu.is_inside_tree():
+        _clear_pause_menu_coop_ui()
+        return
+
+    if pause_menu_owner != null and pause_menu_owner != game_menu:
+        _clear_pause_menu_coop_ui()
+
+    var pause_container: Control = game_menu.find_child("PauseContainer", true, false) as Control
+    var resume_button: Button = game_menu.find_child("ResumeButton", true, false) as Button
+    if pause_container == null or resume_button == null:
+        return
+
+    pause_menu_owner = game_menu
+    pause_menu_container = pause_container
+    pause_menu_resume_button = resume_button
+
+    if not is_instance_valid(pause_menu_coop_button):
+        var button_parent: Node = resume_button.get_parent()
+        if button_parent == null:
+            return
+        pause_menu_coop_button = Button.new()
+        pause_menu_coop_button.name = "CoopPauseButton"
+        _copy_pause_menu_button_style(resume_button, pause_menu_coop_button)
+        pause_menu_coop_button.text = "Co-op"
+        pause_menu_coop_button.pressed.connect(_open_pause_menu_coop_panel)
+        button_parent.add_child(pause_menu_coop_button)
+        button_parent.move_child(pause_menu_coop_button, resume_button.get_index() + 1)
+
+    if not is_instance_valid(pause_menu_coop_panel):
+        var title_label: Label = game_menu.find_child("PauseTitleLabel", true, false) as Label
+        pause_menu_coop_panel = _build_pause_menu_coop_panel(resume_button, title_label)
+        var pause_parent: Node = pause_container.get_parent()
+        if pause_parent == null:
+            return
+        pause_parent.add_child(pause_menu_coop_panel)
+
+    _sync_inputs_from_config()
+    _refresh_pause_menu_coop_status()
+
+
+func _is_pause_menu_coop_panel_open() -> bool:
+    return is_instance_valid(pause_menu_coop_panel) and pause_menu_coop_panel.visible
+
+
+func _open_pause_menu_coop_panel() -> void:
+    _ensure_pause_menu_coop_ui()
+    if not is_instance_valid(pause_menu_coop_panel):
+        return
+    _sync_inputs_from_config()
+    _refresh_pause_menu_coop_status()
+    if is_instance_valid(pause_menu_container):
+        pause_menu_container.visible = false
+    pause_menu_coop_panel.visible = true
+    if pause_menu_coop_address_input != null:
+        pause_menu_coop_address_input.grab_focus()
+        pause_menu_coop_address_input.caret_column = pause_menu_coop_address_input.text.length()
+
+
+func _close_pause_menu_coop_panel() -> void:
+    _apply_ui_to_config()
+    if is_instance_valid(pause_menu_coop_panel):
+        pause_menu_coop_panel.visible = false
+    if is_instance_valid(pause_menu_container):
+        pause_menu_container.visible = true
+    get_viewport().gui_release_focus()
+
+
+func _refresh_pause_menu_coop_status() -> void:
+    if pause_menu_coop_status_label == null:
+        return
+
+    var mode: String = "offline"
+    if _has_live_peer():
+        mode = "host" if multiplayer.is_server() else "client"
+
+    var steam_status: String = "ready" if _can_use_steam_sessions() else "unavailable"
+    if active_steam_lobby_id > 0:
+        steam_status = "lobby %s" % active_steam_lobby_id
+
+    pause_menu_coop_status_label.text = "%s\nMode: %s  |  Transport: %s\nSteam: %s  |  LAN: %s" % [
+        status_message,
+        mode,
+        active_session_transport,
+        steam_status,
+        _get_best_local_ipv4(),
+    ]
+
+
+func _sync_pause_menu_coop_panel_visibility() -> void:
+    if not _is_pause_menu_coop_panel_open():
+        return
+    if pause_menu_owner == null or not is_instance_valid(pause_menu_owner) or not pause_menu_owner.visible:
+        _close_pause_menu_coop_panel()
+        return
+    if is_instance_valid(Ref.game_menu) and int(Ref.game_menu.state) != 4:
+        _close_pause_menu_coop_panel()
 
 
 func _install_game_menu_quit_hook() -> void:
@@ -346,6 +1055,13 @@ func _input(event: InputEvent) -> void:
     if Ref.command_chat_manager != null and Ref.command_chat_manager.has_method("is_command_chat_open") and Ref.command_chat_manager.is_command_chat_open():
         return
 
+    if _is_pause_menu_coop_panel_open():
+        match event.keycode:
+            KEY_ESCAPE:
+                _close_pause_menu_coop_panel()
+                get_viewport().set_input_as_handled()
+        return
+
     if char_select_overlay != null and char_select_overlay.visible:
         match event.keycode:
             KEY_ESCAPE:
@@ -361,8 +1077,6 @@ func _input(event: InputEvent) -> void:
         return
 
     match event.keycode:
-        KEY_F5:
-            toggle_panel()
         KEY_ESCAPE:
             if panel_visible:
                 toggle_panel(false)
@@ -404,10 +1118,14 @@ func _unregister_root_runtime_node(node: Node) -> void:
 
 func _on_root_child_entered(node: Node) -> void:
     _register_root_runtime_node(node)
+    if node is Control:
+        call_deferred("_ensure_pause_menu_coop_ui")
 
 
 func _on_root_child_exiting(node: Node) -> void:
     _unregister_root_runtime_node(node)
+    if node == pause_menu_owner:
+        _clear_pause_menu_coop_ui()
 
 
 func _get_live_tracked_entities() -> Array:
@@ -471,6 +1189,7 @@ func _enforce_host_background_frame_rate() -> void:
 
 func _physics_process(delta: float) -> void:
     _enforce_coop_pause_override()
+    _sync_pause_menu_coop_panel_visibility()
     _enforce_host_background_frame_rate()
     _refresh_world_authority_mode()
     _refresh_host_entity_activity_override(delta)
@@ -652,19 +1371,11 @@ func host_session() -> void:
         _update_status_text()
         return
 
-    local_quit_in_progress = false
-    local_fake_death_save_override.clear()
-    local_fake_death_respawn_target_valid = false
-    clear_fake_death_override_after_shutdown = false
-    _clear_local_downed_state()
-    guest_persistent_ready = true
-    last_host_contact_time = Time.get_ticks_msec()
-    autosave_timer = 0.0
-    deferred_host_autosave_pending = false
-    client_state_heartbeat_timer = 0.0
-    last_sent_client_state_hash = 0
-    host_rehost_pending = false
-    host_rehost_port = int(config.get("port", DEFAULT_PORT))
+    pending_steam_action = ""
+    pending_steam_open_invite_dialog = false
+    reconnect_steam_lobby_id = 0
+    reconnect_steam_host_id = 0
+    _prepare_session_start_state(true)
     _apply_ui_to_config()
     disconnect_session(false)
 
@@ -678,6 +1389,7 @@ func host_session() -> void:
 
     multiplayer.multiplayer_peer = peer
     peer_states.clear()
+    active_session_transport = SESSION_TRANSPORT_LAN
     _install_player_death_hook()
     status_message = "Hosting on port %s" % int(config.get("port", DEFAULT_PORT))
     print("[lucid-blocks-coop] %s" % status_message)
@@ -685,18 +1397,11 @@ func host_session() -> void:
 
 
 func join_session() -> void:
-    local_quit_in_progress = false
-    local_fake_death_save_override.clear()
-    local_fake_death_respawn_target_valid = false
-    clear_fake_death_override_after_shutdown = false
-    _clear_local_downed_state()
-    guest_persistent_ready = false
-    last_host_contact_time = 0
-    autosave_timer = 0.0
-    deferred_host_autosave_pending = false
-    client_state_heartbeat_timer = 0.0
-    last_sent_client_state_hash = 0
-    host_rehost_pending = false
+    pending_steam_action = ""
+    pending_steam_open_invite_dialog = false
+    reconnect_steam_lobby_id = 0
+    reconnect_steam_host_id = 0
+    _prepare_session_start_state(false)
     _apply_ui_to_config()
     disconnect_session(false)
 
@@ -716,6 +1421,7 @@ func join_session() -> void:
 
     multiplayer.multiplayer_peer = peer
     peer_states.clear()
+    active_session_transport = SESSION_TRANSPORT_LAN
     _install_player_death_hook()
     status_message = "Joining %s:%s" % [address, port]
     print("[lucid-blocks-coop] %s" % status_message)
@@ -760,6 +1466,7 @@ func disconnect_session(announce: bool = true) -> void:
             Ref.player.invincible_temporary = false
     if multiplayer.multiplayer_peer != null:
         multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+    _clear_active_steam_session_state()
     _refresh_world_runtime_mode()
 
     peer_states.clear()
@@ -814,6 +1521,8 @@ func leave_session() -> void:
     reconnect_attempt_count = 0
     reconnect_retry_timer = 0.0
     reconnect_reason = ""
+    reconnect_steam_lobby_id = 0
+    reconnect_steam_host_id = 0
     host_rehost_pending = false
     _set_reconnect_overlay_visible(false)
     _close_pause_menu_if_open()
@@ -1662,6 +2371,16 @@ func execute_command(raw_text: String) -> void:
                 config["port"] = clampi(int(parts[2]), 1, 65535)
             _sync_inputs_from_config()
             join_session()
+        "/steam_host", "/steam-host":
+            host_steam_session()
+        "/steam_invite", "/steam-invite", "/invite":
+            _open_steam_invite_dialog()
+        "/steam_join", "/steam-join":
+            if parts.size() < 2 or not parts[1].is_valid_int():
+                status_message = "Usage: /steam_join <lobby_id>"
+                _update_status_text()
+            else:
+                _join_steam_lobby_by_id(int(parts[1]), true)
         "/avatar":
             if parts.size() < 2:
                 status_message = "Usage: /avatar <id>"
@@ -2084,6 +2803,9 @@ func _get_root_command_autocomplete_entries(query: String) -> Array:
     var commands: Array = [
         {"command": "/host", "hint": "Host a LAN session"},
         {"command": "/join", "hint": "Join `ip [port]`"},
+        {"command": "/steam_host", "hint": "Host through Steam"},
+        {"command": "/steam_invite", "hint": "Open Steam invite dialog"},
+        {"command": "/steam_join", "hint": "Join `lobby_id` through Steam"},
         {"command": "/tp", "hint": "Teleport to a connected player"},
         {"command": "/gamemode", "hint": "Session-only creative or survival"},
         {"command": "/spawn", "hint": "Spawn a mob for testing"},
@@ -6808,7 +7530,7 @@ func _build_hud() -> void:
     panel_column.add_child(title_row)
 
     var title: Label = Label.new()
-    title.text = "Co-op LAN"
+    title.text = "Co-op"
     title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
     title.add_theme_font_size_override("font_size", 13)
     title_row.add_child(title)
@@ -6887,8 +7609,26 @@ func _build_hud() -> void:
     disconnect_button.pressed.connect(leave_session)
     button_row.add_child(disconnect_button)
 
+    var steam_button_row: HBoxContainer = HBoxContainer.new()
+    steam_button_row.add_theme_constant_override("separation", 6)
+    panel_column.add_child(steam_button_row)
+
+    var steam_host_button: Button = Button.new()
+    steam_host_button.text = "Host Steam"
+    steam_host_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    steam_host_button.add_theme_font_size_override("font_size", 10)
+    steam_host_button.pressed.connect(host_steam_session)
+    steam_button_row.add_child(steam_host_button)
+
+    var steam_invite_button: Button = Button.new()
+    steam_invite_button.text = "Invite"
+    steam_invite_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    steam_invite_button.add_theme_font_size_override("font_size", 10)
+    steam_invite_button.pressed.connect(_open_steam_invite_dialog)
+    steam_button_row.add_child(steam_invite_button)
+
     var chat_hint_label: Label = Label.new()
-    chat_hint_label.text = "Slash chat: `/`  |  Spawn browser: `F10`"
+    chat_hint_label.text = "Steam invites auto-join. Slash chat: `/`  |  Spawn browser: `F10`"
     chat_hint_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
     chat_hint_label.add_theme_font_size_override("font_size", 9)
     panel_column.add_child(chat_hint_label)
@@ -7277,7 +8017,10 @@ func _refresh_local_ip_label() -> void:
         return
 
     var best_ip: String = _get_best_local_ipv4()
-    local_ip_label.text = "LAN: %s" % best_ip
+    var steam_status: String = "ready" if _can_use_steam_sessions() else "unavailable"
+    if active_steam_lobby_id > 0:
+        steam_status = "lobby %s" % active_steam_lobby_id
+    local_ip_label.text = "LAN: %s\nSteam: %s" % [best_ip, steam_status]
 
 
 func _get_best_local_ipv4() -> String:
@@ -7320,16 +8063,26 @@ func _sync_inputs_from_config() -> void:
         address_input.text = str(config.get("address", "127.0.0.1"))
     if port_input != null:
         port_input.value = int(config.get("port", DEFAULT_PORT))
+    if pause_menu_coop_address_input != null:
+        pause_menu_coop_address_input.text = str(config.get("address", "127.0.0.1"))
+    if pause_menu_coop_port_input != null:
+        pause_menu_coop_port_input.value = int(config.get("port", DEFAULT_PORT))
 
 
 func _apply_ui_to_config() -> void:
     var normalized_address: String = str(config.get("address", "127.0.0.1"))
     var normalized_port: int = int(config.get("port", DEFAULT_PORT))
 
-    if address_input != null:
+    if pause_menu_coop_address_input != null and _is_pause_menu_coop_panel_open():
+        var pause_address: String = pause_menu_coop_address_input.text.strip_edges()
+        normalized_address = pause_address if pause_address != "" else "127.0.0.1"
+    elif address_input != null:
         var address: String = address_input.text.strip_edges()
         normalized_address = address if address != "" else "127.0.0.1"
-    if port_input != null:
+
+    if pause_menu_coop_port_input != null and _is_pause_menu_coop_panel_open():
+        normalized_port = clampi(int(pause_menu_coop_port_input.value), 1, 65535)
+    elif port_input != null:
         normalized_port = clampi(int(port_input.value), 1, 65535)
 
     config["address"] = normalized_address
@@ -7340,6 +8093,10 @@ func _apply_ui_to_config() -> void:
         address_input.text = normalized_address
     if port_input != null and int(port_input.value) != normalized_port:
         port_input.value = normalized_port
+    if pause_menu_coop_address_input != null and pause_menu_coop_address_input.text != normalized_address:
+        pause_menu_coop_address_input.text = normalized_address
+    if pause_menu_coop_port_input != null and int(pause_menu_coop_port_input.value) != normalized_port:
+        pause_menu_coop_port_input.value = normalized_port
 
 
 func _on_address_changed(_new_text: String) -> void:
@@ -7451,19 +8208,23 @@ func _on_spawn_browser_item_activated(_index: int) -> void:
 
 
 func _update_status_text() -> void:
+    _refresh_local_ip_label()
+    _refresh_pause_menu_coop_status()
     if status_label == null:
         return
 
     var mode: String = "offline"
+    var transport: String = SESSION_TRANSPORT_LAN
     if _has_live_peer():
         mode = "host" if multiplayer.is_server() else "client"
+        transport = active_session_transport
 
     var peers: int = peer_states.size()
     if peer_states.has(multiplayer.get_unique_id()):
         peers -= 1
     peers = max(peers, 0)
 
-    status_label.text = "%s\nMode: %s  |  Peers: %s" % [status_message, mode, peers]
+    status_label.text = "%s\nMode: %s  |  Transport: %s  |  Peers: %s" % [status_message, mode, transport, peers]
 
 
 
@@ -7613,6 +8374,7 @@ func _on_local_world_loaded() -> void:
     _set_single_player_shutdown_world_pause_override(false)
     _install_player_death_hook()
     _migrate_loaded_legacy_pocket_to_local_owner_if_needed()
+    call_deferred("_ensure_pause_menu_coop_ui")
     if not host_rehost_pending:
         return
     _resume_host_session_after_world_load.call_deferred()
@@ -7671,6 +8433,12 @@ func _begin_reconnect_flow(reason: String) -> void:
         return
 
     var interrupted_world_restore: bool = receiving_host_world or client_restore_in_progress
+    if active_session_transport == SESSION_TRANSPORT_STEAM:
+        reconnect_steam_lobby_id = active_steam_lobby_id
+        reconnect_steam_host_id = active_steam_host_id
+    else:
+        reconnect_steam_lobby_id = 0
+        reconnect_steam_host_id = 0
     _close_pause_menu_if_open()
     disconnect_session(false)
     reconnect_pending = true
@@ -7719,6 +8487,45 @@ func _attempt_reconnect() -> void:
     last_host_contact_time = 0
     client_state_heartbeat_timer = 0.0
     last_sent_client_state_hash = 0
+
+    if reconnect_steam_host_id > 0 or reconnect_steam_lobby_id > 0:
+        var steam_peer := _create_steam_multiplayer_peer()
+        if steam_peer == null:
+            status_message = "Reconnect failed (Steam unavailable)"
+            _update_status_text()
+            _set_reconnect_overlay_visible(true)
+            return
+
+        var steam_err: Error = ERR_UNAVAILABLE
+        if reconnect_steam_host_id > 0 and steam_peer.has_method("create_client"):
+            steam_err = steam_peer.call("create_client", reconnect_steam_host_id, 0)
+        elif reconnect_steam_lobby_id > 0 and steam_peer.has_method("connect_to_lobby"):
+            steam_err = steam_peer.call("connect_to_lobby", reconnect_steam_lobby_id)
+        elif reconnect_steam_lobby_id > 0:
+            pending_steam_action = "join"
+            pending_steam_lobby_id = reconnect_steam_lobby_id
+            pending_steam_open_invite_dialog = false
+            status_message = "Reconnecting through Steam..."
+            _update_status_text()
+            _steam_call_alias(["joinLobby", "join_lobby"], [reconnect_steam_lobby_id])
+            _set_reconnect_overlay_visible(true)
+            return
+
+        if steam_err != OK:
+            status_message = "Reconnect failed (%s)" % steam_err
+            _update_status_text()
+            _set_reconnect_overlay_visible(true)
+            return
+
+        multiplayer.multiplayer_peer = steam_peer
+        peer_states.clear()
+        active_session_transport = SESSION_TRANSPORT_STEAM
+        active_steam_lobby_id = reconnect_steam_lobby_id
+        active_steam_host_id = reconnect_steam_host_id
+        status_message = "Reconnecting through Steam..."
+        _update_status_text()
+        _set_reconnect_overlay_visible(true)
+        return
 
     var address: String = str(config.get("address", "127.0.0.1")).strip_edges()
     var port: int = int(config.get("port", DEFAULT_PORT))
