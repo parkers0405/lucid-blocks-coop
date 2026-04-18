@@ -25,6 +25,30 @@ const SPRINT_CAMERA_BOB_FREQUENCY: float = 13.0
 const SPRINT_CAMERA_BOB_X: float = 0.018
 const SPRINT_CAMERA_BOB_Y: float = 0.028
 const SPRINT_CAMERA_BOB_ROLL_DEG: float = 1.35
+const CAMERA_MODE_FIRST_PERSON: int = 0
+const CAMERA_MODE_THIRD_PERSON_BACK: int = 1
+const CAMERA_MODE_THIRD_PERSON_FRONT: int = 2
+const THIRD_PERSON_BACK_DISTANCE: float = 3.2
+const THIRD_PERSON_FRONT_DISTANCE: float = 2.4
+const THIRD_PERSON_CAMERA_COLLISION_MARGIN: float = 0.12
+const FIRST_PERSON_ZOOM_FOV_RATIO: float = 0.32
+const FIRST_PERSON_ZOOM_IN_TIME: float = 0.11
+const FIRST_PERSON_ZOOM_OUT_TIME: float = 0.15
+const FIRST_PERSON_ZOOM_SENSITIVITY_SCALE: float = 0.42
+const CAMERA_OVERHAUL_STRAFE_ROLL_DEG: float = 4.8
+const CAMERA_OVERHAUL_FORWARD_PITCH_DEG: float = 2.4
+const CAMERA_OVERHAUL_VERTICAL_PITCH_DEG: float = 1.7
+const CAMERA_OVERHAUL_TURN_ROLL_INTENSITY_DEG: float = 3.0
+const CAMERA_OVERHAUL_TURN_ROLL_ACCUMULATION: float = 1.35
+const CAMERA_OVERHAUL_TURN_ROLL_DECAY: float = 9.0
+const CAMERA_OVERHAUL_HORIZONTAL_SMOOTHING: float = 8.0
+const CAMERA_OVERHAUL_VERTICAL_SMOOTHING: float = 10.0
+const CAMERA_OVERHAUL_IDLE_SWAY_PITCH_DEG: float = 0.2
+const CAMERA_OVERHAUL_IDLE_SWAY_ROLL_DEG: float = 0.35
+const CAMERA_OVERHAUL_IDLE_SWAY_DELAY_SEC: float = 0.2
+const CAMERA_OVERHAUL_IDLE_SWAY_FADE_IN_SEC: float = 2.4
+const CAMERA_OVERHAUL_IDLE_SWAY_FADE_OUT_SEC: float = 0.35
+const CAMERA_OVERHAUL_ZOOM_INTENSITY_SCALE: float = 0.6
 
 
 var sprint_toggle: bool = false
@@ -37,6 +61,7 @@ var might_double_jump: bool = false
 var mouse_sensitivity: float = 0.01
 var fov: float = 86
 var controller_camera_sensitivity: float = 1.0
+var show_hand_setting: bool = true
 
 
 var consumed_actions: Array[String] = []
@@ -78,6 +103,17 @@ var last_forward_press_msec: int = 0
 var double_tap_sprint_requested: bool = false
 var sprint_camera_bob_phase: float = 0.0
 var sprint_camera_bob_weight: float = 0.0
+var camera_mode: int = CAMERA_MODE_FIRST_PERSON
+var local_avatar_marker: Node3D = null
+var first_person_zoom_amount: float = 0.0
+var camera_overhaul_prev_yaw: float = 0.0
+var camera_overhaul_prev_pitch: float = 0.0
+var camera_overhaul_forward_pitch_offset: float = 0.0
+var camera_overhaul_vertical_pitch_offset: float = 0.0
+var camera_overhaul_strafe_roll_offset: float = 0.0
+var camera_overhaul_turn_roll_target: float = 0.0
+var camera_overhaul_idle_sway_weight: float = 0.0
+var camera_overhaul_last_action_time_sec: float = 0.0
 
 signal structure_changed(new_structure: Structure)
 signal can_interact_with_block_changed(value: bool)
@@ -111,6 +147,9 @@ func _ready() -> void :
 
     Ref.main.new_game_loaded.connect(_on_new_game)
     camera_pitch = %Camera3D.rotation.x
+    _reset_camera_overhaul_state()
+    _apply_camera_mode_visuals()
+    call_deferred("_ensure_local_avatar_marker")
     call_deferred("_apply_avatar_sound_overrides")
     call_deferred("_apply_avatar_hand_color")
     print("Player ready.")
@@ -217,6 +256,260 @@ func _set_camera_pitch(new_pitch: float) -> void:
     %Camera3D.rotation.x = camera_pitch
 
 
+func _is_third_person_camera_mode() -> bool:
+    return camera_mode != CAMERA_MODE_FIRST_PERSON
+
+
+func _is_first_person_camera_mode() -> bool:
+    return camera_mode == CAMERA_MODE_FIRST_PERSON
+
+
+func _get_camera_mode_label() -> String:
+    match camera_mode:
+        CAMERA_MODE_THIRD_PERSON_BACK:
+            return "Third Person Back"
+        CAMERA_MODE_THIRD_PERSON_FRONT:
+            return "Third Person Front"
+        _:
+            return "First Person"
+
+
+func _apply_camera_mode_visuals() -> void:
+    if not is_node_ready():
+        return
+
+    var show_first_person_visuals: bool = not _is_third_person_camera_mode()
+    %PlayerHand.visible = show_hand_setting and show_first_person_visuals
+
+    var arm: Node3D = get_node_or_null("%Arm") as Node3D
+    if arm != null:
+        arm.visible = show_first_person_visuals
+
+    _sync_held_item_visibility()
+
+
+func _sync_held_item_visibility() -> void:
+    if is_instance_valid(held_item):
+        held_item.visible = _is_third_person_camera_mode()
+
+
+func _cycle_camera_mode() -> void:
+    camera_mode = (camera_mode + 1) % 3
+    if not _is_first_person_camera_mode():
+        first_person_zoom_amount = 0.0
+    _reset_camera_overhaul_state()
+    _apply_camera_mode_visuals()
+    print("Camera mode: %s" % _get_camera_mode_label())
+
+
+func _ensure_local_avatar_marker() -> void:
+    if is_instance_valid(local_avatar_marker):
+        return
+
+    var marker_script = load("res://coop_mod/remote_player_marker.gd")
+    if not (marker_script is GDScript):
+        return
+
+    local_avatar_marker = marker_script.new()
+    local_avatar_marker.name = "LocalAvatarMarker"
+    add_child(local_avatar_marker)
+
+    if local_avatar_marker.has_method("setup"):
+        local_avatar_marker.call("setup", multiplayer.get_unique_id())
+    if local_avatar_marker.has_method("set_avatar_sounds_enabled"):
+        local_avatar_marker.call("set_avatar_sounds_enabled", false)
+    if local_avatar_marker.has_method("set_label_enabled"):
+        local_avatar_marker.call_deferred("set_label_enabled", false)
+
+
+func _get_local_avatar_id_for_marker() -> String:
+    var coop_manager: Node = _get_coop_manager()
+    if coop_manager != null and coop_manager.has_method("get_local_avatar_id"):
+        return str(coop_manager.call("get_local_avatar_id"))
+    return "default_blocky"
+
+
+func _get_local_skin_color_for_marker() -> Color:
+    if Ref.save_file_manager == null or Ref.save_file_manager.settings_file == null:
+        return Color.WHITE
+    return Ref.save_file_manager.settings_file.get_data("skin_modulate", Color.WHITE)
+
+
+func _get_local_action_state() -> int:
+    if %PlayerHand.current_hand == null:
+        return 0
+    return int(%PlayerHand.current_hand.state)
+
+
+func _sync_local_avatar_marker() -> void:
+    _ensure_local_avatar_marker()
+    if not is_instance_valid(local_avatar_marker):
+        return
+
+    if local_avatar_marker.has_method("set_display_name"):
+        local_avatar_marker.call("set_display_name", "")
+    if local_avatar_marker.has_method("set_avatar_id"):
+        local_avatar_marker.call("set_avatar_id", _get_local_avatar_id_for_marker())
+    if local_avatar_marker.has_method("set_skin_color"):
+        local_avatar_marker.call("set_skin_color", _get_local_skin_color_for_marker())
+    if local_avatar_marker.has_method("set_held_item_id"):
+        var held_item_id: int = held_item.item.id if is_instance_valid(held_item) and held_item.item != null else -1
+        local_avatar_marker.call("set_held_item_id", held_item_id)
+    if local_avatar_marker.has_method("apply_state"):
+        local_avatar_marker.call(
+            "apply_state",
+            not dead and _is_third_person_camera_mode(),
+            global_position,
+            %RotationPivot.rotation.y,
+            camera_pitch,
+            is_crouching,
+            is_on_floor(),
+            Vector3(velocity.x, 0.0, velocity.z).length(),
+            _get_local_action_state()
+        )
+
+
+func _resolve_camera_world_position(pivot_position: Vector3) -> Vector3:
+    if camera_mode == CAMERA_MODE_FIRST_PERSON or not is_inside_tree() or get_world_3d() == null:
+        return pivot_position
+
+    var desired_distance: float = THIRD_PERSON_BACK_DISTANCE if camera_mode == CAMERA_MODE_THIRD_PERSON_BACK else THIRD_PERSON_FRONT_DISTANCE
+    var camera_forward: Vector3 = -%Camera3D.global_transform.basis.z.normalized()
+    var desired_position: Vector3 = pivot_position - camera_forward * desired_distance
+
+    var exclude: Array = [get_rid()]
+    var interact_area: CollisionObject3D = get_node_or_null("%InteractArea3D") as CollisionObject3D
+    if interact_area != null:
+        exclude.append(interact_area.get_rid())
+
+    var query := PhysicsRayQueryParameters3D.create(pivot_position, desired_position)
+    query.exclude = exclude
+    query.collide_with_areas = false
+
+    var hit: Dictionary = get_world_3d().direct_space_state.intersect_ray(query)
+    if hit.is_empty():
+        return desired_position
+
+    var resolved_position: Vector3 = hit.position + (pivot_position - desired_position).normalized() * THIRD_PERSON_CAMERA_COLLISION_MARGIN
+    if pivot_position.distance_to(resolved_position) <= THIRD_PERSON_CAMERA_COLLISION_MARGIN:
+        return pivot_position
+    return resolved_position
+
+
+func _is_first_person_zoom_requested() -> bool:
+    return movement_enabled and MouseHandler.fully_captured and _is_first_person_camera_mode() and Input.is_key_pressed(KEY_C)
+
+
+func _reset_camera_overhaul_state() -> void:
+    camera_overhaul_prev_yaw = %RotationPivot.rotation.y if is_node_ready() else 0.0
+    camera_overhaul_prev_pitch = camera_pitch
+    camera_overhaul_forward_pitch_offset = 0.0
+    camera_overhaul_vertical_pitch_offset = 0.0
+    camera_overhaul_strafe_roll_offset = 0.0
+    camera_overhaul_turn_roll_target = 0.0
+    camera_overhaul_idle_sway_weight = 0.0
+    camera_overhaul_last_action_time_sec = Time.get_ticks_msec() / 1000.0
+
+
+func _get_first_person_zoom_weight() -> float:
+    return ease(first_person_zoom_amount, -2.0)
+
+
+func _get_camera_overhaul_blend(speed: float, delta: float) -> float:
+    return clampf(1.0 - exp(-speed * delta), 0.0, 1.0)
+
+
+func _get_camera_overhaul_turn_eased(x: float) -> float:
+    return 4.0 * x * x * x if x < 0.5 else 1.0 - pow(-2.0 * x + 2.0, 3.0) / 2.0
+
+
+func _get_first_person_camera_overhaul_rotation(delta: float) -> Vector3:
+    if not _is_first_person_camera_mode():
+        camera_overhaul_prev_yaw = %RotationPivot.rotation.y
+        camera_overhaul_prev_pitch = camera_pitch
+        return Vector3.ZERO
+
+    var basis: Basis = %RotationPivot.global_transform.basis
+    var right: Vector3 = basis.x.normalized()
+    var forward: Vector3 = (-basis.z).normalized()
+    var forward_velocity: float = velocity.dot(forward)
+    var strafe_velocity: float = velocity.dot(right)
+    var speed_base: float = maxf(speed * GROUND_SPRINT_SPEED_MULTIPLIER, 0.001)
+    var yaw_delta: float = angle_difference(camera_overhaul_prev_yaw, %RotationPivot.rotation.y)
+    var pitch_delta: float = camera_pitch - camera_overhaul_prev_pitch
+    var now_sec: float = Time.get_ticks_msec() / 1000.0
+
+    var is_player_active: bool = Vector3(velocity.x, 0.0, velocity.z).length() > 0.03 \
+        or absf(velocity.y) > 0.03 \
+        or absf(yaw_delta) > 0.0005 \
+        or absf(pitch_delta) > 0.0005 \
+        or _is_first_person_zoom_requested() \
+        or Input.is_action_pressed("attack") \
+        or Input.is_action_pressed("interact")
+    if is_player_active:
+        camera_overhaul_last_action_time_sec = now_sec
+
+    var horizontal_blend: float = _get_camera_overhaul_blend(CAMERA_OVERHAUL_HORIZONTAL_SMOOTHING, delta)
+    var vertical_blend: float = _get_camera_overhaul_blend(CAMERA_OVERHAUL_VERTICAL_SMOOTHING, delta)
+    var normalized_forward_velocity: float = clampf(forward_velocity / speed_base, -1.4, 1.4)
+    var normalized_strafe_velocity: float = clampf(strafe_velocity / speed_base, -1.4, 1.4)
+    var normalized_vertical_velocity: float = clampf(velocity.y / maxf(jump_impulse * 1.25, 0.001), -2.0, 2.0)
+
+    camera_overhaul_forward_pitch_offset = lerpf(
+        camera_overhaul_forward_pitch_offset,
+        deg_to_rad(normalized_forward_velocity * CAMERA_OVERHAUL_FORWARD_PITCH_DEG),
+        horizontal_blend
+    )
+    camera_overhaul_vertical_pitch_offset = lerpf(
+        camera_overhaul_vertical_pitch_offset,
+        deg_to_rad(normalized_vertical_velocity * CAMERA_OVERHAUL_VERTICAL_PITCH_DEG),
+        vertical_blend
+    )
+    camera_overhaul_strafe_roll_offset = lerpf(
+        camera_overhaul_strafe_roll_offset,
+        deg_to_rad(-normalized_strafe_velocity * CAMERA_OVERHAUL_STRAFE_ROLL_DEG),
+        horizontal_blend
+    )
+
+    camera_overhaul_turn_roll_target = lerpf(
+        camera_overhaul_turn_roll_target,
+        0.0,
+        clampf(delta * CAMERA_OVERHAUL_TURN_ROLL_DECAY, 0.0, 1.0)
+    )
+    camera_overhaul_turn_roll_target = clampf(
+        camera_overhaul_turn_roll_target + yaw_delta * CAMERA_OVERHAUL_TURN_ROLL_ACCUMULATION,
+        -1.0,
+        1.0
+    )
+
+    var idle_target: float = 1.0 if (now_sec - camera_overhaul_last_action_time_sec) >= CAMERA_OVERHAUL_IDLE_SWAY_DELAY_SEC else 0.0
+    var idle_fade_time: float = CAMERA_OVERHAUL_IDLE_SWAY_FADE_IN_SEC if idle_target > camera_overhaul_idle_sway_weight else CAMERA_OVERHAUL_IDLE_SWAY_FADE_OUT_SEC
+    camera_overhaul_idle_sway_weight = move_toward(camera_overhaul_idle_sway_weight, idle_target, delta / maxf(idle_fade_time, 0.001))
+    var idle_sway_strength: float = pow(camera_overhaul_idle_sway_weight, 3.0)
+    var sway_pitch: float = deg_to_rad((sin(now_sec * 0.77) + sin(now_sec * 1.19 + 1.7)) * 0.5 * CAMERA_OVERHAUL_IDLE_SWAY_PITCH_DEG * idle_sway_strength)
+    var sway_roll: float = deg_to_rad((sin(now_sec * 0.71 + 0.8) + cos(now_sec * 0.97 + 2.1)) * 0.5 * CAMERA_OVERHAUL_IDLE_SWAY_ROLL_DEG * idle_sway_strength)
+
+    var turn_roll_strength: float = _get_camera_overhaul_turn_eased(absf(camera_overhaul_turn_roll_target))
+    var turn_roll_sign: float = 0.0 if is_zero_approx(camera_overhaul_turn_roll_target) else (1.0 if camera_overhaul_turn_roll_target > 0.0 else -1.0)
+    var turn_roll: float = deg_to_rad(CAMERA_OVERHAUL_TURN_ROLL_INTENSITY_DEG * turn_roll_strength * turn_roll_sign)
+    var zoom_intensity_scale: float = lerpf(1.0, CAMERA_OVERHAUL_ZOOM_INTENSITY_SCALE, _get_first_person_zoom_weight())
+
+    camera_overhaul_prev_yaw = %RotationPivot.rotation.y
+    camera_overhaul_prev_pitch = camera_pitch
+
+    return Vector3(
+        (camera_overhaul_forward_pitch_offset + camera_overhaul_vertical_pitch_offset + sway_pitch) * zoom_intensity_scale,
+        0.0,
+        (camera_overhaul_strafe_roll_offset + turn_roll + sway_roll) * zoom_intensity_scale
+    )
+
+
+func _get_camera_look_sensitivity_scale() -> float:
+    if not _is_first_person_camera_mode():
+        return 1.0
+    return lerpf(1.0, FIRST_PERSON_ZOOM_SENSITIVITY_SCALE, _get_first_person_zoom_weight())
+
+
 func _on_settings_updated() -> void :
     fov = int(Ref.save_file_manager.settings_file.get_data("fov", 86))
     sprint_toggle = Ref.save_file_manager.settings_file.get_data("sprint_toggle", false)
@@ -227,7 +520,8 @@ func _on_settings_updated() -> void :
     controller_camera_sensitivity = 0.25 + 1.75 * Ref.save_file_manager.settings_file.get_data("controller_camera_sensitivity", 14) / 14.0
 
     %Camera3D.shake_enabled = Ref.save_file_manager.settings_file.get_data("screen_shake", true)
-    %PlayerHand.visible = Ref.save_file_manager.settings_file.get_data("show_hand", true)
+    show_hand_setting = Ref.save_file_manager.settings_file.get_data("show_hand", true)
+    _apply_camera_mode_visuals()
 
     hand.position.x = abs(hand.position.x) * (-1.0 if left_handed else 1.0)
 
@@ -319,6 +613,7 @@ func _sync_player_hand_visual() -> void:
     if player_hand == null:
         return
     player_hand.switch_item(held_item, _get_selected_hotbar_item_state())
+    _sync_held_item_visibility()
 
 
 func _on_held_item_index_changed() -> void :
@@ -353,12 +648,14 @@ func _process(delta: float) -> void :
     var local_movement_enabled: bool = movement_enabled and MouseHandler.fully_captured
     var joy_input: Vector2 = Input.get_vector("camera_left", "camera_right", "camera_up", "camera_down")
     if local_movement_enabled and is_processing_input() and joy_input != Vector2.ZERO:
-        %RotationPivot.rotate_y( - joy_input.x * controller_camera_sensitivity * delta)
+        var look_sensitivity_scale: float = _get_camera_look_sensitivity_scale()
+        %RotationPivot.rotate_y( - joy_input.x * controller_camera_sensitivity * look_sensitivity_scale * delta)
         var y_direction: float = -1.0 if not invert_mouse_y else 1.0
-        _set_camera_pitch(camera_pitch + y_direction * joy_input.y * controller_camera_sensitivity * delta)
+        _set_camera_pitch(camera_pitch + y_direction * joy_input.y * controller_camera_sensitivity * look_sensitivity_scale * delta)
 
     check_water()
     camera_process(delta)
+    _sync_local_avatar_marker()
     update_walk_animation()
 
 
@@ -489,11 +786,19 @@ func _input(event: InputEvent) -> void :
     if local_movement_enabled and is_instance_valid(held_item) and event.is_action_pressed("drop_item", false):
         %DropItems.drop_and_remove_from_inventory( %Hotbar, held_item_index)
 
+    if local_movement_enabled and event is InputEventKey:
+        var key_event := event as InputEventKey
+        if key_event.pressed and not key_event.echo and key_event.keycode == KEY_V:
+            _cycle_camera_mode()
+            get_viewport().set_input_as_handled()
+            return
+
     if event is InputEventMouseMotion and local_movement_enabled:
-        %RotationPivot.rotate_y( - event.relative.x * mouse_sensitivity)
+        var look_sensitivity_scale: float = _get_camera_look_sensitivity_scale()
+        %RotationPivot.rotate_y( - event.relative.x * mouse_sensitivity * look_sensitivity_scale)
 
         var y_direction: float = -1.0 if not invert_mouse_y else 1.0
-        _set_camera_pitch(camera_pitch + y_direction * event.relative.y * mouse_sensitivity)
+        _set_camera_pitch(camera_pitch + y_direction * event.relative.y * mouse_sensitivity * look_sensitivity_scale)
 
     if sprint_toggle and event.is_action_pressed("sprint", false):
         is_sprinting_requested = not is_sprinting_requested
@@ -541,6 +846,8 @@ func initialize() -> void :
     glider_speed_modifier = 1.0
     sprint_camera_bob_phase = 0.0
     sprint_camera_bob_weight = 0.0
+    first_person_zoom_amount = 0.0
+    _reset_camera_overhaul_state()
     first_frame = true
     current_biome = null
     push_bodies.clear()
@@ -548,7 +855,10 @@ func initialize() -> void :
 
 
 func _on_new_game() -> void :
-    %PlayerHand.visible = Ref.save_file_manager.settings_file.get_data("show_hand", true)
+    show_hand_setting = Ref.save_file_manager.settings_file.get_data("show_hand", true)
+    first_person_zoom_amount = 0.0
+    _reset_camera_overhaul_state()
+    _apply_camera_mode_visuals()
     %HarmCover.visible = true
     health = 10
     max_health = 10
@@ -569,6 +879,7 @@ func save_file(file: SaveFile) -> void :
 
     file.set_data("node/player/global_position", global_position, false)
     file.set_data("node/player/camera_angle", camera_pitch, false)
+    file.set_data("node/player/camera_mode", camera_mode, false)
     file.set_data("node/player/flying", flying, true)
 
 
@@ -576,8 +887,13 @@ func load_file(file: SaveFile) -> void :
     super.preserve_load(file, "player")
 
     _set_camera_pitch(file.get_data("node/player/camera_angle", camera_pitch, false))
+    camera_mode = int(file.get_data("node/player/camera_mode", camera_mode, false))
+    camera_mode = clampi(camera_mode, CAMERA_MODE_FIRST_PERSON, CAMERA_MODE_THIRD_PERSON_FRONT)
+    first_person_zoom_amount = 0.0
+    _reset_camera_overhaul_state()
     global_position = file.get_data("node/player/global_position", Vector3(0, 0, 0), false)
     flying = file.get_data("node/player/flying", false, true)
+    _apply_camera_mode_visuals()
 
 func die() -> void :
     if disabled or dead:
@@ -639,13 +955,22 @@ func hand_process() -> void :
 
 
 func camera_process(delta: float) -> void :
+    var zoom_requested: bool = _is_first_person_zoom_requested()
+    var zoom_target: float = 1.0 if zoom_requested else 0.0
+    var zoom_time: float = FIRST_PERSON_ZOOM_IN_TIME if zoom_requested else FIRST_PERSON_ZOOM_OUT_TIME
+    first_person_zoom_amount = move_toward(first_person_zoom_amount, zoom_target, delta / maxf(zoom_time, 0.001))
+
     if is_sprinting:
         camera_fov += delta / spring_fov_time
     else:
         camera_fov -= delta / spring_fov_time
     camera_fov = clamp(camera_fov, 0.0, 1.0)
 
-    %Camera3D.fov = lerp(fov, fov * fov_spring_scale, ease(camera_fov, -2.0))
+    var base_fov: float = lerp(fov, fov * fov_spring_scale, ease(camera_fov, -2.0))
+    if _is_first_person_camera_mode():
+        %Camera3D.fov = lerpf(base_fov, base_fov * FIRST_PERSON_ZOOM_FOV_RATIO, _get_first_person_zoom_weight())
+    else:
+        %Camera3D.fov = base_fov
 
     if is_crouching:
         camera_height += delta / crouch_time
@@ -664,15 +989,33 @@ func camera_process(delta: float) -> void :
     camera_pivot_position.x += cos(sprint_camera_bob_phase * 0.5) * SPRINT_CAMERA_BOB_X * sprint_camera_bob_weight
     camera_pivot_position.y += absf(sin(sprint_camera_bob_phase)) * SPRINT_CAMERA_BOB_Y * sprint_camera_bob_weight
     %CameraPivot.position = camera_pivot_position
+
+    var first_person_camera_overhaul_rotation: Vector3 = _get_first_person_camera_overhaul_rotation(delta)
+    var camera_roll: float = deg_to_rad(sin(sprint_camera_bob_phase * 0.5) * SPRINT_CAMERA_BOB_ROLL_DEG * sprint_camera_bob_weight)
+    var camera_x_rotation: float = camera_pitch + first_person_camera_overhaul_rotation.x
+    var camera_y_rotation: float = 0.0
+    camera_roll += first_person_camera_overhaul_rotation.z
+    if camera_mode == CAMERA_MODE_THIRD_PERSON_FRONT:
+        camera_x_rotation = -camera_pitch
+        camera_y_rotation = PI
+        camera_roll = 0.0
+    elif camera_mode == CAMERA_MODE_THIRD_PERSON_BACK:
+        camera_roll = 0.0
+
     %Camera3D.rotation = Vector3(
-        camera_pitch,
-        0.0,
-        deg_to_rad(sin(sprint_camera_bob_phase * 0.5) * SPRINT_CAMERA_BOB_ROLL_DEG * sprint_camera_bob_weight)
+        camera_x_rotation,
+        camera_y_rotation,
+        camera_roll
     )
+    %Camera3D.global_position = _resolve_camera_world_position(%CameraPivot.global_position)
 
     %Arm.position = %CameraPivot.position
-    %Arm.rotation.x = camera_pitch
-    %Arm.rotation.y = %RotationPivot.rotation.y
+    var arm_pitch: float = camera_pitch
+    var arm_roll: float = 0.0
+    if _is_first_person_camera_mode():
+        arm_pitch = camera_x_rotation
+        arm_roll = camera_roll
+    %Arm.rotation = Vector3(arm_pitch, %RotationPivot.rotation.y, arm_roll)
 
 
 
@@ -688,11 +1031,6 @@ func attack_process(data: Dictionary) -> void :
                 _play_avatar_voice("attack")
                 %PlayerHand.current_hand.hit()
             if "target" in data:
-                if Ref.coop_manager != null and not multiplayer.is_server():
-                    var target = data.target
-                    var target_name: String = target.name if target is Node else str(target)
-                    var target_uuid: String = str(target.get_meta("coop_uuid", "")) if is_instance_valid(target) else ""
-                    print("[lucid-blocks-coop][attack-debug] guest target=", target_name, " class=", target.get_class(), " uuid=", target_uuid)
                 attack_used = true
                 %WhiffPlayer.play()
                 _play_avatar_voice("attack")
@@ -700,12 +1038,8 @@ func attack_process(data: Dictionary) -> void :
                 %PlayerHand.current_hand.hit()
                 %Camera3D.camera_shake()
             elif "target_position" in data:
-                if Ref.coop_manager != null and not multiplayer.is_server():
-                    print("[lucid-blocks-coop][attack-debug] guest block target=", data.target_position, " collider=", data.get("debug_collider", "<none>"), " resolved=", data.get("debug_resolved", "<none>"))
                 pass
             else:
-                if Ref.coop_manager != null and not multiplayer.is_server():
-                    print("[lucid-blocks-coop][attack-debug] guest whiff collider=", data.get("debug_collider", "<none>"), " resolved=", data.get("debug_resolved", "<none>"))
                 %WhiffPlayer.play()
                 _play_avatar_voice("attack")
                 %PlayerHand.hit()
@@ -811,10 +1145,12 @@ func crouch_snap(delta: float) -> void :
 func update_walk_animation() -> void :
     %AnimationPlayer.speed_scale = 0.5 if is_crouching else (1.45 if is_sprinting else 1.25)
     if Vector3(velocity.x, 0, velocity.z).length() > 0.1 and not in_air:
-        if is_sprinting and %AnimationPlayer.has_animation("run"):
-            %AnimationPlayer.current_animation = "run"
-        else:
-            %AnimationPlayer.current_animation = "walk"
+        var animation_name: String = "run" if is_sprinting and %AnimationPlayer.has_animation("run") else "walk"
+        var animation: Animation = %AnimationPlayer.get_animation(animation_name)
+        if animation != null and animation.loop_mode == Animation.LOOP_NONE:
+            animation.loop_mode = Animation.LOOP_LINEAR
+        if %AnimationPlayer.current_animation != animation_name or not %AnimationPlayer.is_playing():
+            %AnimationPlayer.play(animation_name, 0.12)
     else:
         %AnimationPlayer.stop()
 

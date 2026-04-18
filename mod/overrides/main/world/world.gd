@@ -83,7 +83,7 @@ func _on_settings_updated() -> void :
 
 
 func _is_coop_perf_override_active() -> bool:
-    return Ref.coop_manager != null and (Ref.coop_manager.is_client_session() or Ref.coop_manager.has_connected_remote_peers())
+    return Ref.coop_manager != null and Ref.coop_manager.has_method("has_active_session") and Ref.coop_manager.has_active_session()
 
 
 func _should_force_background_perf_override() -> bool:

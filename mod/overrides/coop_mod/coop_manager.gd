@@ -304,7 +304,6 @@ func _flush_guest_persistent_state_before_disconnect() -> void:
     if multiplayer.is_server() or not _has_live_peer() or not guest_persistent_ready:
         return
 
-    print("[lucid-blocks-coop][quit-debug] sending guest persistent state before disconnect")
     _send_persistent_state_to_host(true)
     _send_local_authoritative_entities_to_host(true)
     multiplayer.poll()
@@ -320,7 +319,6 @@ func _guest_save_and_quit_to_main_menu(reason: String = "Left host session") -> 
         return
 
     local_quit_in_progress = true
-    print("[lucid-blocks-coop][quit-debug] guest save+quit intercepted")
     await _flush_guest_persistent_state_before_disconnect()
 
     if _has_live_peer():
@@ -468,10 +466,7 @@ func _enforce_host_background_frame_rate() -> void:
         Engine.max_fps = 0
     if Engine.physics_ticks_per_second < 60:
         Engine.physics_ticks_per_second = 60
-    _bg_tick_log_timer += 1.0 / 60.0
-    if _bg_tick_log_timer >= 2.0:
-        _bg_tick_log_timer = 0.0
-        print("[lucid-blocks-coop][bg-tick] host unfocused: fps=%.1f max_fps=%d physics_ticks=%d actual_fps=%.1f" % [Engine.get_frames_per_second(), Engine.max_fps, Engine.physics_ticks_per_second, Performance.get_monitor(Performance.TIME_FPS)])
+    _bg_tick_log_timer = 0.0
 
 
 func _physics_process(delta: float) -> void:
@@ -907,7 +902,6 @@ func _set_local_player_combat_targetable(enabled: bool) -> void:
             interact_area.set_meta("coop_original_collision_mask", int(interact_area.collision_mask))
         interact_area.collision_layer = int(interact_area.get_meta("coop_original_collision_layer", 4098)) if enabled else 0
         interact_area.collision_mask = int(interact_area.get_meta("coop_original_collision_mask", int(interact_area.collision_mask)))
-    print("[lucid-blocks-coop][downed-debug] local targetable=", enabled, " root_layer=", Ref.player.collision_layer, " interact_layer=", interact_area.collision_layer if interact_area != null else -1)
     revive_hold_progress = 0.0
     revive_target_peer_id = -1
     revive_request_pending = false
@@ -1139,7 +1133,6 @@ func _begin_double_downed_recovery() -> void:
     status_message = "Both downed - regrouped"
     _update_status_text()
     _broadcast_local_state_now()
-    print("[lucid-blocks-coop][downed-debug] finished double-downed recovery host=", host_respawn_position, " guest=", guest_respawn_position)
 
 
 func _tick_local_downed_state(_delta: float) -> void:
@@ -2660,7 +2653,6 @@ func sync_local_attack_on_entity(attacker: Entity, target, damage_position: Vect
     if target_uuid == "":
         target_uuid = ensure_runtime_entity_uuid(target)
     if target_uuid == "":
-        print("[lucid-blocks-coop][attack-debug] guest target missing uuid name=", target.name if target is Node else str(target), " class=", target.get_class())
         return false
 
     var actual_damage: int = maxi(1, damage)
@@ -2672,7 +2664,6 @@ func sync_local_attack_on_entity(attacker: Entity, target, damage_position: Vect
     if attacker.held_item != null and attacker.held_item.item is Tool:
         attacker.decrease_held_item_durability(1)
 
-    print("[lucid-blocks-coop][attack-debug] guest send attack uuid=", target_uuid, " target=", target.name if target is Node else str(target), " damage=", actual_damage)
     request_entity_attack.rpc_id(1, target_uuid, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect)
     return true
 
@@ -5470,7 +5461,6 @@ func _try_begin_double_downed_recovery() -> void:
         return
     if not _all_same_instance_partners_downed(multiplayer.get_unique_id()):
         return
-    print("[lucid-blocks-coop][downed-debug] starting double-downed recovery")
     call_deferred("_begin_double_downed_recovery")
 
 
@@ -7775,7 +7765,6 @@ func _kick_client_to_main_menu() -> void:
         client_menu_kick_pending = false
         return
 
-    print("[lucid-blocks-coop][quit-debug] kicking guest to main menu")
     _close_pause_menu_if_open()
     await Ref.trans.open()
     Ref.audio_manager.play_song(Ref.main.main_menu_music, 100)
@@ -10991,26 +10980,21 @@ func request_entity_attack(target_uuid: String, damage_position: Vector3, damage
 
     var sender_state: Dictionary = peer_states.get(sender_id, {})
     if sender_state.is_empty() or not _is_peer_state_same_instance(sender_state, get_active_dimension_instance_key()):
-        print("[lucid-blocks-coop][attack-debug] host reject attack sender_state invalid sender=", sender_id, " uuid=", target_uuid)
         return
 
     var attacker = get_remote_player_proxy(sender_id)
     if attacker == null or not is_instance_valid(attacker) or attacker.dead or attacker.disabled:
-        print("[lucid-blocks-coop][attack-debug] host reject attack attacker invalid sender=", sender_id, " uuid=", target_uuid)
         return
 
     var target = _find_existing_entity_by_uuid(target_uuid)
     if target == null or not is_instance_valid(target) or not (target is Entity) or target is Player or is_remote_player_proxy(target):
-        print("[lucid-blocks-coop][attack-debug] host reject attack target invalid uuid=", target_uuid)
         return
 
     var target_entity := target as Entity
     if target_entity.dead or target_entity.disabled or target_entity.direct_damage_cooldown:
-        print("[lucid-blocks-coop][attack-debug] host reject attack target state uuid=", target_uuid, " dead=", target_entity.dead, " disabled=", target_entity.disabled, " cooldown=", target_entity.direct_damage_cooldown)
         return
     var attacker_position: Vector3 = sender_state.get("position", attacker.global_position)
     if attacker_position.distance_squared_to(target_entity.global_position) > (ENTITY_ATTACK_REQUEST_MAX_DISTANCE + 1.25) * (ENTITY_ATTACK_REQUEST_MAX_DISTANCE + 1.25):
-        print("[lucid-blocks-coop][attack-debug] host reject attack range uuid=", target_uuid, " attacker_pos=", attacker_position, " target_pos=", target_entity.global_position)
         return
 
     var actual_damage: int = maxi(1, damage)
@@ -11018,7 +11002,6 @@ func request_entity_attack(target_uuid: String, damage_position: Vector3, damage
     var knockback_velocity: Vector3 = calculate_attack_knockback_velocity(target_entity, attacker_position, attacker_velocity, knockback_strength, fly_strength)
     target_entity.knockback_velocity += knockback_velocity
     target_entity.attacked(attacker, actual_damage)
-    print("[lucid-blocks-coop][attack-debug] host accept attack uuid=", target_uuid, " target=", target_entity.name, " damage=", actual_damage)
 
     if fire_aspect and target_entity.has_node("%Burn"):
         target_entity.get_node("%Burn").ignite()

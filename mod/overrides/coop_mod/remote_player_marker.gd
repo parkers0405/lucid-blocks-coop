@@ -13,6 +13,7 @@ const PLAYER_HEIGHT: float = 1.85
 const MOVE_ANIM_THRESHOLD: float = 0.08
 const HELD_ITEM_REBUILD_DELAY: float = 0.08
 const LABEL_HEIGHT: float = PLAYER_HEIGHT + 0.4
+const IN_PLACE_LOCOMOTION_CLIPS: Array[String] = ["walk", "run", "crouch_walk", "jump"]
 
 const ACTION_IDLE: int = 0
 const ACTION_HIT_SUSTAIN: int = 1
@@ -84,6 +85,8 @@ var avatar_sound_player: AudioStreamPlayer3D
 var avatar_sound_cache: Dictionary = {}  # action_name -> Array[AudioStream]
 var last_sound_action: String = ""
 var sound_cooldown: float = 0.0
+var avatar_sounds_enabled: bool = true
+var label_enabled: bool = true
 
 
 func _ready() -> void:
@@ -202,6 +205,14 @@ func set_skin_color(new_skin_color: Color) -> void:
     target_skin_color = new_skin_color
 
 
+func set_avatar_sounds_enabled(enabled: bool) -> void:
+    avatar_sounds_enabled = enabled
+    if avatar_sound_player != null and is_instance_valid(avatar_sound_player):
+        avatar_sound_player.queue_free()
+    avatar_sound_player = null
+    sound_cooldown = 0.0
+
+
 func set_action_state(new_action_state: int) -> void:
     if target_action_state == new_action_state:
         return
@@ -213,6 +224,7 @@ func set_action_state(new_action_state: int) -> void:
 
 
 func set_label_enabled(enabled: bool) -> void:
+    label_enabled = enabled
     if label != null:
         label.visible = enabled
 
@@ -263,6 +275,7 @@ func _rebuild_visual() -> void:
     label.position = Vector3(0.0, _get_label_height(), 0.0)
     label.no_depth_test = true
     label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+    label.visible = label_enabled
     add_child(label)
 
 
@@ -275,6 +288,9 @@ func _try_build_avatar() -> bool:
     avatar_skeleton = null
     avatar_animation_player = null
     avatar_mesh_instance = null
+    if avatar_sound_player != null and is_instance_valid(avatar_sound_player):
+        avatar_sound_player.queue_free()
+    avatar_sound_player = null
     held_item_visual = null
     held_item_rebuild_pending = false
     held_item_rebuild_timer = 0.0
@@ -407,6 +423,8 @@ func _load_runtime_clips() -> void:
         # Only remap if using shared default clips on a non-default skeleton
         if not custom_clips.has(clip_name):
             _retarget_clip_tracks(clip, bone_map, skeleton_path)
+        if clip_name in IN_PLACE_LOCOMOTION_CLIPS:
+            _make_locomotion_clip_in_place(clip, str(bone_map.get("mixamorig_Hips", "mixamorig_Hips")))
         if clip_name in ["idle", "idle_alt", "walk", "run", "crouch_idle", "crouch_walk"]:
             clip.loop_mode = Animation.LOOP_LINEAR
         else:
@@ -538,6 +556,33 @@ func _retarget_clip_tracks(clip: Animation, bone_map: Dictionary, skeleton_path:
     print("[avatar] retarget: rewritten=%d removed=%d remaining=%d skeleton_path=%s" % [rewritten, tracks_to_remove.size(), clip.get_track_count(), skeleton_path])
 
 
+func _make_locomotion_clip_in_place(clip: Animation, root_bone_name: String) -> void:
+    if clip == null or root_bone_name == "":
+        return
+
+    var candidate_root_names: Array[String] = [root_bone_name, "mixamorig_Hips", "hips"]
+    for track_idx in range(clip.get_track_count()):
+        if clip.track_get_type(track_idx) != Animation.TYPE_POSITION_3D:
+            continue
+
+        var track_path: String = str(clip.track_get_path(track_idx))
+        var is_root_track: bool = track_path.find(":") == -1
+        if not is_root_track:
+            var bone_name: String = track_path.substr(track_path.rfind(":") + 1)
+            is_root_track = bone_name in candidate_root_names
+        if not is_root_track:
+            continue
+        if clip.track_get_key_count(track_idx) == 0:
+            continue
+
+        var root_origin: Vector3 = clip.track_get_key_value(track_idx, 0)
+        for key_idx in range(clip.track_get_key_count(track_idx)):
+            var key_value: Vector3 = clip.track_get_key_value(track_idx, key_idx)
+            key_value.x = root_origin.x
+            key_value.z = root_origin.z
+            clip.track_set_key_value(track_idx, key_idx, key_value)
+
+
 func _choose_clip(speed_ratio: float) -> String:
     if target_action_state == ACTION_HIT or target_action_state == ACTION_HIT_SUSTAIN:
         return "attack"
@@ -602,6 +647,8 @@ func _update_avatar_animation(speed_ratio: float) -> void:
 
 func _setup_avatar_sounds() -> void:
     avatar_sound_cache.clear()
+    if not avatar_sounds_enabled:
+        return
     var sounds_config: Dictionary = avatar_entry.get("sounds", {})
     if sounds_config.is_empty():
         return
