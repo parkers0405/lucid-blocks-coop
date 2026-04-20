@@ -172,6 +172,7 @@ var pending_local_world_patch_chunks: Dictionary = {}
 var pending_local_world_patch_dimension: int = -1
 var pending_local_world_patch_pocket_owner_key: String = ""
 var pending_local_world_patch_instance_key: String = ""
+var cached_world_chunk_size: Vector3i = Vector3i.ZERO
 var guest_world_patch_flush_request_counter: int = 0
 var pending_guest_world_patch_flush_acks: Dictionary = {}
 var group_dimension_transfer_in_progress: bool = false
@@ -246,10 +247,25 @@ var pause_menu_owner: Control
 var pause_menu_container: Control
 var pause_menu_resume_button: Button
 var pause_menu_coop_button: Button
-var pause_menu_coop_panel: PanelContainer
+var pause_menu_coop_panel: Control
+var pause_menu_coop_shell: PanelContainer
 var pause_menu_coop_status_label: Label
 var pause_menu_coop_address_input: LineEdit
 var pause_menu_coop_port_input: SpinBox
+var pause_menu_coop_players_section: VBoxContainer
+var pause_menu_coop_player_list: ItemList
+var pause_menu_coop_player_detail_label: Label
+var pause_menu_coop_tp_button: Button
+var pause_menu_coop_kick_button: Button
+var pause_menu_coop_player_signature: String = ""
+var main_menu_owner: Control
+var main_menu_coop_button: Button
+var main_menu_coop_panel: Control
+var main_menu_coop_shell: PanelContainer
+var main_menu_coop_address_input: LineEdit
+var main_menu_coop_port_input: SpinBox
+var main_menu_coop_steam_lobby_input: LineEdit
+var main_menu_coop_status_label: Label
 
 
 func _ready() -> void:
@@ -274,6 +290,7 @@ func _ready() -> void:
     multiplayer.server_disconnected.connect(_on_server_disconnected)
     _install_steam_integration()
     call_deferred("_ensure_pause_menu_coop_ui")
+    call_deferred("_ensure_main_menu_coop_ui")
 
     get_tree().get_root().child_entered_tree.connect(_on_root_child_entered)
     get_tree().get_root().child_exiting_tree.connect(_on_root_child_exiting)
@@ -544,8 +561,8 @@ func host_steam_session(auto_open_invite_dialog: bool = true) -> void:
     pending_steam_lobby_id = 0
     pending_steam_open_invite_dialog = auto_open_invite_dialog
     _set_reconnect_overlay_visible(false)
-    _prepare_session_start_state(true)
     _apply_ui_to_config()
+    _prepare_session_start_state(true)
     disconnect_session(false)
     status_message = "Creating Steam lobby..."
     _update_status_text()
@@ -690,6 +707,18 @@ func _get_game_menu_node() -> Control:
     return null
 
 
+func _get_main_menu_node() -> Control:
+    if is_instance_valid(Ref.main):
+        var main_menu: Control = Ref.main.get_node_or_null("%MainMenu") as Control
+        if main_menu != null:
+            return main_menu
+    if is_instance_valid(Ref.ui):
+        var ui_main_menu: Control = Ref.ui.find_child("MainMenu", true, false) as Control
+        if ui_main_menu != null:
+            return ui_main_menu
+    return null
+
+
 func _clear_pause_menu_coop_ui() -> void:
     if is_instance_valid(pause_menu_coop_button):
         pause_menu_coop_button.queue_free()
@@ -700,9 +729,31 @@ func _clear_pause_menu_coop_ui() -> void:
     pause_menu_resume_button = null
     pause_menu_coop_button = null
     pause_menu_coop_panel = null
+    pause_menu_coop_shell = null
     pause_menu_coop_status_label = null
     pause_menu_coop_address_input = null
     pause_menu_coop_port_input = null
+    pause_menu_coop_players_section = null
+    pause_menu_coop_player_list = null
+    pause_menu_coop_player_detail_label = null
+    pause_menu_coop_tp_button = null
+    pause_menu_coop_kick_button = null
+    pause_menu_coop_player_signature = ""
+
+
+func _clear_main_menu_coop_ui() -> void:
+    if is_instance_valid(main_menu_coop_button):
+        main_menu_coop_button.queue_free()
+    if is_instance_valid(main_menu_coop_panel):
+        main_menu_coop_panel.queue_free()
+    main_menu_owner = null
+    main_menu_coop_button = null
+    main_menu_coop_panel = null
+    main_menu_coop_shell = null
+    main_menu_coop_address_input = null
+    main_menu_coop_port_input = null
+    main_menu_coop_steam_lobby_input = null
+    main_menu_coop_status_label = null
 
 
 func _copy_pause_menu_button_style(source: Button, target: Button) -> void:
@@ -727,39 +778,99 @@ func _copy_pause_menu_label_style(source: Label, target: Label, font_size: int =
         target.add_theme_font_size_override("font_size", resolved_font_size)
 
 
-func _build_pause_menu_coop_panel(sample_button: Button, sample_title: Label) -> PanelContainer:
-    var submenu_panel := PanelContainer.new()
+func _get_overlay_parent(source: Control) -> Control:
+    var overlay_parent: Control = source
+    while overlay_parent.get_parent() is Control:
+        overlay_parent = overlay_parent.get_parent() as Control
+    return overlay_parent
+
+
+func _get_spin_box_int_value(spin_box: SpinBox, fallback: int) -> int:
+    if spin_box == null:
+        return fallback
+
+    var min_value: int = maxi(1, int(floor(spin_box.min_value)))
+    var max_value: int = maxi(min_value, int(ceil(spin_box.max_value)))
+    var line_edit: LineEdit = spin_box.get_line_edit()
+    if line_edit != null:
+        var raw_text: String = line_edit.text.strip_edges()
+        if raw_text.is_valid_int():
+            return clampi(int(raw_text), min_value, max_value)
+    return clampi(int(round(spin_box.value)), min_value, max_value)
+
+
+func _build_pause_menu_coop_panel(sample_button: Button, sample_title: Label, sample_container: Control) -> Control:
+    var submenu_panel := Control.new()
     submenu_panel.visible = false
-    submenu_panel.anchor_left = 0.5
-    submenu_panel.anchor_top = 0.5
-    submenu_panel.anchor_right = 0.5
-    submenu_panel.anchor_bottom = 0.5
-    submenu_panel.offset_left = -210.0
-    submenu_panel.offset_top = -176.0
-    submenu_panel.offset_right = 210.0
-    submenu_panel.offset_bottom = 176.0
     submenu_panel.mouse_filter = Control.MOUSE_FILTER_STOP
     submenu_panel.focus_mode = Control.FOCUS_ALL
+    submenu_panel.z_index = 100
+    submenu_panel.set_anchors_preset(Control.PRESET_FULL_RECT)
+
+    var safe_area := MarginContainer.new()
+    safe_area.set_anchors_preset(Control.PRESET_FULL_RECT)
+    safe_area.add_theme_constant_override("margin_left", 18)
+    safe_area.add_theme_constant_override("margin_right", 18)
+    safe_area.add_theme_constant_override("margin_top", 18)
+    safe_area.add_theme_constant_override("margin_bottom", 18)
+    submenu_panel.add_child(safe_area)
+
+    var center := CenterContainer.new()
+    center.set_anchors_preset(Control.PRESET_FULL_RECT)
+    safe_area.add_child(center)
+
+    pause_menu_coop_shell = PanelContainer.new()
+    pause_menu_coop_shell.clip_contents = true
+    if sample_container != null:
+        pause_menu_coop_shell.theme = sample_container.theme
+        pause_menu_coop_shell.theme_type_variation = sample_container.theme_type_variation
+    center.add_child(pause_menu_coop_shell)
+
+    var scroll := ScrollContainer.new()
+    scroll.anchor_right = 1.0
+    scroll.anchor_bottom = 1.0
+    scroll.offset_right = 0.0
+    scroll.offset_bottom = 0.0
+    scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+    scroll.follow_focus = true
+    pause_menu_coop_shell.add_child(scroll)
 
     var margin := MarginContainer.new()
     margin.add_theme_constant_override("margin_left", 18)
     margin.add_theme_constant_override("margin_right", 18)
     margin.add_theme_constant_override("margin_top", 18)
     margin.add_theme_constant_override("margin_bottom", 18)
-    submenu_panel.add_child(margin)
+    scroll.add_child(margin)
 
     var column := VBoxContainer.new()
     column.add_theme_constant_override("separation", 10)
     margin.add_child(column)
 
+    var title_row := HBoxContainer.new()
+    title_row.add_theme_constant_override("separation", 8)
+    column.add_child(title_row)
+
+    var title_back_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, title_back_button)
+    title_back_button.text = "Back"
+    title_back_button.custom_minimum_size = Vector2(72.0, sample_button.custom_minimum_size.y)
+    title_back_button.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+    title_back_button.pressed.connect(_close_pause_menu_coop_panel)
+    title_row.add_child(title_back_button)
+
     var title := Label.new()
     title.text = "CO-OP"
     title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
     if sample_title != null:
         _copy_pause_menu_label_style(sample_title, title, sample_title.get_theme_font_size("font_size"))
     else:
         title.add_theme_font_size_override("font_size", 18)
-    column.add_child(title)
+    title_row.add_child(title)
+
+    var title_spacer := Control.new()
+    title_spacer.custom_minimum_size = Vector2(72.0, sample_button.custom_minimum_size.y)
+    title_row.add_child(title_spacer)
 
     var subtitle := Label.new()
     subtitle.text = "Invite friends through Steam or connect over your local network"
@@ -844,6 +955,47 @@ func _build_pause_menu_coop_panel(sample_button: Button, sample_title: Label) ->
     pause_menu_coop_status_label.add_theme_font_size_override("font_size", 10)
     column.add_child(pause_menu_coop_status_label)
 
+    pause_menu_coop_players_section = VBoxContainer.new()
+    pause_menu_coop_players_section.visible = false
+    pause_menu_coop_players_section.add_theme_constant_override("separation", 6)
+    column.add_child(pause_menu_coop_players_section)
+
+    var players_heading := Label.new()
+    players_heading.text = "PLAYERS"
+    players_heading.add_theme_font_size_override("font_size", 11)
+    pause_menu_coop_players_section.add_child(players_heading)
+
+    pause_menu_coop_player_list = ItemList.new()
+    pause_menu_coop_player_list.custom_minimum_size = Vector2(0.0, 110.0)
+    pause_menu_coop_player_list.allow_reselect = true
+    pause_menu_coop_player_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+    pause_menu_coop_player_list.add_theme_font_size_override("font_size", 10)
+    pause_menu_coop_player_list.item_selected.connect(_on_pause_menu_player_selected)
+    pause_menu_coop_player_list.item_activated.connect(_on_pause_menu_player_activated)
+    pause_menu_coop_players_section.add_child(pause_menu_coop_player_list)
+
+    pause_menu_coop_player_detail_label = Label.new()
+    pause_menu_coop_player_detail_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    pause_menu_coop_player_detail_label.custom_minimum_size = Vector2(0.0, 32.0)
+    pause_menu_coop_player_detail_label.add_theme_font_size_override("font_size", 10)
+    pause_menu_coop_players_section.add_child(pause_menu_coop_player_detail_label)
+
+    var players_button_row := HBoxContainer.new()
+    players_button_row.add_theme_constant_override("separation", 8)
+    pause_menu_coop_players_section.add_child(players_button_row)
+
+    pause_menu_coop_tp_button = Button.new()
+    _copy_pause_menu_button_style(sample_button, pause_menu_coop_tp_button)
+    pause_menu_coop_tp_button.text = "TP"
+    pause_menu_coop_tp_button.pressed.connect(_teleport_to_selected_pause_menu_peer)
+    players_button_row.add_child(pause_menu_coop_tp_button)
+
+    pause_menu_coop_kick_button = Button.new()
+    _copy_pause_menu_button_style(sample_button, pause_menu_coop_kick_button)
+    pause_menu_coop_kick_button.text = "Kick"
+    pause_menu_coop_kick_button.pressed.connect(_kick_selected_pause_menu_peer)
+    players_button_row.add_child(pause_menu_coop_kick_button)
+
     var footer_buttons := HBoxContainer.new()
     footer_buttons.add_theme_constant_override("separation", 8)
     column.add_child(footer_buttons)
@@ -853,12 +1005,6 @@ func _build_pause_menu_coop_panel(sample_button: Button, sample_title: Label) ->
     leave_button.text = "Leave Session"
     leave_button.pressed.connect(leave_session)
     footer_buttons.add_child(leave_button)
-
-    var back_button := Button.new()
-    _copy_pause_menu_button_style(sample_button, back_button)
-    back_button.text = "Back"
-    back_button.pressed.connect(_close_pause_menu_coop_panel)
-    footer_buttons.add_child(back_button)
 
     return submenu_panel
 
@@ -895,14 +1041,15 @@ func _ensure_pause_menu_coop_ui() -> void:
 
     if not is_instance_valid(pause_menu_coop_panel):
         var title_label: Label = game_menu.find_child("PauseTitleLabel", true, false) as Label
-        pause_menu_coop_panel = _build_pause_menu_coop_panel(resume_button, title_label)
-        var pause_parent: Node = pause_container.get_parent()
+        pause_menu_coop_panel = _build_pause_menu_coop_panel(resume_button, title_label, pause_container)
+        var pause_parent: Node = _get_overlay_parent(game_menu)
         if pause_parent == null:
             return
         pause_parent.add_child(pause_menu_coop_panel)
 
     _sync_inputs_from_config()
     _refresh_pause_menu_coop_status()
+    _refresh_overlay_layout()
 
 
 func _is_pause_menu_coop_panel_open() -> bool:
@@ -915,9 +1062,12 @@ func _open_pause_menu_coop_panel() -> void:
         return
     _sync_inputs_from_config()
     _refresh_pause_menu_coop_status()
+    _refresh_pause_menu_player_list(true)
     if is_instance_valid(pause_menu_container):
         pause_menu_container.visible = false
     pause_menu_coop_panel.visible = true
+    pause_menu_coop_panel.move_to_front()
+    _refresh_overlay_layout()
     if pause_menu_coop_address_input != null:
         pause_menu_coop_address_input.grab_focus()
         pause_menu_coop_address_input.caret_column = pause_menu_coop_address_input.text.length()
@@ -961,6 +1111,517 @@ func _sync_pause_menu_coop_panel_visibility() -> void:
         return
     if is_instance_valid(Ref.game_menu) and int(Ref.game_menu.state) != 4:
         _close_pause_menu_coop_panel()
+
+
+func _get_peer_display_name(peer_id: int, state: Dictionary = {}) -> String:
+    if peer_id == multiplayer.get_unique_id():
+        return _get_local_player_name()
+    var resolved_state: Dictionary = state if not state.is_empty() else peer_states.get(peer_id, {})
+    var display_name: String = str(resolved_state.get("name", "")).strip_edges()
+    if display_name != "":
+        return display_name
+    return "Peer %s" % peer_id
+
+
+func _get_session_player_entries() -> Array:
+    var entries: Array = []
+    if not _has_live_peer():
+        return entries
+
+    var local_entry: Dictionary = _capture_local_state()
+    local_entry["peer_id"] = multiplayer.get_unique_id()
+    local_entry["is_local"] = true
+    entries.append(local_entry)
+
+    for peer_id in peer_states.keys():
+        var int_peer_id: int = int(peer_id)
+        if int_peer_id == multiplayer.get_unique_id():
+            continue
+        var state: Dictionary = peer_states[peer_id]
+        if state.is_empty():
+            continue
+        var entry: Dictionary = state.duplicate(true)
+        entry["peer_id"] = int_peer_id
+        entry["is_local"] = false
+        entries.append(entry)
+
+    entries.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+        return int(a.get("peer_id", -1)) < int(b.get("peer_id", -1))
+    )
+    return entries
+
+
+func _format_session_player_label(entry: Dictionary) -> String:
+    var peer_id: int = int(entry.get("peer_id", -1))
+    var label: String = _get_peer_display_name(peer_id, entry)
+    if bool(entry.get("is_local", false)):
+        label += " (You)"
+    elif peer_id == 1:
+        label += " (Host)"
+    elif not bool(entry.get("active", false)):
+        label += " (Connecting)"
+    if bool(entry.get("downed", false)):
+        label += " [Downed]"
+    return label
+
+
+func _get_session_player_signature(entries: Array) -> String:
+    var parts: PackedStringArray = PackedStringArray()
+    for entry in entries:
+        if not (entry is Dictionary):
+            continue
+        parts.append("%s|%s|%s|%s" % [
+            int(entry.get("peer_id", -1)),
+            _format_session_player_label(entry),
+            str(entry.get("dimension_instance_key", "")),
+            bool(entry.get("active", false)),
+        ])
+    return "\n".join(parts)
+
+
+func _get_selected_pause_menu_peer_id() -> int:
+    if pause_menu_coop_player_list == null or pause_menu_coop_player_list.get_item_count() == 0:
+        return -1
+    var selected: PackedInt32Array = pause_menu_coop_player_list.get_selected_items()
+    if selected.is_empty():
+        return -1
+    return int(pause_menu_coop_player_list.get_item_metadata(int(selected[0])))
+
+
+func _refresh_pause_menu_player_actions() -> void:
+    if pause_menu_coop_player_detail_label == null:
+        return
+    if not _has_live_peer():
+        pause_menu_coop_player_detail_label.text = ""
+        if pause_menu_coop_tp_button != null:
+            pause_menu_coop_tp_button.disabled = true
+        if pause_menu_coop_kick_button != null:
+            pause_menu_coop_kick_button.disabled = true
+            pause_menu_coop_kick_button.visible = false
+        return
+
+    var peer_id: int = _get_selected_pause_menu_peer_id()
+    if peer_id <= 0:
+        pause_menu_coop_player_detail_label.text = "Select a player to manage them."
+        if pause_menu_coop_tp_button != null:
+            pause_menu_coop_tp_button.disabled = true
+        if pause_menu_coop_kick_button != null:
+            pause_menu_coop_kick_button.disabled = true
+            pause_menu_coop_kick_button.visible = multiplayer.is_server() and active_session_transport == SESSION_TRANSPORT_STEAM
+        return
+
+    var is_local: bool = peer_id == multiplayer.get_unique_id()
+    var state: Dictionary = _capture_local_state() if is_local else peer_states.get(peer_id, {})
+    var same_dimension: bool = str(state.get("dimension_instance_key", "")) == get_active_dimension_instance_key()
+    var detail_lines: PackedStringArray = PackedStringArray([
+        _get_peer_display_name(peer_id, state),
+        "Peer %s  |  %s" % [peer_id, "Same area" if same_dimension else "Different area"],
+    ])
+    if bool(state.get("downed", false)):
+        detail_lines.append("Status: Downed")
+    pause_menu_coop_player_detail_label.text = "\n".join(detail_lines)
+
+    if pause_menu_coop_tp_button != null:
+        pause_menu_coop_tp_button.disabled = is_local or not _can_sample_player() or state.is_empty() or not bool(state.get("active", false))
+
+    if pause_menu_coop_kick_button != null:
+        pause_menu_coop_kick_button.visible = multiplayer.is_server() and active_session_transport == SESSION_TRANSPORT_STEAM
+        pause_menu_coop_kick_button.disabled = not pause_menu_coop_kick_button.visible or is_local or state.is_empty()
+
+
+func _refresh_pause_menu_player_list(force: bool = false) -> void:
+    if pause_menu_coop_players_section == null or pause_menu_coop_player_list == null:
+        return
+
+    var session_active: bool = _has_live_peer()
+    pause_menu_coop_players_section.visible = session_active
+    if not session_active:
+        pause_menu_coop_player_list.clear()
+        pause_menu_coop_player_signature = ""
+        _refresh_pause_menu_player_actions()
+        return
+
+    var entries: Array = _get_session_player_entries()
+    var signature: String = _get_session_player_signature(entries)
+    if force or signature != pause_menu_coop_player_signature:
+        var previous_peer_id: int = _get_selected_pause_menu_peer_id()
+        pause_menu_coop_player_list.clear()
+        for entry in entries:
+            var label: String = _format_session_player_label(entry)
+            pause_menu_coop_player_list.add_item(label)
+            var item_index: int = pause_menu_coop_player_list.get_item_count() - 1
+            pause_menu_coop_player_list.set_item_metadata(item_index, int(entry.get("peer_id", -1)))
+
+        if pause_menu_coop_player_list.get_item_count() > 0:
+            var selected_index: int = -1
+            for item_index in range(pause_menu_coop_player_list.get_item_count()):
+                if int(pause_menu_coop_player_list.get_item_metadata(item_index)) == previous_peer_id:
+                    selected_index = item_index
+                    break
+            if selected_index == -1:
+                for item_index in range(pause_menu_coop_player_list.get_item_count()):
+                    var peer_id: int = int(pause_menu_coop_player_list.get_item_metadata(item_index))
+                    if peer_id != multiplayer.get_unique_id():
+                        selected_index = item_index
+                        break
+            if selected_index == -1:
+                selected_index = 0
+            pause_menu_coop_player_list.select(selected_index)
+
+        pause_menu_coop_player_signature = signature
+
+    _refresh_pause_menu_player_actions()
+
+
+func _on_pause_menu_player_selected(_index: int) -> void:
+    _refresh_pause_menu_player_actions()
+
+
+func _on_pause_menu_player_activated(_index: int) -> void:
+    _teleport_to_selected_pause_menu_peer()
+
+
+func _teleport_to_peer(peer_id: int) -> void:
+    if not _can_sample_player():
+        return
+    if peer_id == multiplayer.get_unique_id():
+        status_message = "You are already on your own position"
+        _update_status_text()
+        return
+
+    var target_state: Dictionary = peer_states.get(peer_id, {})
+    if target_state.is_empty() or not bool(target_state.get("active", false)):
+        status_message = "That player is not ready yet"
+        _update_status_text()
+        return
+
+    if str(target_state.get("dimension_instance_key", "")) != get_active_dimension_instance_key():
+        var target_key: String = str(target_state.get("dimension_instance_key", ""))
+        if _open_dimension_instance_from_key(target_key):
+            status_message = "Teleporting to %s's area" % _get_peer_display_name(peer_id, target_state)
+            _update_status_text()
+            return
+
+    _teleport_local_player_near(target_state.get("position", Ref.player.global_position))
+    status_message = "Teleported to %s" % _get_peer_display_name(peer_id, target_state)
+    _update_status_text()
+
+
+func _teleport_to_selected_pause_menu_peer() -> void:
+    var peer_id: int = _get_selected_pause_menu_peer_id()
+    if peer_id <= 0:
+        return
+    _teleport_to_peer(peer_id)
+
+
+func _kick_selected_pause_menu_peer() -> void:
+    var peer_id: int = _get_selected_pause_menu_peer_id()
+    if peer_id <= 0:
+        return
+    _kick_connected_peer.call_deferred(peer_id)
+
+
+func _kick_connected_peer(peer_id: int) -> void:
+    if not multiplayer.is_server() or not _has_live_peer() or peer_id == multiplayer.get_unique_id():
+        return
+
+    var reason: String = "Removed by host"
+    var peer_name: String = _get_peer_display_name(peer_id)
+    host_session_ending.rpc_id(peer_id, false, reason)
+    await get_tree().create_timer(0.15, true).timeout
+    if multiplayer.multiplayer_peer != null and multiplayer.multiplayer_peer.has_method("disconnect_peer"):
+        multiplayer.multiplayer_peer.call("disconnect_peer", peer_id)
+
+    status_message = "Removed %s" % peer_name
+    _update_status_text()
+
+
+func _open_steam_friends_overlay() -> void:
+    var steam_api: Object = _get_steam_api()
+    if steam_api == null:
+        status_message = "Steam overlay unavailable"
+        _update_status_text()
+        return
+    if steam_api.has_method("activateGameOverlay"):
+        steam_api.call("activateGameOverlay", "Friends")
+        status_message = "Opened Steam friends overlay"
+    elif steam_api.has_method("activate_game_overlay"):
+        steam_api.call("activate_game_overlay", "Friends")
+        status_message = "Opened Steam friends overlay"
+    else:
+        status_message = "Steam overlay unavailable"
+    _update_status_text()
+
+
+func _build_main_menu_coop_panel(sample_button: Button) -> Control:
+    var panel_root := Control.new()
+    panel_root.visible = false
+    panel_root.mouse_filter = Control.MOUSE_FILTER_STOP
+    panel_root.focus_mode = Control.FOCUS_ALL
+    panel_root.z_index = 100
+    panel_root.set_anchors_preset(Control.PRESET_FULL_RECT)
+
+    var fade := ColorRect.new()
+    fade.set_anchors_preset(Control.PRESET_FULL_RECT)
+    fade.color = Color(0.0, 0.0, 0.0, 0.22)
+    panel_root.add_child(fade)
+
+    var safe_area := MarginContainer.new()
+    safe_area.set_anchors_preset(Control.PRESET_FULL_RECT)
+    safe_area.add_theme_constant_override("margin_left", 18)
+    safe_area.add_theme_constant_override("margin_right", 18)
+    safe_area.add_theme_constant_override("margin_top", 18)
+    safe_area.add_theme_constant_override("margin_bottom", 18)
+    panel_root.add_child(safe_area)
+
+    var center := CenterContainer.new()
+    center.set_anchors_preset(Control.PRESET_FULL_RECT)
+    safe_area.add_child(center)
+
+    main_menu_coop_shell = PanelContainer.new()
+    main_menu_coop_shell.clip_contents = true
+    main_menu_coop_shell.theme = sample_button.theme
+    center.add_child(main_menu_coop_shell)
+
+    var scroll := ScrollContainer.new()
+    scroll.anchor_right = 1.0
+    scroll.anchor_bottom = 1.0
+    scroll.offset_right = 0.0
+    scroll.offset_bottom = 0.0
+    scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+    scroll.follow_focus = true
+    main_menu_coop_shell.add_child(scroll)
+
+    var margin := MarginContainer.new()
+    margin.add_theme_constant_override("margin_left", 18)
+    margin.add_theme_constant_override("margin_right", 18)
+    margin.add_theme_constant_override("margin_top", 18)
+    margin.add_theme_constant_override("margin_bottom", 18)
+    scroll.add_child(margin)
+
+    var column := VBoxContainer.new()
+    column.add_theme_constant_override("separation", 10)
+    margin.add_child(column)
+
+    var title_row := HBoxContainer.new()
+    title_row.add_theme_constant_override("separation", 8)
+    column.add_child(title_row)
+
+    var back_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, back_button)
+    back_button.text = "Back"
+    back_button.custom_minimum_size = Vector2(72.0, sample_button.custom_minimum_size.y)
+    back_button.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+    back_button.pressed.connect(_close_main_menu_coop_panel)
+    title_row.add_child(back_button)
+
+    var title := Label.new()
+    title.text = "CO-OP"
+    title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    title.add_theme_font_size_override("font_size", 18)
+    title_row.add_child(title)
+
+    var right_spacer := Control.new()
+    right_spacer.custom_minimum_size = Vector2(72.0, sample_button.custom_minimum_size.y)
+    title_row.add_child(right_spacer)
+
+    var subtitle := Label.new()
+    subtitle.text = "Join a friend through Steam or connect directly by address"
+    subtitle.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    subtitle.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    subtitle.add_theme_font_size_override("font_size", 11)
+    column.add_child(subtitle)
+
+    var steam_heading := Label.new()
+    steam_heading.text = "STEAM"
+    steam_heading.add_theme_font_size_override("font_size", 11)
+    column.add_child(steam_heading)
+
+    var steam_section := VBoxContainer.new()
+    steam_section.add_theme_constant_override("separation", 8)
+    column.add_child(steam_section)
+
+    var steam_hint := Label.new()
+    steam_hint.text = "Accept a Steam invite, or enter a lobby ID manually."
+    steam_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    steam_hint.add_theme_font_size_override("font_size", 10)
+    steam_section.add_child(steam_hint)
+
+    main_menu_coop_steam_lobby_input = LineEdit.new()
+    main_menu_coop_steam_lobby_input.placeholder_text = "Steam lobby ID"
+    main_menu_coop_steam_lobby_input.custom_minimum_size = Vector2(0.0, max(24.0, sample_button.custom_minimum_size.y))
+    main_menu_coop_steam_lobby_input.text_submitted.connect(_on_main_menu_steam_lobby_submitted)
+    steam_section.add_child(main_menu_coop_steam_lobby_input)
+
+    var steam_buttons := HBoxContainer.new()
+    steam_buttons.add_theme_constant_override("separation", 8)
+    steam_section.add_child(steam_buttons)
+
+    var join_steam_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, join_steam_button)
+    join_steam_button.text = "Join Steam"
+    join_steam_button.pressed.connect(_join_main_menu_steam_lobby)
+    steam_buttons.add_child(join_steam_button)
+
+    var open_steam_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, open_steam_button)
+    open_steam_button.text = "Open Steam"
+    open_steam_button.pressed.connect(_open_steam_friends_overlay)
+    steam_buttons.add_child(open_steam_button)
+
+    var local_heading := Label.new()
+    local_heading.text = "LOCAL"
+    local_heading.add_theme_font_size_override("font_size", 11)
+    column.add_child(local_heading)
+
+    var local_section := VBoxContainer.new()
+    local_section.add_theme_constant_override("separation", 8)
+    column.add_child(local_section)
+
+    var local_hint := Label.new()
+    local_hint.text = "Join a hosted world directly by address and port."
+    local_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    local_hint.add_theme_font_size_override("font_size", 10)
+    local_section.add_child(local_hint)
+
+    var local_join_row := HBoxContainer.new()
+    local_join_row.add_theme_constant_override("separation", 8)
+    local_section.add_child(local_join_row)
+
+    main_menu_coop_address_input = LineEdit.new()
+    main_menu_coop_address_input.placeholder_text = "127.0.0.1"
+    main_menu_coop_address_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    main_menu_coop_address_input.custom_minimum_size = Vector2(0.0, max(24.0, sample_button.custom_minimum_size.y))
+    main_menu_coop_address_input.text_submitted.connect(_on_join_text_submitted)
+    local_join_row.add_child(main_menu_coop_address_input)
+
+    main_menu_coop_port_input = SpinBox.new()
+    main_menu_coop_port_input.min_value = 1
+    main_menu_coop_port_input.max_value = 65535
+    main_menu_coop_port_input.step = 1
+    main_menu_coop_port_input.rounded = true
+    main_menu_coop_port_input.custom_minimum_size = Vector2(88.0, max(24.0, sample_button.custom_minimum_size.y))
+    local_join_row.add_child(main_menu_coop_port_input)
+
+    var local_join_button := Button.new()
+    _copy_pause_menu_button_style(sample_button, local_join_button)
+    local_join_button.text = "Join Local"
+    local_join_button.pressed.connect(_join_main_menu_local_session)
+    local_section.add_child(local_join_button)
+
+    main_menu_coop_status_label = Label.new()
+    main_menu_coop_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    main_menu_coop_status_label.custom_minimum_size = Vector2(0.0, 48.0)
+    main_menu_coop_status_label.add_theme_font_size_override("font_size", 10)
+    column.add_child(main_menu_coop_status_label)
+
+    return panel_root
+
+
+func _ensure_main_menu_coop_ui() -> void:
+    var main_menu: Control = _get_main_menu_node()
+    if main_menu == null or not main_menu.is_inside_tree():
+        _clear_main_menu_coop_ui()
+        return
+
+    if main_menu_owner != null and main_menu_owner != main_menu:
+        _clear_main_menu_coop_ui()
+
+    var play_button: Button = main_menu.find_child("PlayButton", true, false) as Button
+    if play_button == null:
+        return
+
+    main_menu_owner = main_menu
+
+    if not is_instance_valid(main_menu_coop_button):
+        var button_parent: Node = play_button.get_parent()
+        if button_parent == null:
+            return
+        main_menu_coop_button = Button.new()
+        main_menu_coop_button.name = "CoopMainMenuButton"
+        _copy_pause_menu_button_style(play_button, main_menu_coop_button)
+        main_menu_coop_button.text = "Co-op"
+        main_menu_coop_button.pressed.connect(_open_main_menu_coop_panel)
+        button_parent.add_child(main_menu_coop_button)
+        button_parent.move_child(main_menu_coop_button, play_button.get_index() + 1)
+
+    if not is_instance_valid(main_menu_coop_panel):
+        main_menu_coop_panel = _build_main_menu_coop_panel(play_button)
+        var panel_parent: Node = _get_overlay_parent(main_menu)
+        if panel_parent == null:
+            return
+        panel_parent.add_child(main_menu_coop_panel)
+
+    _sync_inputs_from_config()
+    _refresh_main_menu_coop_status()
+    _refresh_overlay_layout()
+
+
+func _is_main_menu_coop_panel_open() -> bool:
+    return is_instance_valid(main_menu_coop_panel) and main_menu_coop_panel.visible
+
+
+func _open_main_menu_coop_panel() -> void:
+    _ensure_main_menu_coop_ui()
+    if not is_instance_valid(main_menu_coop_panel):
+        return
+    _sync_inputs_from_config()
+    _refresh_main_menu_coop_status()
+    main_menu_coop_panel.visible = true
+    main_menu_coop_panel.move_to_front()
+    _refresh_overlay_layout()
+    if main_menu_coop_steam_lobby_input != null:
+        main_menu_coop_steam_lobby_input.grab_focus()
+
+
+func _close_main_menu_coop_panel() -> void:
+    _apply_ui_to_config()
+    if is_instance_valid(main_menu_coop_panel):
+        main_menu_coop_panel.visible = false
+    get_viewport().gui_release_focus()
+
+
+func _refresh_main_menu_coop_status() -> void:
+    if main_menu_coop_status_label == null:
+        return
+    var steam_status: String = "Ready" if _can_use_steam_sessions() else "Unavailable"
+    if active_steam_lobby_id > 0:
+        steam_status = "Connected to lobby %s" % active_steam_lobby_id
+    main_menu_coop_status_label.text = "%s\nSteam: %s\nLocal target: %s:%s" % [
+        status_message,
+        steam_status,
+        str(config.get("address", "127.0.0.1")),
+        int(config.get("port", DEFAULT_PORT)),
+    ]
+
+
+func _sync_main_menu_coop_panel_visibility() -> void:
+    if not _is_main_menu_coop_panel_open():
+        return
+    if main_menu_owner == null or not is_instance_valid(main_menu_owner) or not main_menu_owner.visible:
+        _close_main_menu_coop_panel()
+
+
+func _join_main_menu_local_session() -> void:
+    _close_main_menu_coop_panel()
+    join_session()
+
+
+func _on_main_menu_steam_lobby_submitted(_new_text: String) -> void:
+    _join_main_menu_steam_lobby()
+
+
+func _join_main_menu_steam_lobby() -> void:
+    if main_menu_coop_steam_lobby_input == null:
+        return
+    var lobby_text: String = main_menu_coop_steam_lobby_input.text.strip_edges()
+    if not lobby_text.is_valid_int():
+        status_message = "Enter a valid Steam lobby ID"
+        _update_status_text()
+        return
+    _close_main_menu_coop_panel()
+    _join_steam_lobby_by_id(int(lobby_text), true)
 
 
 func _install_game_menu_quit_hook() -> void:
@@ -1022,23 +1683,54 @@ func _flush_guest_persistent_state_before_disconnect() -> void:
 
 
 func _guest_save_and_quit_to_main_menu(reason: String = "Left host session") -> void:
-    if multiplayer.is_server() or not is_instance_valid(Ref.main):
+    if not is_instance_valid(Ref.main):
+        return
+    if multiplayer.is_server() and _has_live_peer():
         return
     if client_menu_kick_pending:
         return
 
-    local_quit_in_progress = true
-    await _flush_guest_persistent_state_before_disconnect()
+    reconnect_pending = false
+    reconnect_attempt_count = 0
+    reconnect_retry_timer = 0.0
+    reconnect_reason = ""
+    reconnect_steam_lobby_id = 0
+    reconnect_steam_host_id = 0
+    host_rehost_pending = false
+    _set_reconnect_overlay_visible(false)
 
+    local_quit_in_progress = true
     if _has_live_peer():
-        disconnect_session(false)
-    else:
-        disconnect_session(false)
+        await _flush_guest_persistent_state_before_disconnect()
+
+    disconnect_session(false)
 
     status_message = reason
     _update_status_text()
     client_menu_kick_pending = true
     await _kick_client_to_main_menu()
+
+
+func _should_use_canonical_guest_block_patch(block_position: Vector3i) -> bool:
+    if multiplayer.is_server() or not _has_live_peer() or _is_local_world_authority():
+        return false
+
+    var active_instance_key: String = get_active_dimension_instance_key()
+    var host_state: Dictionary = peer_states.get(1, {})
+    if not _is_peer_state_same_instance(host_state, active_instance_key):
+        return false
+
+    var host_position: Vector3 = host_state.get("position", Vector3.ZERO)
+    var host_load_radius: float = maxf(get_same_instance_base_load_radius(float(HOST_SESSION_MAX_LOAD_RADIUS)), float(HOST_SESSION_MAX_LOAD_RADIUS))
+    var safe_radius: float = maxf(16.0, host_load_radius)
+    var target_position: Vector3 = Vector3(block_position) + Vector3(0.5, 0.5, 0.5)
+    return host_position.distance_squared_to(target_position) > safe_radius * safe_radius
+
+
+func _capture_guest_block_action_patch(block_position: Vector3i) -> Dictionary:
+    if _should_use_canonical_guest_block_patch(block_position):
+        return _capture_local_chunk_patch_for_world_positions([block_position])
+    return _capture_local_runtime_chunk_patch_for_world_positions([block_position])
 
 
 func _input(event: InputEvent) -> void:
@@ -1059,6 +1751,13 @@ func _input(event: InputEvent) -> void:
         match event.keycode:
             KEY_ESCAPE:
                 _close_pause_menu_coop_panel()
+                get_viewport().set_input_as_handled()
+        return
+
+    if _is_main_menu_coop_panel_open():
+        match event.keycode:
+            KEY_ESCAPE:
+                _close_main_menu_coop_panel()
                 get_viewport().set_input_as_handled()
         return
 
@@ -1120,12 +1819,15 @@ func _on_root_child_entered(node: Node) -> void:
     _register_root_runtime_node(node)
     if node is Control:
         call_deferred("_ensure_pause_menu_coop_ui")
+        call_deferred("_ensure_main_menu_coop_ui")
 
 
 func _on_root_child_exiting(node: Node) -> void:
     _unregister_root_runtime_node(node)
     if node == pause_menu_owner:
         _clear_pause_menu_coop_ui()
+    if node == main_menu_owner:
+        _clear_main_menu_coop_ui()
 
 
 func _get_live_tracked_entities() -> Array:
@@ -1190,7 +1892,10 @@ func _enforce_host_background_frame_rate() -> void:
 func _physics_process(delta: float) -> void:
     _enforce_coop_pause_override()
     _sync_pause_menu_coop_panel_visibility()
+    _sync_main_menu_coop_panel_visibility()
     _enforce_host_background_frame_rate()
+    if _is_pause_menu_coop_panel_open():
+        _refresh_pause_menu_player_list()
     _refresh_world_authority_mode()
     _refresh_host_entity_activity_override(delta)
     _refresh_session_load_radius()
@@ -1364,6 +2069,23 @@ func _refresh_overlay_layout() -> void:
         var browser_height: float = clampf(420.0, 160.0, maxf(160.0, viewport_size.y - 16.0))
         spawn_browser_panel.custom_minimum_size = Vector2(browser_width, browser_height)
 
+    if pause_menu_coop_shell != null:
+        var pause_width_target: float = viewport_size.x * 0.44
+        var pause_height_target: float = viewport_size.y * 0.72
+        if is_instance_valid(pause_menu_container) and pause_menu_container.size.x > 0.0 and pause_menu_container.size.y > 0.0:
+            pause_width_target = pause_menu_container.size.x
+            pause_height_target = pause_menu_container.size.y
+        pause_menu_coop_shell.custom_minimum_size = Vector2(
+            clampf(minf(pause_width_target, 560.0), 220.0, maxf(220.0, viewport_size.x - 48.0)),
+            clampf(minf(pause_height_target, 620.0), 220.0, maxf(220.0, viewport_size.y - 60.0))
+        )
+
+    if main_menu_coop_shell != null:
+        main_menu_coop_shell.custom_minimum_size = Vector2(
+            clampf(minf(viewport_size.x * 0.4, 520.0), 220.0, maxf(220.0, viewport_size.x - 48.0)),
+            clampf(minf(viewport_size.y * 0.64, 560.0), 220.0, maxf(220.0, viewport_size.y - 60.0))
+        )
+
 
 func host_session() -> void:
     if not _can_share_loaded_world():
@@ -1375,8 +2097,8 @@ func host_session() -> void:
     pending_steam_open_invite_dialog = false
     reconnect_steam_lobby_id = 0
     reconnect_steam_host_id = 0
-    _prepare_session_start_state(true)
     _apply_ui_to_config()
+    _prepare_session_start_state(true)
     disconnect_session(false)
 
     var peer: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
@@ -1401,8 +2123,8 @@ func join_session() -> void:
     pending_steam_open_invite_dialog = false
     reconnect_steam_lobby_id = 0
     reconnect_steam_host_id = 0
-    _prepare_session_start_state(false)
     _apply_ui_to_config()
+    _prepare_session_start_state(false)
     disconnect_session(false)
 
     var address: String = str(config.get("address", "127.0.0.1")).strip_edges()
@@ -1482,8 +2204,7 @@ func disconnect_session(announce: bool = true) -> void:
     client_state_heartbeat_timer = 0.0
     host_entity_activity_refresh_timer = 0.0
     _clear_host_entity_activity_override()
-    synced_entities.clear()
-    synced_dropped_items.clear()
+    _clear_client_world_entities_and_drops()
     host_entity_last_sent.clear()
     client_world_sync_ready = false
     guest_persistent_ready = false
@@ -1516,7 +2237,7 @@ func disconnect_session(announce: bool = true) -> void:
 
 
 func leave_session() -> void:
-    var should_kick_to_menu: bool = not multiplayer.is_server() and (reconnect_pending or (reconnect_overlay != null and reconnect_overlay.visible))
+    var should_kick_to_menu: bool = reconnect_pending or client_restore_in_progress or (reconnect_overlay != null and reconnect_overlay.visible)
     reconnect_pending = false
     reconnect_attempt_count = 0
     reconnect_retry_timer = 0.0
@@ -1528,9 +2249,10 @@ func leave_session() -> void:
     _close_pause_menu_if_open()
 
     if not _has_live_peer():
-        disconnect_session()
         if should_kick_to_menu:
-            _queue_client_main_menu_kick()
+            await _guest_save_and_quit_to_main_menu("Left host session")
+            return
+        disconnect_session()
         return
 
     local_quit_in_progress = true
@@ -3224,7 +3946,7 @@ func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, 
         get_active_dimension_instance_key(),
         block_position,
         block_id,
-        _capture_local_chunk_patch_for_world_positions([block_position])
+        _capture_guest_block_action_patch(block_position)
     )
     return true
 
@@ -3265,7 +3987,7 @@ func sync_local_block_break(break_behavior, block_position: Vector3i) -> bool:
         bool(break_behavior.shovel),
         bool(break_behavior.meat),
         bool(break_behavior.plant),
-        _capture_local_chunk_patch_for_world_positions([block_position])
+        _capture_guest_block_action_patch(block_position)
     )
     return true
 
@@ -6304,6 +7026,123 @@ func _capture_local_chunk_patch_for_world_positions(world_positions: Array) -> D
     return _capture_local_chunk_patch_for_chunk_positions(chunk_positions)
 
 
+func _capture_local_runtime_chunk_patch_for_world_positions(world_positions: Array) -> Dictionary:
+    if not _can_sample_player():
+        return {}
+
+    var chunk_positions: Array = _get_unique_chunk_positions_for_world_positions(world_positions)
+    if chunk_positions.is_empty():
+        return {}
+
+    # Avoid full world serialization on guest block actions; capture only touched chunks.
+    var dimension: int = int(Ref.world.current_dimension)
+    var pocket_owner_key: String = get_active_pocket_owner_key()
+    var prefix: String = _resolve_dimension_namespace(dimension, pocket_owner_key) + "_"
+    var chunk_blocks: Dictionary = {}
+    var chunk_water: Dictionary = {}
+    var chunk_water_awake: Dictionary = {}
+    var chunk_fire: Dictionary = {}
+
+    for chunk_position in chunk_positions:
+        var chunk_snapshot: Dictionary = _capture_runtime_chunk_snapshot(chunk_position)
+        if chunk_snapshot.is_empty():
+            continue
+        chunk_blocks[chunk_position] = chunk_snapshot.get("blocks", PackedInt32Array())
+        chunk_water[chunk_position] = chunk_snapshot.get("water", PackedByteArray())
+        chunk_water_awake[chunk_position] = chunk_snapshot.get("water_awake", PackedByteArray())
+        chunk_fire[chunk_position] = chunk_snapshot.get("fire", PackedByteArray())
+
+    if chunk_blocks.is_empty():
+        return {}
+
+    return {
+        "dimension": dimension,
+        "pocket_owner_key": pocket_owner_key,
+        "dimension_instance_key": get_dimension_instance_key(dimension, pocket_owner_key),
+        "world_data": {
+            prefix + "world": {
+                prefix + "chunk_block": chunk_blocks,
+                prefix + "chunk_water": chunk_water,
+                prefix + "chunk_water_awake": chunk_water_awake,
+                prefix + "chunk_fire": chunk_fire,
+            },
+        },
+    }
+
+
+func _capture_runtime_chunk_snapshot(chunk_position: Vector3i) -> Dictionary:
+    if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(chunk_position):
+        return {}
+
+    var chunk_size: Vector3i = _get_cached_world_chunk_size()
+    var cell_count: int = chunk_size.x * chunk_size.y * chunk_size.z
+    if cell_count <= 0:
+        return {}
+
+    var blocks: PackedInt32Array = PackedInt32Array()
+    var water: PackedByteArray = PackedByteArray()
+    var water_awake: PackedByteArray = PackedByteArray()
+    var fire: PackedByteArray = PackedByteArray()
+    blocks.resize(cell_count)
+    water.resize(cell_count)
+    water_awake.resize(cell_count)
+    fire.resize(cell_count)
+
+    var index: int = 0
+    for y in range(chunk_size.y):
+        for z in range(chunk_size.z):
+            for x in range(chunk_size.x):
+                var world_position: Vector3 = Vector3(chunk_position + Vector3i(x, y, z))
+                var block: Block = Ref.world.get_block_type_at(world_position)
+                var water_level: int = _clamp_chunk_byte_value(Ref.world.get_water_level_at(world_position))
+                blocks[index] = block.id if block != null else 0
+                water[index] = water_level
+                water_awake[index] = 1 if water_level > 0 else 0
+                fire[index] = _clamp_chunk_byte_value(Ref.world.get_fire_at(world_position))
+                index += 1
+
+    return {
+        "blocks": blocks,
+        "water": water,
+        "water_awake": water_awake,
+        "fire": fire,
+    }
+
+
+func _clamp_chunk_byte_value(value: Variant) -> int:
+    return clampi(int(value), 0, 255)
+
+
+func _get_cached_world_chunk_size() -> Vector3i:
+    if cached_world_chunk_size != Vector3i.ZERO:
+        return cached_world_chunk_size
+
+    var fallback_size: Vector3i = Vector3i(16, 16, 16)
+    if not is_instance_valid(Ref.world):
+        cached_world_chunk_size = fallback_size
+        return cached_world_chunk_size
+
+    var chunk_origin: Vector3i = Ref.world.snap_to_chunk(Vector3.ZERO)
+    cached_world_chunk_size = Vector3i(
+        _measure_world_chunk_axis_size(chunk_origin, Vector3i(1, 0, 0), fallback_size.x),
+        _measure_world_chunk_axis_size(chunk_origin, Vector3i(0, 1, 0), fallback_size.y),
+        _measure_world_chunk_axis_size(chunk_origin, Vector3i(0, 0, 1), fallback_size.z)
+    )
+    return cached_world_chunk_size
+
+
+func _measure_world_chunk_axis_size(chunk_origin: Vector3i, axis: Vector3i, fallback: int) -> int:
+    if not is_instance_valid(Ref.world):
+        return fallback
+
+    for step in range(1, 257):
+        var sample_position: Vector3 = Vector3(chunk_origin + axis * step)
+        if Ref.world.snap_to_chunk(sample_position) != chunk_origin:
+            return step
+
+    return fallback
+
+
 func _capture_local_chunk_patch_for_chunk_positions(chunk_positions: Array, include_respawn_positions: bool = false) -> Dictionary:
     if not _can_sample_player() or chunk_positions.is_empty():
         return {}
@@ -7274,7 +8113,7 @@ func _remove_remote_player_proxy(peer_id: int) -> void:
     if not remote_player_proxies.has(peer_id):
         return
     if is_instance_valid(remote_player_proxies[peer_id]):
-        remote_player_proxies[peer_id].call_deferred("queue_free")
+        _queue_runtime_node_for_cleanup(remote_player_proxies[peer_id])
     remote_player_proxies.erase(peer_id)
 
 
@@ -8067,6 +8906,10 @@ func _sync_inputs_from_config() -> void:
         pause_menu_coop_address_input.text = str(config.get("address", "127.0.0.1"))
     if pause_menu_coop_port_input != null:
         pause_menu_coop_port_input.value = int(config.get("port", DEFAULT_PORT))
+    if main_menu_coop_address_input != null:
+        main_menu_coop_address_input.text = str(config.get("address", "127.0.0.1"))
+    if main_menu_coop_port_input != null:
+        main_menu_coop_port_input.value = int(config.get("port", DEFAULT_PORT))
 
 
 func _apply_ui_to_config() -> void:
@@ -8076,14 +8919,19 @@ func _apply_ui_to_config() -> void:
     if pause_menu_coop_address_input != null and _is_pause_menu_coop_panel_open():
         var pause_address: String = pause_menu_coop_address_input.text.strip_edges()
         normalized_address = pause_address if pause_address != "" else "127.0.0.1"
+    elif main_menu_coop_address_input != null and _is_main_menu_coop_panel_open():
+        var main_menu_address: String = main_menu_coop_address_input.text.strip_edges()
+        normalized_address = main_menu_address if main_menu_address != "" else "127.0.0.1"
     elif address_input != null:
         var address: String = address_input.text.strip_edges()
         normalized_address = address if address != "" else "127.0.0.1"
 
     if pause_menu_coop_port_input != null and _is_pause_menu_coop_panel_open():
-        normalized_port = clampi(int(pause_menu_coop_port_input.value), 1, 65535)
+        normalized_port = _get_spin_box_int_value(pause_menu_coop_port_input, normalized_port)
+    elif main_menu_coop_port_input != null and _is_main_menu_coop_panel_open():
+        normalized_port = _get_spin_box_int_value(main_menu_coop_port_input, normalized_port)
     elif port_input != null:
-        normalized_port = clampi(int(port_input.value), 1, 65535)
+        normalized_port = _get_spin_box_int_value(port_input, normalized_port)
 
     config["address"] = normalized_address
     config["port"] = normalized_port
@@ -8097,6 +8945,10 @@ func _apply_ui_to_config() -> void:
         pause_menu_coop_address_input.text = normalized_address
     if pause_menu_coop_port_input != null and int(pause_menu_coop_port_input.value) != normalized_port:
         pause_menu_coop_port_input.value = normalized_port
+    if main_menu_coop_address_input != null and main_menu_coop_address_input.text != normalized_address:
+        main_menu_coop_address_input.text = normalized_address
+    if main_menu_coop_port_input != null and int(main_menu_coop_port_input.value) != normalized_port:
+        main_menu_coop_port_input.value = normalized_port
 
 
 func _on_address_changed(_new_text: String) -> void:
@@ -8210,6 +9062,8 @@ func _on_spawn_browser_item_activated(_index: int) -> void:
 func _update_status_text() -> void:
     _refresh_local_ip_label()
     _refresh_pause_menu_coop_status()
+    _refresh_pause_menu_player_list(true)
+    _refresh_main_menu_coop_status()
     if status_label == null:
         return
 
@@ -8339,9 +9193,13 @@ func _on_local_game_quit() -> void:
         host_rehost_pending = false
         _shutdown_host_session.call_deferred(false, "Host left the session")
     else:
+        var menu_kick_already_pending: bool = client_menu_kick_pending
         if guest_persistent_ready:
             _send_persistent_state_to_host(true)
         disconnect_session(false)
+        if not menu_kick_already_pending and is_instance_valid(Ref.main):
+            client_menu_kick_pending = true
+            _kick_client_to_main_menu.call_deferred()
 
 
 func _on_server_disconnected() -> void:
@@ -8373,6 +9231,7 @@ func _shutdown_host_session(reconnectable: bool, reason: String = "") -> void:
 func _on_local_world_loaded() -> void:
     _set_single_player_shutdown_world_pause_override(false)
     _install_player_death_hook()
+    call_deferred("_install_game_menu_quit_hook")
     _migrate_loaded_legacy_pocket_to_local_owner_if_needed()
     call_deferred("_ensure_pause_menu_coop_ui")
     if not host_rehost_pending:
@@ -8487,6 +9346,10 @@ func _attempt_reconnect() -> void:
     last_host_contact_time = 0
     client_state_heartbeat_timer = 0.0
     last_sent_client_state_hash = 0
+    status_message = "Attempting reconnect..."
+    _update_status_text()
+    if reconnect_overlay_subtitle != null:
+        reconnect_overlay_subtitle.text = "%s\nAttempting reconnect now..." % reconnect_reason
 
     if reconnect_steam_host_id > 0 or reconnect_steam_lobby_id > 0:
         var steam_peer := _create_steam_multiplayer_peer()
@@ -8567,17 +9430,24 @@ func _set_reconnect_overlay_visible(visible: bool) -> void:
 
 
 func _kick_client_to_main_menu() -> void:
-    if (multiplayer.is_server() and _has_live_peer()) or not is_instance_valid(Ref.main) or not Ref.main.loaded:
+    if (multiplayer.is_server() and _has_live_peer()) or not is_instance_valid(Ref.main):
         client_restore_in_progress = false
         client_menu_kick_pending = false
         return
 
     _close_pause_menu_if_open()
-    await Ref.trans.open()
-    Ref.audio_manager.play_song(Ref.main.main_menu_music, 100)
 
     var main_menu = Ref.main.get_node_or_null("%MainMenu")
     var game_menu = Ref.main.get_node_or_null("%GameMenu")
+    var had_loaded_world: bool = bool(Ref.main.loaded)
+
+    if had_loaded_world:
+        await Ref.trans.open()
+    elif is_instance_valid(Ref.trans) and Ref.trans.visible:
+        await Ref.trans.close()
+
+    Ref.audio_manager.play_song(Ref.main.main_menu_music, 100)
+
     if main_menu != null:
         main_menu.open()
     if game_menu != null:
@@ -8585,8 +9455,9 @@ func _kick_client_to_main_menu() -> void:
 
     if is_instance_valid(Ref.player):
         Ref.player.consume_actions()
-    await Ref.main.quit_game(false, false)
-    await Ref.trans.close()
+    if had_loaded_world:
+        await Ref.main.quit_game(false, false)
+        await Ref.trans.close()
 
     if main_menu != null:
         main_menu.activate()
@@ -8982,10 +9853,10 @@ func _clear_client_world_entities_and_drops() -> void:
 
     for child in _get_live_tracked_entities():
         if bool(child.get_meta("coop_synced_entity", false)) or bool(child.get_meta("coop_candidate_existing", false)):
-            child.call_deferred("queue_free")
+            _queue_runtime_node_for_cleanup(child)
     for child in _get_live_tracked_drops():
         if bool(child.get_meta("coop_synced_drop", false)) or bool(child.get_meta("coop_predicted_drop", false)):
-            child.call_deferred("queue_free")
+            _queue_runtime_node_for_cleanup(child)
 
 
 func _clear_local_guest_authoritative_runtime() -> void:
@@ -9003,7 +9874,66 @@ func _clear_local_guest_authoritative_runtime() -> void:
     for child in _get_live_tracked_drops():
         if bool(child.get_meta("coop_synced_drop", false)):
             continue
-        child.call_deferred("queue_free")
+        _queue_runtime_node_for_cleanup(child)
+
+
+func _prepare_runtime_node_for_cleanup(node: Node) -> void:
+    if node == null or not is_instance_valid(node):
+        return
+
+    if node is Timer:
+        (node as Timer).stop()
+    if node is GPUParticles3D:
+        (node as GPUParticles3D).emitting = false
+    elif node is GPUParticles2D:
+        (node as GPUParticles2D).emitting = false
+    elif node is AudioStreamPlayer3D:
+        (node as AudioStreamPlayer3D).stop()
+    elif node is AudioStreamPlayer:
+        (node as AudioStreamPlayer).stop()
+    elif node is VisibleOnScreenEnabler3D:
+        (node as VisibleOnScreenEnabler3D).enable_node_path = ""
+
+    if node.has_method("set_process"):
+        node.set_process(false)
+    if node.has_method("set_physics_process"):
+        node.set_physics_process(false)
+    if node.has_method("set_process_input"):
+        node.set_process_input(false)
+    if node.has_method("set_process_unhandled_input"):
+        node.set_process_unhandled_input(false)
+
+    if node is CollisionObject3D:
+        var collision_object := node as CollisionObject3D
+        collision_object.collision_layer = 0
+        collision_object.collision_mask = 0
+    if node is Area3D:
+        var area := node as Area3D
+        area.monitoring = false
+        area.monitorable = false
+    elif node is RayCast3D:
+        var ray := node as RayCast3D
+        ray.enabled = false
+        ray.collision_mask = 0
+    elif node is CollisionShape3D and _object_has_property(node, "disabled"):
+        node.set_deferred("disabled", true)
+    elif node is CollisionPolygon3D and _object_has_property(node, "disabled"):
+        node.set_deferred("disabled", true)
+
+    for child in node.get_children():
+        if child is Node:
+            _prepare_runtime_node_for_cleanup(child)
+
+
+func _queue_runtime_node_for_cleanup(node: Node) -> void:
+    if node == null or not is_instance_valid(node):
+        return
+
+    _prepare_runtime_node_for_cleanup(node)
+    if node.is_inside_tree():
+        node.call_deferred("queue_free")
+    else:
+        node.queue_free()
 
 
 func _promote_host_synced_entities_to_local_authority() -> void:
@@ -9382,7 +10312,7 @@ func _apply_client_drop_snapshots(drop_snapshots: Array) -> void:
             continue
 
         if is_instance_valid(dropped_item) and dropped_item.item != null and int(dropped_item.item.id) != int(item_state.id):
-            dropped_item.call_deferred("queue_free")
+            _queue_runtime_node_for_cleanup(dropped_item)
             dropped_item = null
 
         if not is_instance_valid(dropped_item):
@@ -9403,7 +10333,7 @@ func _apply_client_drop_snapshots(drop_snapshots: Array) -> void:
         if visible_uuids.has(uuid):
             continue
         if is_instance_valid(synced_dropped_items[uuid]):
-            synced_dropped_items[uuid].call_deferred("queue_free")
+            _queue_runtime_node_for_cleanup(synced_dropped_items[uuid])
         synced_dropped_items.erase(uuid)
 
     _remove_unlisted_client_drops(visible_uuids)
@@ -9511,7 +10441,7 @@ func _remove_unlisted_client_entities(visible_uuids: Dictionary) -> void:
             continue
         if not _should_prune_client_synced_entity(entity):
             continue
-        entity.call_deferred("queue_free")
+        _queue_runtime_node_for_cleanup(entity)
         synced_entities.erase(uuid)
         entity_interp_map.erase(uuid)
 
@@ -9522,7 +10452,7 @@ func _remove_unlisted_client_entities(visible_uuids: Dictionary) -> void:
             continue
         if not _should_prune_client_synced_entity(child):
             continue
-        child.call_deferred("queue_free")
+        _queue_runtime_node_for_cleanup(child)
 
 
 func _remove_unlisted_client_drops(visible_uuids: Dictionary) -> void:
@@ -10867,7 +11797,7 @@ func _schedule_client_visual_projectile_cleanup(projectile, lifetime: float = VI
     var cleanup_timer: SceneTreeTimer = get_tree().create_timer(lifetime, false)
     cleanup_timer.timeout.connect(func() -> void:
         if is_instance_valid(projectile):
-            projectile.queue_free()
+            _queue_runtime_node_for_cleanup(projectile)
     )
 
 
