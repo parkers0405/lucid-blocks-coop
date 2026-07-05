@@ -7,10 +7,10 @@ class_name HeldBallThrower extends HeldItem
 func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
     super.interact(sustain, data)
 
-    if not %CooldownTimer.is_stopped():
+    if not %CooldownTimer.is_stopped() or HeldGun.is_switch_fire(Ref.sun.session_cumulative_time, %CooldownTimer.wait_time, item):
         return false
 
-    if not Ref.world.is_position_loaded(holder.hand.global_position) or Ref.world.is_block_solid_at(holder.hand.global_position):
+    if not can_interact(data):
         return false
 
     var new_ball: Ball = ball_scene.instantiate()
@@ -19,8 +19,8 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
         var intended_peer_id: int = int(holder.call("get_coop_locked_target_peer_id"))
         if intended_peer_id > 1:
             new_ball.set_meta("coop_intended_peer_id", intended_peer_id)
+    new_ball.position = holder.hand.global_position
     get_tree().get_root().add_child(new_ball)
-    new_ball.global_position = holder.hand.global_position
 
     new_ball.linear_velocity = holder.velocity + holder.get_look_direction() * throw_impulse
     if is_instance_valid(holder) and holder.get_class() == "Manikin":
@@ -37,8 +37,10 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
 
     %CooldownTimer.start()
 
-    if holder == Ref.player:
+    if holder == Ref.player and item.internal_name == "ball wand":
         Steamworks.set_achievement("BALL_WAND")
+
+    item.last_shot_time = Ref.sun.session_cumulative_time
 
     return true
 

@@ -97,7 +97,7 @@ var teleport_location: Vector3
 var teleport: bool = false
 
 
-var push_bodies: Dictionary[Entity, bool]
+var push_bodies: Dictionary[PhysicsBody3D, bool]
 var coop_interact_release_grace_timer: float = 0.0
 var last_forward_press_msec: int = 0
 var double_tap_sprint_requested: bool = false
@@ -591,10 +591,14 @@ func _on_burning_stopped() -> void :
 
 
 func _on_body_entered(body: PhysicsBody3D) -> void :
-    push_bodies[body as Entity] = true
+    if not is_instance_valid(body):
+        return
+    push_bodies[body] = true
 
 
 func _on_body_exited(body: PhysicsBody3D) -> void :
+    if not is_instance_valid(body):
+        return
     push_bodies.erase(body)
 
 
@@ -644,7 +648,6 @@ func _process(delta: float) -> void :
     if not Ref.world.is_position_loaded(global_position):
         return
 
-
     var local_movement_enabled: bool = movement_enabled and MouseHandler.fully_captured
     var joy_input: Vector2 = Input.get_vector("camera_left", "camera_right", "camera_up", "camera_down")
     if local_movement_enabled and is_processing_input() and joy_input != Vector2.ZERO:
@@ -692,7 +695,7 @@ func _physics_process(delta: float) -> void :
     if is_future_position_loaded(delta):
         move_and_slide()
 
-    if not dead and not invincible and (Ref.world.current_dimension == LucidBlocksWorld.Dimension.CHALLENGE or Ref.world.current_dimension == LucidBlocksWorld.Dimension.FIRMAMENT) and global_position.y < -128:
+    if not dead and not invincible and (Ref.world.current_dimension == LucidBlocksWorld.Dimension.CHALLENGE or Ref.world.current_dimension == LucidBlocksWorld.Dimension.FIRMAMENT) and (global_position.y < -64 or global_position.y > 512):
         health -= 1
     var input: Vector2 = Input.get_vector("left", "right", "up", "down") if local_movement_enabled else Vector2()
     var movement_dir: Vector3 = %RotationPivot.global_transform.basis * Vector3(input.x, 0, input.y)
@@ -761,7 +764,6 @@ func _physics_process(delta: float) -> void :
     push_process(delta)
 
 
-
 func _input(event: InputEvent) -> void :
     if disabled:
         return
@@ -783,7 +785,7 @@ func _input(event: InputEvent) -> void :
             hold_item(new_index)
 
     var local_movement_enabled: bool = movement_enabled and MouseHandler.fully_captured
-    if local_movement_enabled and is_instance_valid(held_item) and event.is_action_pressed("drop_item", false):
+    if local_movement_enabled and is_instance_valid(held_item) and is_action_pressed_safe("drop_item") and Input.is_action_just_pressed("drop_item"):
         %DropItems.drop_and_remove_from_inventory( %Hotbar, held_item_index)
 
     if local_movement_enabled and event is InputEventKey:
@@ -800,7 +802,7 @@ func _input(event: InputEvent) -> void :
         var y_direction: float = -1.0 if not invert_mouse_y else 1.0
         _set_camera_pitch(camera_pitch + y_direction * event.relative.y * mouse_sensitivity * look_sensitivity_scale)
 
-    if sprint_toggle and event.is_action_pressed("sprint", false):
+    if local_movement_enabled and sprint_toggle and is_action_pressed_safe("sprint") and Input.is_action_just_pressed("sprint"):
         is_sprinting_requested = not is_sprinting_requested
 
     if local_movement_enabled and event.is_action_pressed("up", false):
@@ -811,7 +813,7 @@ func _input(event: InputEvent) -> void :
                 double_tap_sprint_requested = true
             last_forward_press_msec = now_msec
 
-    if crouch_toggle and event.is_action_pressed("crouch", false):
+    if local_movement_enabled and crouch_toggle and is_action_pressed_safe("crouch") and Input.is_action_just_pressed("crouch"):
         is_croucing_requested = not is_croucing_requested
 
 
@@ -865,6 +867,7 @@ func _on_new_game() -> void :
     hate = 1
     lust = 3
     faith = 2
+    druj = 0
 
     if Ref.main.debug and not Ref.main.creative and Ref.save_file_manager.loaded_file_register.get_data("starter_kit", false):
         for i in range(len(starter_kit)):
@@ -905,13 +908,27 @@ func die() -> void :
         get_tree().paused = true
         Ref.audio_manager.fade_out_sfx()
 
-        await Ref.trans.open_scary()
-
+        var retrying: bool = Ref.main.in_challenge and Ref.main.challenge_attempts_remaining > 0
         if Ref.main.in_challenge:
-            print("End challenge...")
-            Ref.main.end_challenge(false)
+            Ref.challenge_status_menu.initialize_remaining(Ref.main.challenge_attempts_remaining)
+            Ref.challenge_status_menu.activate()
+            Ref.challenge_status_menu.open()
+            await Ref.challenge_status_menu.play_cutscene()
+            Ref.challenge_status_menu.deactivate()
+            Ref.challenge_status_menu.close()
+
+            if not retrying:
+                print("End challenge...")
+                Ref.main.end_challenge(false)
+            else:
+                print("Retrying challenge... %d" % Ref.main.challenge_attempts_remaining)
+                Ref.main.challenge_attempts_remaining -= 1
+                revive()
+                await Ref.main.teleport_to_dimension(LucidBlocksWorld.Dimension.CHALLENGE, true)
+                return
         if Ref.main.in_ending:
             print("End ending...")
+            await Ref.trans.open_scary()
             Ref.main.end_ending(false)
         Ref.plot_manager.remove_cutscene()
         revive()
@@ -929,6 +946,7 @@ func revive() -> void :
     health = max_health
     movement_velocity = Vector3()
     rope_velocity = Vector3()
+    residual_rope_velocity = Vector3()
     gravity_velocity = Vector3()
     knockback_velocity = Vector3()
     velocity = Vector3()
@@ -1023,6 +1041,10 @@ func attack_process(data: Dictionary) -> void :
     var attack_pressed: bool = is_action_pressed_safe("attack")
     if not is_interacting():
         if attack_pressed and Input.is_action_just_pressed("attack"):
+            if "star_target" in data:
+                data.star_target.explode(true)
+                %WhiffPlayer.play()
+                %PlayerHand.current_hand.hit()
             if "ball_target" in data and data.ball_target.can_parry:
                 attack_used = true
                 data.ball_target.apply_impulse(velocity * 0.25 + get_look_direction() * 28.0)
@@ -1055,7 +1077,7 @@ func attack_process(data: Dictionary) -> void :
                 place_position = place_position.floor()
                 if not Ref.world.is_position_loaded(place_position):
                     continue
-                if not Ref.world.is_block_solid_at(place_position) and is_instance_valid(Ref.world.get_living_block_at(place_position)):
+                if not is_block_solid_or_non_collision(place_position) and is_instance_valid(Ref.world.get_living_block_at(place_position)):
                     if attack_pressed and Input.is_action_just_pressed("attack"):
                         %BreakBlocks.break_block_instant(Vector3i(place_position))
                     invisible_block_seen = true
@@ -1119,14 +1141,24 @@ func fly_process() -> void :
 
 
 func push_process(delta: float) -> void :
+    var new_push: Dictionary[PhysicsBody3D, bool] = {}
+    for body in push_bodies.keys():
+        if is_instance_valid(body):
+            new_push[body] = true
+    push_bodies = new_push
+
     for body in push_bodies:
-        if not is_instance_valid(body) or body == self:
+        if not is_instance_valid(body):
             continue
-        var distance: float = body.global_position.distance_squared_to(global_position)
-        if distance > 0.75:
+        var entity: Entity = EntityHelper.get_entity(body)
+        if not is_instance_valid(entity) or entity == self:
             continue
-        var t: float = pow(1.0 - distance / 0.75, 2)
-        body.knockback_velocity += (8 * (velocity * 0.1 + 16.0 * t * (body.global_position - global_position).normalized()) * delta * clamp(weight / body.weight, 0.0, 12.0))
+        var distance: float = entity.global_position.distance_to(global_position)
+        var limit: float = 10.0 if entity is Lozenge or entity is Gel else 1.0
+        if distance > limit:
+            continue
+        var t: float = pow(1.0 - clamp(distance, 0.0, limit) / limit, 2)
+        entity.knockback_velocity += (8 * (velocity * 0.1 + 16.0 * t * (entity.global_position - global_position).normalized()) * delta * clamp(weight / entity.weight, 0.0, 12.0))
 
 
 func crouch_snap(delta: float) -> void :
@@ -1216,48 +1248,28 @@ func get_interact_data(skip_look: bool = false) -> Dictionary:
     data.interact_normal = %InteractRayCast3D.get_collision_normal()
     data.interact_end_adjacent = ( %InteractRayCast3D.get_collision_point() + %InteractRayCast3D.get_collision_normal() * 0.5)
 
-
-
-
-    var non_block_position: Vector3
-    var non_block_collision: bool = false
-    for i in range(2):
-        %InteractRayCast3D.set_collision_mask_value(1, i == 1)
-        %InteractRayCast3D.force_raycast_update()
-        if %InteractRayCast3D.is_colliding():
-            data.interact_end = %InteractRayCast3D.get_collision_point()
-
-            var collider: Object = %InteractRayCast3D.get_collider()
-            var resolved_target = _resolve_interact_owner_from_collider(collider)
-            var collider_name: String = collider.name if collider is Node else str(collider)
-            var resolved_name: String = resolved_target.name if resolved_target is Node else str(resolved_target)
-            data["debug_collider"] = "%s:%s" % [collider.get_class(), collider_name]
-            data["debug_resolved"] = "%s:%s" % [resolved_target.get_class(), resolved_name] if is_instance_valid(resolved_target) else "<none>"
-            if resolved_target is Ball or resolved_target is Heart:
-                data.ball_target = resolved_target
-                non_block_position = data.interact_end
-                non_block_collision = true
-                data.attack_position = data.interact_end
-            elif resolved_target is Entity:
-                data.target = resolved_target as Entity
-                non_block_position = data.interact_end
-                non_block_collision = true
-                data.attack_position = data.interact_end
-            else:
-
-                if (
-                    non_block_collision
-                    and (non_block_position.distance_to(data.interact_end) < 0.001 or ( %InteractRayCast3D.global_position.distance_squared_to(non_block_position) < %InteractRayCast3D.global_position.distance_squared_to(data.interact_end)))
-                ):
-                    data.interact_end = non_block_position
-                else:
-                    data.erase("target")
-                    data.erase("ball_target")
-
-                    var target_position: Vector3 = ( %InteractRayCast3D.get_collision_point() - %InteractRayCast3D.get_collision_normal() * 0.5).floor()
-                    if Ref.world.is_position_loaded(target_position) and Ref.world.is_block_solid_at(target_position):
-                        data.target_position = target_position
-                        data.target_position_adjacent = (data.target_position + %InteractRayCast3D.get_collision_normal())
+    %InteractRayCast3D.force_raycast_update()
+    if %InteractRayCast3D.is_colliding():
+        data.interact_end = %InteractRayCast3D.get_collision_point()
+        var collider: Object = %InteractRayCast3D.get_collider()
+        var resolved_target = _resolve_interact_owner_from_collider(collider)
+        var collider_name: String = collider.name if collider is Node else str(collider)
+        var resolved_name: String = resolved_target.name if resolved_target is Node else str(resolved_target)
+        data["debug_collider"] = "%s:%s" % [collider.get_class(), collider_name]
+        data["debug_resolved"] = "%s:%s" % [resolved_target.get_class(), resolved_name] if is_instance_valid(resolved_target) else "<none>"
+        if collider.owner is Star:
+            data.star_target = collider.owner
+        elif resolved_target is Ball or resolved_target is Heart:
+            data.ball_target = resolved_target
+            data.attack_position = data.interact_end
+        elif resolved_target is Entity:
+            data.target = resolved_target as Entity
+            data.attack_position = data.interact_end
+        else:
+            var target_position: Vector3 = ( %InteractRayCast3D.get_collision_point() - %InteractRayCast3D.get_collision_normal() * 0.5).floor()
+            if Ref.world.is_position_loaded(target_position) and is_block_solid_or_non_collision(target_position):
+                data.target_position = target_position
+                data.target_position_adjacent = (data.target_position + %InteractRayCast3D.get_collision_normal())
 
     if not data.has("target") and not data.has("ball_target") and Ref.coop_manager != null and not multiplayer.is_server():
         var fallback_target = Ref.coop_manager.find_client_ray_attack_target(data.interact_begin, data.interact_end)
@@ -1269,3 +1281,12 @@ func get_interact_data(skip_look: bool = false) -> Dictionary:
             data["debug_resolved"] = "fallback:%s:%s" % [fallback_target.get_class(), fallback_target.name if fallback_target is Node else str(fallback_target)]
 
     return data
+
+
+func is_block_solid_or_non_collision(p: Vector3) -> bool:
+    if not Ref.world.is_position_loaded(p):
+        return false
+    if Ref.world.is_block_solid_at(p):
+        return true
+    var block: Block = Ref.world.get_block_type_at(p)
+    return block.no_collision_block

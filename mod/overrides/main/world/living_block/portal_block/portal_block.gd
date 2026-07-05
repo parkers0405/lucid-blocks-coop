@@ -8,7 +8,15 @@ var embargo: bool = false
 func _ready() -> void:
     Ref.save_file_manager.settings_updated.connect(_on_settings_updated)
     _on_settings_updated()
-    %StopTimer.timeout.connect(_on_timeout)
+
+    mark_locked( not can_teleport())
+    if can_teleport():
+        %StopTimer.timeout.connect(_on_timeout)
+
+
+func mark_locked(locked: bool) -> void :
+    %Torus.visible = not locked
+    %LockIndicator.visible = locked
 
 
 func _on_timeout() -> void:
@@ -52,10 +60,17 @@ func interact(interactor: Entity) -> void:
         Ref.main.teleport_to_dimension(target_dimension)
 
 
+func can_teleport() -> bool:
+    if Ref.world.current_dimension == LucidBlocksWorld.Dimension.CHALLENGE or Ref.world.current_dimension == LucidBlocksWorld.Dimension.YHVH:
+        return false
+    return target_dimension != Ref.world.current_dimension
+
+
 func can_currently_interact(interactor: Entity) -> bool:
-    return not embargo and super.can_currently_interact(interactor) and interactor == Ref.player and target_dimension != Ref.world.current_dimension and Ref.world.current_dimension != LucidBlocksWorld.Dimension.CHALLENGE and Ref.world.current_dimension != LucidBlocksWorld.Dimension.YHVH
+    return not embargo and super.can_currently_interact(interactor) and interactor == Ref.player and can_teleport()
 
 
 func preserve_load(file: SaveFile, uuid: String) -> void:
     super.preserve_load(file, uuid)
+
     %EmbargoAnimationPlayer.play("liven_immediate")

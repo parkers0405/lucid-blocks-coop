@@ -19,8 +19,8 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
         item.entity_scene = ResourceLoader.load(item.entity_path)
 
     var new_capsule: SpawnProjectile = item.projectile_scene.instantiate()
+    new_capsule.position = holder.hand.global_position
     get_tree().get_root().add_child(new_capsule)
-    new_capsule.global_position = holder.hand.global_position
     new_capsule.initialize(throw_velocity, item, item.entity_scene)
 
     _play_throw_audio(holder.hand.global_position)

@@ -27,20 +27,26 @@ func _ready() -> void :
 
 
 func _on_boid_entered(body: Node) -> void :
-    if not body is Fish:
+    if not is_instance_valid(body):
         return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or not target is Fish:
+        return
+    var boid: Fish = target as Fish
 
-    var boid: Fish = body as Fish
     if len(boids) >= max_boids:
         return
     boids.append(boid)
 
 
 func _on_boid_exited(body: Node) -> void :
-    if not body is Fish:
+    if not is_instance_valid(body):
         return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or not target is Fish:
+        return
+    var boid: Fish = target as Fish
 
-    var boid: Fish = body as Fish
     var index: int = boids.find(boid)
     if index != -1:
         boids.remove_at(index)

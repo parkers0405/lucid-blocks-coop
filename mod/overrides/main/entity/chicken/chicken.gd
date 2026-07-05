@@ -56,14 +56,36 @@ func _ready() -> void :
 
 
 func _on_body_entered(body: Node3D) -> void :
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+
+    flush_deleted_entities()
     if len(follow_entities) > follow_limit:
         return
-    follow_entities.append(body)
+    follow_entities.append(target)
     update_follow_target()
 
 
+func flush_deleted_entities() -> void :
+    var new_entities: Array[Entity] = []
+    for entity in follow_entities:
+        if is_instance_valid(entity):
+            new_entities.append(entity)
+    follow_entities = new_entities
+
+
 func _on_body_exited(body: Node3D) -> void :
-    var index: int = follow_entities.find(body)
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+
+    flush_deleted_entities()
+    var index: int = follow_entities.find(target)
     if index != -1:
         follow_entities.remove_at(index)
     update_follow_target()
@@ -76,6 +98,8 @@ func update_follow_target() -> void :
     if len(follow_entities) == 0:
         return
     for entity in follow_entities:
+        if not is_instance_valid(entity):
+            continue
         if health == max_health and not entity is Chicken:
             follow = entity
 

@@ -2,8 +2,11 @@
 
 set -euo pipefail
 
-DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
-LEGACY_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+# Build 4.0.1 moved the exe up to common/lucid-blocks/; keep the old nested paths as fallbacks.
+DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE_2="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE_3="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
 
 resolve_game_exe() {
   local configured_game_exe="${GAME_EXE:-}"
@@ -19,6 +22,8 @@ resolve_game_exe() {
   local candidates=(
     "$DEFAULT_GAME_EXE"
     "$LEGACY_GAME_EXE"
+    "$LEGACY_GAME_EXE_2"
+    "$LEGACY_GAME_EXE_3"
   )
 
   local game_exe
@@ -40,7 +45,8 @@ RUNTIME_DIR="${RUNTIME_DIR:-$STEAM_ROOT/steamapps/common/SteamLinuxRuntime_snipe
 SECOND_PREFIX="${SECOND_PREFIX:-$STEAM_ROOT/steamapps/compatdata/lucid-blocks-coop-second}"
 SECOND_SHADERCACHE="${SECOND_SHADERCACHE:-$STEAM_ROOT/steamapps/shadercache/lucid-blocks-coop-second}"
 COOP_PLAYER_KEY_SUFFIX="${COOP_PLAYER_KEY_SUFFIX:-second}"
-GAME_LIBRARY_DIR=$(dirname "$(dirname "$GAME_EXE")")
+# The game's install dir is the folder holding lucid-blocks.exe (and the mods/ folder).
+GAME_LIBRARY_DIR=$(dirname "$GAME_EXE")
 COMPAT_LIBRARY_PATHS="$STEAM_ROOT/steamapps"
 
 if [[ -d "/data/SteamLibrary/steamapps" ]]; then
@@ -57,9 +63,13 @@ if [[ ! -d "$RUNTIME_DIR" ]]; then
   exit 1
 fi
 
-if ! command -v steam-run >/dev/null 2>&1; then
-  printf 'steam-run not found. Try: nix-shell -p steam-run --run ./scripts/run_second_instance.sh\n' >&2
-  exit 1
+# steam-run (a NixOS FHS wrapper) is optional. On non-Nix distros (Arch, etc.) Proton
+# bootstraps its own runtime, so fall back to a plain `env` when steam-run is absent.
+if command -v steam-run >/dev/null 2>&1; then
+  LAUNCH_WRAPPER=(steam-run env)
+else
+  printf 'steam-run not found; launching Proton directly (fine on non-Nix distros).\n' >&2
+  LAUNCH_WRAPPER=(env)
 fi
 
 mkdir -p "$SECOND_PREFIX"
@@ -71,7 +81,7 @@ printf 'Second prefix: %s\n' "$SECOND_PREFIX"
 printf 'Second shadercache: %s\n' "$SECOND_SHADERCACHE"
 printf 'Coop player key suffix: %s\n' "$COOP_PLAYER_KEY_SUFFIX"
 
-steam-run env \
+"${LAUNCH_WRAPPER[@]}" \
   COOP_PLAYER_KEY_SUFFIX="$COOP_PLAYER_KEY_SUFFIX" \
   STEAM_COMPAT_APP_ID=3495730 \
   STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" \

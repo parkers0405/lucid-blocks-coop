@@ -5,8 +5,12 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
-DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
-LEGACY_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+# As of game build 4.0.1 the executable (and its mods/ folder) lives directly under
+# common/lucid-blocks/. Older builds nested it under common/lucid-blocks/lucid-blocks/.
+DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE_2="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE_3="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
 DEFAULT_MOD_NAME="lucid-blocks-coop.pck"
 DEFAULT_PROJECT_DIR="$ROOT_DIR/mod/overrides"
 DEFAULT_DIST_DIR="$ROOT_DIR/dist"
@@ -80,6 +84,8 @@ resolve_game_exe() {
   local candidates=(
     "$DEFAULT_GAME_EXE"
     "$LEGACY_GAME_EXE"
+    "$LEGACY_GAME_EXE_2"
+    "$LEGACY_GAME_EXE_3"
   )
 
   local game_exe

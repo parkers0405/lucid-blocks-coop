@@ -42,8 +42,8 @@ func drop_item(item: ItemState, override_disable: bool = false) -> void:
     var new_item: DroppedItem = dropped_item_scene.instantiate()
     new_item.delay_collect()
     new_item.delay_merge()
+    new_item.position = spawn_position
     get_tree().get_root().add_child(new_item)
-    new_item.global_position = spawn_position
     new_item.initialize(item)
     if new_item.state != DroppedItem.SWIM:
         new_item.velocity = launch_velocity

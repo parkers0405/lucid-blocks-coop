@@ -19,10 +19,8 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
 
     var new_explosive: PhysicalExplosive = item.physical_explosive.instantiate()
     new_explosive.entity_owner = holder
+    new_explosive.position = holder.hand.global_position
     get_tree().get_root().add_child(new_explosive)
-    new_explosive.freeze = true
-    new_explosive.global_position = holder.hand.global_position
-    new_explosive.freeze = false
 
     new_explosive.linear_velocity = holder.velocity + holder.get_look_direction() * throw_impulse
     new_explosive.ignite()

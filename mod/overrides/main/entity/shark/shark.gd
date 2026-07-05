@@ -60,7 +60,7 @@ func _physics_process(delta: float) -> void :
 
     if wall_ray.is_colliding():
         var target_position: Vector3 = (wall_ray.get_collision_point() - wall_ray.get_collision_normal() * 0.5).floor()
-        if hand.global_position.distance_to(target_position) < 5.0:
+        if not GuardChecker.is_guarded_entity(target_position, self) and hand.global_position.distance_to(target_position) < 5.0:
             %BreakBlocks.break_block_instant(target_position)
         uncollide_velocity = lerp(uncollide_velocity, - movement_velocity.normalized(), clamp(delta * uncollide_accel, 0.0, 1.0))
     else:
@@ -78,10 +78,12 @@ func attack_entities() -> void :
     if Vector3(velocity.x, 0, velocity.z).length() < 6.0:
         return
     for i in range(attack_shape.get_collision_count()):
-        var area: Area3D = attack_shape.get_collider(i)
-        if not is_instance_valid(area):
+        var object: Object = attack_shape.get_collider(i)
+        if not is_instance_valid(object):
+            return
+        var entity: Entity = EntityHelper.get_entity_from_area(object)
+        if not is_instance_valid(entity) or entity == self or entity.dead or entity.disabled:
             continue
-        var entity: Entity = area.owner
-        if entity == self or not is_instance_valid(entity) or entity.dead or entity.disabled:
+        if WallChecker.is_obscured(head.global_position, entity):
             continue
         %Attack.attack(entity, hand.global_position, 24.0, 0.25)

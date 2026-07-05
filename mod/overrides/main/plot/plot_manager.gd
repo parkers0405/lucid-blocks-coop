@@ -6,6 +6,7 @@ class_name PlotManager extends Node
 @export var default_cutscene: PackedScene
 @export var debug_override_with_default: bool = false
 @export var debug_override_with_ending: bool = false
+@export var debug_disable_tiamana_gain_from_cutscene: bool = true
 
 @export_category("Special Cutscenes")
 @export var ending_cutscene: PackedScene

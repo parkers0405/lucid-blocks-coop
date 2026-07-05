@@ -17,6 +17,8 @@ var days_elapsed: int = 0
 var frame: int = 0
 var depth_scale: float = 0
 var cumulative_time: float = 0.0
+var global_cumulative_time: float = 0.0
+var session_cumulative_time: float = 0.0
 var time_moving: bool = true
 var time_tween: Tween
 var target_time_scale: float = 1.0
@@ -39,7 +41,7 @@ func _on_settings_updated() -> void :
             directional_shadow_max_distance = 30.0
             directional_shadow_blend_splits = false
         1:
-            ProjectSettings.set("rendering/lights_and_shadows/directional_shadow/size", 2048)
+            ProjectSettings.set("rendering/lights_and_shadows/directional_shadow/size", 1024)
             ProjectSettings.set("rendering/lights_and_shadows/directional_shadow/soft_shadow_filter_quality", 1)
             directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS
             directional_shadow_max_distance = 40.0
@@ -72,6 +74,9 @@ func _process(delta: float) -> void :
             time = 0.0
         time += delta * time_scale
         cumulative_time += delta
+        global_cumulative_time += delta
+
+    session_cumulative_time += delta
 
     depth_scale = get_height_x()
     light_energy = brightness_curve.curve.sample(time) * height_brightness_curve.curve.sample(depth_scale)
@@ -112,6 +117,7 @@ func exit_game() -> void :
 func save_file(file: SaveFile) -> void :
     file.set_data("sun/time", time)
     file.set_data("sun/cumulative_time", cumulative_time)
+    file.set_data("sun/global_cumulative_time", global_cumulative_time, true)
     file.set_data("sun/days_elapsed", days_elapsed)
     file.set_data("sun/time_scale", target_time_scale)
 
@@ -119,6 +125,7 @@ func save_file(file: SaveFile) -> void :
 func load_file(file: SaveFile) -> void :
     time = file.get_data("sun/time", 0.8)
     cumulative_time = file.get_data("sun/cumulative_time", 0.0)
+    global_cumulative_time = file.get_data("sun/global_cumulative_time", 0.0, true)
     days_elapsed = file.get_data("sun/days_elapsed", 0)
     target_time_scale = file.get_data("sun/time_scale", 1.0)
     set_time_scale(target_time_scale)

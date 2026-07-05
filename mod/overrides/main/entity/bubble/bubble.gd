@@ -93,7 +93,10 @@ func _on_shoot_timeout() -> void :
         held_item.interact_end()
 
     if entity_ray.is_colliding():
-        var entity: Entity = entity_ray.get_collider() as Entity
+        var collider: Object = entity_ray.get_collider()
+        if not is_instance_valid(collider):
+            return
+        var entity: Entity = EntityHelper.get_entity(collider)
         if not is_instance_valid(entity):
             return
         if not entity == target:
@@ -123,7 +126,9 @@ func get_target() -> void :
     var closest_entity: Entity = null
     for i in range(entity_detect.get_collision_count()):
         var object: Object = entity_detect.get_collider(i)
-        var entity: Entity = object.owner
+        if not is_instance_valid(object):
+            return
+        var entity: Entity = EntityHelper.get_entity_from_area(object)
         if not is_instance_valid(entity) or entity.dead or entity.disabled or entity is Bubble or entity is Hamsa or entity is Ofanim:
             continue
         if not is_instance_valid(closest_entity):

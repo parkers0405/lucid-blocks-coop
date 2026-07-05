@@ -25,7 +25,6 @@ var approximate_velocity: Vector3
 var color_1: Color
 var color_2: Color
 
-
 func _ready() -> void :
     super._ready()
     modulate_changed.connect(_on_modulate_changed)
@@ -48,30 +47,44 @@ func _ready() -> void :
 
 
 func _on_body_entered_attack_area(body: Node3D) -> void :
-    if dead or disabled or not is_instance_valid(body) or body is Gel or body.dead:
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if dead or disabled or not is_instance_valid(target) or target is Gel or target.dead:
         return
     if approximate_velocity.length() < 4.0:
         return
 
 
     velocity = approximate_velocity
-    %Attack.attack(body, global_position, 48.0 * weight / 0.5, 0.55)
+    if not WallChecker.is_obscured(global_position, target):
+        %Attack.attack(target, global_position, 28.0 * clamp(weight, 0.0, 1.0), 0.55)
     velocity = Vector3()
 
 
 func _on_target_entered(body: Node3D) -> void :
-    if len(bothersome_entities) > bothersome_limit:
+    if not is_instance_valid(body):
         return
-    if body is Gel:
+    var target: Entity = EntityHelper.get_entity(body)
+    if len(bothersome_entities) > bothersome_limit or not is_instance_valid(target) or target is Gel:
         return
-    if bothersome_entities.has(body):
+
+    flush_deleted_entities()
+    if bothersome_entities.has(target):
         return
-    bothersome_entities.append(body)
+    bothersome_entities.append(target)
     update_bothersome_target()
 
 
 func _on_target_exited(body: Node3D) -> void :
-    var index: int = bothersome_entities.find(body)
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+
+    flush_deleted_entities()
+    var index: int = bothersome_entities.find(target)
     if index != -1:
         bothersome_entities.remove_at(index)
     update_bothersome_target()
@@ -131,8 +144,8 @@ func _physics_process(delta: float) -> void :
     if is_session_position_loaded( %CenterPoint.global_position) and Ref.world.is_block_solid_at( %CenterPoint.global_position):
         global_position.y += 1.0
 
-    if knockback_velocity.length() > 0.1:
-        softbody.apply_central_force(128.0 * knockback_velocity)
+    if knockback_velocity.length() > 0.2:
+        softbody.apply_central_force(400.0 * knockback_velocity)
     if rope_velocity.length() > 0.1:
         softbody.apply_central_force(127.0 * rope_velocity)
 
@@ -152,6 +165,8 @@ func update_bothersome_target() -> void :
         return
 
     for entity in bothersome_entities:
+        if not is_instance_valid(entity):
+            continue
         if is_session_player_entity(entity):
             bothersome = entity
             break
@@ -178,17 +193,20 @@ func _on_alpha_changed(new_alpha: float) -> void :
     softbody.set_instance_shader_parameter("fade", new_alpha)
 
 
+func flush_deleted_entities() -> void :
+    var new_entities: Array[Entity] = []
+    for entity in bothersome_entities:
+        if is_instance_valid(entity):
+            new_entities.append(entity)
+    bothersome_entities = new_entities
+
+
 func attacked(attacker: Entity, damage: int) -> void :
     if dead or disabled or softbody.process_mode == PROCESS_MODE_DISABLED:
         return
-
+    super.attacked(attacker, damage)
     if is_instance_valid(attacker):
-        var knockback_strength: float = knockback_velocity.length()
-        knockback_velocity = (get_softbody_approximate_position() - attacker.global_position) * knockback_strength
-        super.attacked(attacker, damage)
         bothersome = attacker
-    else:
-        super.attacked(attacker, damage)
 
 
 func update_positions() -> bool:

@@ -7,8 +7,15 @@ Multiplayer Co-op mod For Lucid Blocks.
 
 1) Download From Github
 2) Unzip, and open "dist"
-4) Copy `lucid-blocks-coop.pck`.
-5) Paste it into your mods folder (EX:'SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/mods')
+3) Copy `lucid-blocks-coop.pck`.
+4) Paste it into your mods folder — the `mods` folder sits next to `lucid-blocks.exe`
+   (EX: `SteamLibrary/steamapps/common/lucid-blocks/mods`). Create the folder if it
+   does not exist.
+
+> Updating from an older build? The June 2026 game update (build 4.0.1) moved
+> `lucid-blocks.exe` up one folder. If you previously installed into the old nested
+> `common/lucid-blocks/lucid-blocks/mods`, delete that old `.pck` and reinstall next to
+> the new exe, or the mod will silently fail to load.
 
 
 ## How To Join Co-op
@@ -18,9 +25,20 @@ Multiplayer Co-op mod For Lucid Blocks.
 3) [Guest] Once they are hosting, enter their IP and click join.
 
 
+## Compatibility
+
+- Updated for game build **4.0.1** (June 2026). The 4.0.1 update changed the save
+  format (chunks now live in per-region files instead of one big save dictionary) and
+  added a backup/restore menu, which is what bricked older versions of this mod.
+
 ## Known Issues
 
 - Apotheosis is 'working' but its not super tested so make sure to back up your world
+- **Back up your world before co-op building.** The 4.0.1 save-format change is not yet
+  fully reconciled with how the mod syncs guest edits back to the host. Joining a host and
+  seeing their world works; a guest building/mining and the host then reloading is not
+  fully tested and can revert the host's world. Firmament/Apotheosis and Challenge/YHVH
+  co-op world-sharing are also still affected. Naraka/Creative/Pocket joins are fine.
 - Host can save and quit great, but guest has to relauch game after playing COOP
 - Manikin can't agro Guest, and will always attack
 - Gel, and small gel are invisble to Gust but can beat the heck out the guest anyway

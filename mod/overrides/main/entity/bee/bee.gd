@@ -47,20 +47,26 @@ func _on_alpha_changed(new_alpha: float) -> void :
 
 
 func _on_boid_entered(body: Node) -> void :
-    if not body is Bee:
+    if not is_instance_valid(body):
         return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or not target is Bee:
+        return
+    var boid: Bee = target as Bee
 
-    var boid: Bee = body as Bee
     if len(boids) >= max_boids:
         return
     boids.append(boid)
 
 
 func _on_boid_exited(body: Node) -> void :
-    if not body is Bee:
+    if not is_instance_valid(body):
         return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or not target is Bee:
+        return
+    var boid: Bee = target as Bee
 
-    var boid: Bee = body as Bee
     var index: int = boids.find(boid)
     if index != -1:
         boids.remove_at(index)

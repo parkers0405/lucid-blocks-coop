@@ -37,7 +37,6 @@ func _physics_process(delta: float) -> void :
     if is_future_position_loaded(delta):
         move_and_slide()
 
-
     var nudge: Vector3 = Vector3(
         randf_range(-1, 1), 
         randf_range(-1, 1), 
@@ -46,7 +45,6 @@ func _physics_process(delta: float) -> void :
 
     movement_velocity += nudge
     movement_velocity = movement_velocity.limit_length(max_drift_speed)
-
     if is_instance_valid(get_last_slide_collision()):
         var collision: KinematicCollision3D = get_last_slide_collision()
         var normal: Vector3 = collision.get_normal()

@@ -5,6 +5,9 @@ class_name Bubblebear extends Entity
 @export var panic_time: float = 4.0
 @export var random_time_range: float = 1.5
 @export var turn_accel: float = 4.0
+@export var summon_scene: PackedScene
+@export var revival_chance: float = 0.01
+@export var jumpy: bool = false
 
 @onready var anim: AnimationTree = %BubblebearModel.get_node("%AnimationTree")
 @onready var ambient_sound_enabled: bool = %AmbientSound.enabled
@@ -84,6 +87,9 @@ func _physics_process(delta: float) -> void :
     else:
         anim["parameters/fear/blend_amount"] = lerp(anim["parameters/fear/blend_amount"], 0.0, delta * 8.0)
 
+        if jumpy and is_on_floor() and %JumpRayCast.is_colliding():
+            will_jump = true
+
     var horizontal_velocity: Vector3 = Vector3(velocity.x, 0, velocity.z)
     anim["parameters/walk/blend_amount"] = min(1.0, horizontal_velocity.length() / (speed * speed_modifier))
     %RotationPivot.rotation.y = lerp_angle( %RotationPivot.rotation.y, desired_angle, clamp(delta * turn_accel, 0.0, 1.0))
@@ -137,7 +143,17 @@ func _on_attacked(attacker: Entity) -> void :
     %StateTimer.start(get_time(panic_time))
 
 
+func summon() -> void :
+    if disabled or not is_inside_tree():
+        return
+    var new_summon: ArchangelSummon = summon_scene.instantiate()
+    get_tree().get_root().add_child(new_summon)
+    new_summon.summon(global_position)
+
+
 func die() -> void :
+    if randf() < revival_chance and summon_scene != null:
+        summon()
     %AmbientSound.enabled = false
 
     if panic_source == Ref.player:

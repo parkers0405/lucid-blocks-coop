@@ -11,3 +11,6 @@ mod/overrides/.godot/
 !dist/lucid-blocks-coop-test.pck
 !dist/zzz-lucid-blocks-command-chat.pck
 lucid-blocks-decompiled
+
+# local build/scratch working dir
+work/

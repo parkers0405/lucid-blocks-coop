@@ -25,20 +25,26 @@ func _ready() -> void :
 
 
 func _on_boid_entered(body: Node) -> void :
-    if not body is Boid:
+    if not is_instance_valid(body):
         return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or not target is Boid:
+        return
+    var boid: Boid = target as Boid
 
-    var boid: Boid = body as Boid
     if len(boids) >= max_boids:
         return
     boids.append(boid)
 
 
 func _on_boid_exited(body: Node) -> void :
-    if not body is Boid:
+    if not is_instance_valid(body):
         return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or not target is Boid:
+        return
+    var boid: Boid = target as Boid
 
-    var boid: Boid = body as Boid
     var index: int = boids.find(boid)
     if index != -1:
         boids.remove_at(index)

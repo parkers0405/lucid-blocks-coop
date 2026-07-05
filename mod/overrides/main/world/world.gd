@@ -14,7 +14,7 @@ class_name LucidBlocksWorld extends World
 signal start_up_done
 
 
-enum Dimension { DEBUG = 0, CREATIVE = 1, NARAKA = 2, POCKET = 3, CHALLENGE = 4, FIRMAMENT = 5, YHVH = 6 }
+enum Dimension { DEBUG = 0, CREATIVE = 1, NARAKA = 2, POCKET = 3, CHALLENGE = 4, FIRMAMENT = 5, YHVH = 6, ALMA = 7 }
 var current_dimension: Dimension = Dimension.NARAKA
 
 
@@ -510,6 +510,8 @@ func select_generator() -> void :
             generator = ResourceLoader.load("res://main/world/generators/firmament_generator.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
         Dimension.YHVH:
             generator = ResourceLoader.load("res://main/world/generators/yhvh_generator.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
+        Dimension.ALMA:
+            generator = ResourceLoader.load("res://main/world/generators/alma_generator.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
         _:
             assert(false)
     generator.seed = current_seed
@@ -531,25 +533,87 @@ func _get_dimension_save_namespace() -> String:
     return dimension_namespace
 
 
-func save_file(file: SaveFile) -> void :
+func get_region_file_name(region_coordinate: Vector3i) -> String:
+    return "c%d.%d.%d.txt" % [region_coordinate.x, region_coordinate.y, region_coordinate.z]
+
+
+func save_chunk_data(chunk_directory: String) -> void :
+    register_loaded_chunks()
+
+    var dimension_folder: String = _get_dimension_save_namespace()
+    var dimension_directory = chunk_directory + "/" + dimension_folder + "/"
+    if not DirAccess.dir_exists_absolute(dimension_directory):
+        var status: Error = DirAccess.make_dir_absolute(dimension_directory)
+        assert (status == OK)
+
+    var regions_to_save: Dictionary[Vector3i, bool] = get_regions_to_save()
+    print("Regions to save: ", len(regions_to_save))
+    for region_coordinate in regions_to_save:
+        var region_file: FileAccess = FileAccess.open(dimension_directory + get_region_file_name(region_coordinate), FileAccess.WRITE)
+
+        var region_file_data: Dictionary = get_region_data(region_coordinate)
+        region_file_data["save_version"] = ProjectSettings.get_setting("application/config/version")
+        region_file_data["coordinate"] = region_coordinate
+
+        var json_string: String = JSON.stringify(JSON.from_native(region_file_data))
+        var buffer: PackedByteArray = json_string.to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)
+        var _buffer_saved: bool = region_file.store_buffer(buffer)
+
+
+func load_chunk_data(chunk_directory: String) -> void :
+    select_generator()
+
+    var dimension_folder: String = _get_dimension_save_namespace()
+    var dimension_directory = chunk_directory + "/" + dimension_folder + "/"
+
+    if not DirAccess.dir_exists_absolute(dimension_directory):
+        # Co-op private instances (pocket__<owner>, firmament__<owner>) are invisible to the
+        # vanilla plain-key migration gate, so migrate their legacy in-file data here.
+        var legacy_file: SaveFile = Ref.save_file_manager.loaded_file if Ref.save_file_manager != null else null
+        if legacy_file != null and legacy_file.data.has(dimension_folder + "_world"):
+            load_data(legacy_file.data, dimension_folder + "_")
+            legacy_file.data.erase(dimension_folder + "_world")
+            make_all_regions_dirty()
+            return
+        print("No chunk directory found for this dimension.")
+        return
+
+    for region_file_name in DirAccess.get_files_at(dimension_directory):
+        var region_file = FileAccess.open(dimension_directory + region_file_name, FileAccess.READ)
+        var buffer: PackedByteArray = region_file.get_buffer(region_file.get_length()).decompress_dynamic(4000000000, FileAccess.COMPRESSION_GZIP)
+        var data: Dictionary = JSON.to_native(JSON.parse_string(buffer.get_string_from_utf8()))
+        region_file.close()
+        load_region(data)
+
+
+func load_chunks_old(file: SaveFile) -> void :
+    select_generator()
     var dimension_namespace: String = _get_dimension_save_namespace()
-    save_data(file.data, dimension_namespace + "_")
+    load_data(file.data, dimension_namespace + "_")
+
+
+
+func clear_old_chunk_data(file: SaveFile, dimension: Dimension) -> void :
+    file.data.erase(SaveFile.DIMENSION_MAP[dimension] + "_world")
+    if dimension == current_dimension:
+        var dimension_namespace: String = _get_dimension_save_namespace()
+        if dimension_namespace != SaveFile.DIMENSION_MAP[dimension]:
+            file.data.erase(dimension_namespace + "_world")
+
+
+func save_file(file: SaveFile) -> void :
     var owner_key: String = _get_private_instance_owner_key()
     if owner_key != "":
-        file.set_data("%s/respawn_positions" % dimension_namespace, respawn_positions, false)
+        file.set_data("%s/respawn_positions" % _get_dimension_save_namespace(), respawn_positions, false)
     else:
         file.set_data("respawn_positions", respawn_positions)
 
 
 func load_file(file: SaveFile) -> void :
-    select_generator()
-    var dimension_namespace: String = _get_dimension_save_namespace()
-    load_data(file.data, dimension_namespace + "_")
-
     var default_positions: Dictionary[Vector3i, bool] = {}
     var owner_key: String = _get_private_instance_owner_key()
     if owner_key != "":
-        respawn_positions = file.get_data("%s/respawn_positions" % dimension_namespace, file.get_data("respawn_positions", default_positions), false)
+        respawn_positions = file.get_data("%s/respawn_positions" % _get_dimension_save_namespace(), file.get_data("respawn_positions", default_positions), false)
     else:
         respawn_positions = file.get_data("respawn_positions", default_positions)
 

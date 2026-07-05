@@ -93,6 +93,7 @@ var process_distance: float = 0.0:
 @export_group("Other")
 @export var can_rename: bool = true
 @export var disabled_by_visibility: bool = true
+@export var disabled_by_distance: bool = true
 @export var damage_modulate: Color
 @export var heal_modulate: Color
 @export var dropped_item_scene: PackedScene
@@ -132,6 +133,7 @@ signal held_item_index_changed
 signal modulate_changed(new_modulate: Color)
 signal alpha_changed(new_alpha: float)
 signal death_drop_item
+signal fire_damage_taken
 
 
 var held_item_index: int = 0:
@@ -281,6 +283,8 @@ var gravity_modifier: float:
 var last_attacker: Entity
 
 var has_endure: bool = false
+
+var armored: bool = false
 
 func _ready() -> void :
     if swarming:
@@ -548,8 +552,8 @@ func attacked(attacker: Entity, damage: int) -> void :
         heal( - damage)
     else:
         on_attacked.emit(attacker)
-        take_damage(damage, MELEE)
         last_attacker = attacker
+        take_damage(max(damage - (1 if armored else 0), 1), MELEE)
 
 
 func heal(heal_power: int) -> void :
@@ -604,6 +608,7 @@ func take_damage(damage: int, type: int) -> void :
             %FallSound.play()
             %ImpactSound.play()
         FIRE:
+            fire_damage_taken.emit()
             equipment_damage = true
             %ImpactSound.play()
             %BurnSound.play()
@@ -663,8 +668,8 @@ func die() -> void :
         if item == null:
             continue
         var new_item: DroppedItem = dropped_item_scene.instantiate()
+        new_item.position = (Vector3(0.05, 0.05, 0) + %CenterRotatePoint.global_position - Vector3(0.5, 0.5, 0.5))
         get_tree().get_root().add_child(new_item)
-        new_item.global_position = (Vector3(0.05, 0.05, 0) + %CenterRotatePoint.global_position - Vector3(0.5, 0.5, 0.5))
         new_item.delay_merge()
         new_item.initialize(item)
     await %DeathAnimationPlayer.animation_finished
@@ -699,12 +704,14 @@ func preserve_save(file: SaveFile, uuid: String) -> void :
     file.set_data("node/%s/movement_velocity" % uuid, movement_velocity, false)
     file.set_data("node/%s/gravity_velocity" % uuid, gravity_velocity, false)
     file.set_data("node/%s/knockback_velocity" % uuid, knockback_velocity, false)
+    file.set_data("node/%s/residual_rope_velocity" % uuid, residual_rope_velocity, false)
     file.set_data("node/%s/rope_velocity" % uuid, rope_velocity, false)
     file.set_data("node/%s/health" % uuid, health, multidimensional)
     file.set_data("node/%s/max_health" % uuid, max_health, multidimensional)
     file.set_data("node/%s/hate" % uuid, hate, multidimensional)
     file.set_data("node/%s/faith" % uuid, faith, multidimensional)
     file.set_data("node/%s/lust" % uuid, lust, multidimensional)
+    file.set_data("node/%s/druj" % uuid, druj, multidimensional)
     file.set_data("node/%s/rotation_pivot" % uuid, %RotationPivot.rotation.y, false)
     file.set_data("node/%s/nickname" % uuid, nickname, multidimensional)
     file.set_data("node/%s/has_endure" % uuid, has_endure, multidimensional)
@@ -731,6 +738,7 @@ func preserve_load(file: SaveFile, uuid: String) -> void :
     gravity_velocity = file.get_data("node/%s/gravity_velocity" % uuid, Vector3(), false)
     knockback_velocity = file.get_data("node/%s/knockback_velocity" % uuid, Vector3(), false)
     rope_velocity = file.get_data("node/%s/rope_velocity" % uuid, Vector3(), false)
+    residual_rope_velocity = file.get_data("node/%s/residual_rope_velocity" % uuid, Vector3(), false)
     nickname = file.get_data("node/%s/nickname" % uuid, "", multidimensional)
     has_endure = file.get_data("node/%s/has_endure" % uuid, can_endure, multidimensional)
 
@@ -739,6 +747,7 @@ func preserve_load(file: SaveFile, uuid: String) -> void :
     hate = file.get_data("node/%s/hate" % uuid, hate, multidimensional)
     faith = file.get_data("node/%s/faith" % uuid, faith, multidimensional)
     lust = file.get_data("node/%s/lust" % uuid, lust, multidimensional)
+    druj = file.get_data("node/%s/druj" % uuid, druj, multidimensional)
     health = file.get_data("node/%s/health" % uuid, max_health, multidimensional)
     held_item_index = file.get_data("node/%s/held_item_index" % uuid, 0, multidimensional)
 
@@ -765,9 +774,9 @@ func _refresh_held_item_from_inventory_slot(index: int) -> void:
 
 
 func hold_item(index: int) -> void :
-    held_item_index = index
-
     unhold_item()
+
+    held_item_index = index
 
     if held_item_inventory.items[index] == null:
         return
@@ -851,7 +860,7 @@ func distance_process_check() -> void :
         var session_distance: float = Ref.coop_manager.get_nearest_session_player_distance(global_position, distance)
         near_session_player = session_distance < distance
         distance = session_distance
-    if distance >= process_distance:
+    if disabled_by_distance and distance >= process_distance:
         set_physics_process(false)
         set_process(false)
 

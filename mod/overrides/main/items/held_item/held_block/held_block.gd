@@ -27,7 +27,8 @@ func initialize(set_inventory: Inventory, set_index: int, set_holder: Entity) ->
     %Cube.visible = not item.foliage and not item.override_icon
     %Cube.set_instance_shader_parameter("index", item.get_index())
 
-    placement_check = %PlacementCheckShapeCast3D
+
+    placement_check = %PlacementCheckShapeCast3D if item.internal_name != "barrier balls" and item.internal_name != "barrier blocks" and item.internal_name != "barrier cone" else %TallPlacementCheckShapeCast3D
     remove_child(placement_check)
     get_tree().get_root().add_child(placement_check)
     placement_check.scale = Vector3(1, 1, 1)
@@ -85,7 +86,8 @@ func place_block() -> void :
     else:
         place_position = final_place_position
         inventory.change_amount(inventory_index, -1)
-        Ref.world.place_block_at(place_position, to_place, true, true)
+        if not GuardChecker.is_guarded_entity(place_position, holder):
+            Ref.world.place_block_at(place_position, to_place, true, true)
         if holder == Ref.player and Ref.coop_manager != null:
             Ref.coop_manager.notify_local_world_state_dirty([place_position])
 
@@ -102,8 +104,7 @@ func can_place() -> bool:
     placement_check.global_rotation = Vector3()
     placement_check.global_position = Vector3(future_place_position) + Vector3(0.5, 0.5, 0.5)
     placement_check.force_shapecast_update()
-
-    if not Ref.world.is_position_loaded(future_place_position) or Ref.world.is_block_solid_at(future_place_position) or (not item.foliage and placement_check.is_colliding()):
+    if not Ref.world.is_position_loaded(future_place_position) or Ref.world.is_block_solid_at(future_place_position) or ( not item.foliage and placement_check.is_colliding()):
         return false
 
     if (not item is LetterBlock and item.foliage) and Ref.world.get_block_type_at(future_place_position).id != 0:
@@ -147,4 +148,6 @@ func can_interact(data: Dictionary) -> bool:
                 place_id += 5
             Vector3i(-1, 0, 0):
                 place_id += 6
+    if place_id not in ItemMap.id_to_resource:
+        return false
     return can_place()

@@ -17,7 +17,10 @@ func _ready() -> void:
 
 func _on_refresh_timer() -> void:
     %CollisionShape3D.disabled = true
-    await get_tree().process_frame
+    await get_tree().physics_frame
+    await get_tree().physics_frame
+    if not is_inside_tree() or not has_node("%CollisionShape3D") or not is_instance_valid( %CollisionShape3D):
+        return
     %CollisionShape3D.disabled = false
 
 

@@ -5,8 +5,13 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
-DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
-LEGACY_GAME_EXE="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+# As of game build 4.0.1 the executable lives directly under common/lucid-blocks/.
+# Older builds nested it one level deeper (common/lucid-blocks/lucid-blocks/); keep
+# those as fallbacks so the tooling still resolves on un-updated installs.
+DEFAULT_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE="$HOME/.local/share/Steam/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE_2="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks.exe"
+LEGACY_GAME_EXE_3="/data/SteamLibrary/steamapps/common/lucid-blocks/lucid-blocks/lucid-blocks.exe"
 DEFAULT_GDRE_VERSION="v2.4.0"
 DEFAULT_GODOT_EXPORT_BIN="$ROOT_DIR/work/tools/godot-4.6/editor/Godot_v4.6-stable_linux.x86_64"
 
@@ -24,6 +29,8 @@ resolve_game_exe() {
   local candidates=(
     "$DEFAULT_GAME_EXE"
     "$LEGACY_GAME_EXE"
+    "$LEGACY_GAME_EXE_2"
+    "$LEGACY_GAME_EXE_3"
   )
 
   local game_exe

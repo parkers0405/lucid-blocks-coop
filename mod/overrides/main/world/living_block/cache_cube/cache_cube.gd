@@ -69,8 +69,8 @@ static func drop_block_items(inventory: Inventory, block_position: Vector3, tree
 
         var new_item: DroppedItem = dropped_item_scene.instantiate()
         new_item.delay_collect()
+        new_item.position = (block_position + Vector3(0.0, break_offset, 0.0) + Vector3(randf() - 0.5, 0.0, randf() - 0.5) * break_spawn_spread)
         tree.get_root().add_child(new_item)
-        new_item.global_position = block_position + Vector3(0.0, break_offset, 0.0) + Vector3(randf() - 0.5, 0.0, randf() - 0.5) * break_spawn_spread
         new_item.initialize(item_state)
 
         if new_item.state != DroppedItem.SWIM:

@@ -6,10 +6,10 @@ class_name HeldRodThrower extends HeldItem
 func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
     super.interact(sustain, data)
 
-    if not %CooldownTimer.is_stopped():
+    if not %CooldownTimer.is_stopped() or HeldGun.is_switch_fire(Ref.sun.session_cumulative_time, %CooldownTimer.wait_time, item):
         return false
 
-    if not Ref.world.is_position_loaded(holder.hand.global_position) or Ref.world.is_block_solid_at(holder.hand.global_position):
+    if not can_interact(data):
         return false
 
     if Ref.coop_manager != null and holder == Ref.player and Ref.coop_manager.has_active_session() and Ref.coop_manager.is_client_session():
@@ -28,7 +28,7 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
 
     var new_bolt: Bolt = bolt_scene.instantiate()
     get_tree().get_root().add_child(new_bolt)
-    new_bolt.global_position = holder.hand.global_position
+    new_bolt.position = holder.hand.global_position
     new_bolt.entity_owner = holder
 
     if is_instance_valid(holder) and holder.get_class() == "Manikin":
@@ -39,11 +39,13 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
 
     var new_player: AudioStreamPlayer3D = %ShootPlayer.duplicate()
     new_player.finished.connect(new_player.queue_free)
+    new_player.position = holder.hand.global_position
     get_tree().get_root().add_child(new_player)
-    new_player.global_position = holder.hand.global_position
     new_player.play()
 
     %CooldownTimer.start()
+
+    item.last_shot_time = Ref.sun.session_cumulative_time
 
     return true
 

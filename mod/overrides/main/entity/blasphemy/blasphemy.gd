@@ -19,9 +19,11 @@ class_name Blasphemy extends Entity
 @export var leg_span: float = 2 * PI
 @export var jumpy: bool = false
 
+
 @export_group("Other")
 @export var ik_leg_scene: PackedScene
 @export var kill_achievement: bool = false
+@export var attacks: bool = true
 
 var legs: Array[IKLeg]
 var leg_rests: Array[Marker3D]
@@ -62,7 +64,7 @@ func _ready() -> void:
         var new_target := Marker3D.new()
         %LegTargets.add_child(new_target)
         new_target.global_position = global_position
-        new_target.global_position += Vector3(sin(angle), 0, -cos(angle)) * leg_rest_distance
+        new_target.global_position += Vector3(sin(angle), 0, -cos(angle)) * leg_target_initial_distance
         leg_targets.append(new_target)
         new_leg.target = new_target
 
@@ -150,19 +152,27 @@ func _get_chase_target():
 
 
 func _on_body_entered_attack(body: Node3D) -> void:
-    if body == self:
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or target == self:
         return
     if near_entities.size() > max_targets:
         return
-    if not near_entities.has(body):
-        near_entities.append(body)
+    if not near_entities.has(target):
+        near_entities.append(target)
     if not near_entities.is_empty() and has_node("%AttackTimer") and %AttackTimer.is_stopped():
         _on_attack_timeout()
         %AttackTimer.start(attack_timeout)
 
 
 func _on_body_exited_attack(body: Node3D) -> void:
-    near_entities.erase(body)
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or target == self:
+        return
+    near_entities.erase(target)
     if near_entities.is_empty() and is_inside_tree() and has_node("%AttackTimer"):
         %AttackTimer.stop()
 
@@ -175,11 +185,13 @@ func _on_stuck_timeout() -> void:
 
 
 func _on_attack_timeout() -> void:
-    if dead or disabled:
+    if dead or disabled or not attacks:
         return
     %AttackAnimationPlayer.play("attack")
     for entity in near_entities:
         if is_instance_valid(entity) and entity.global_position.distance_to(global_position) < attack_distance:
+            if WallChecker.is_obscured( %Core.global_position, entity):
+                continue
             %Attack.attack(entity, entity.global_position, 50.0)
 
 

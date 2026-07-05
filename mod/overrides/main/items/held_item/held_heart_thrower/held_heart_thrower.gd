@@ -7,16 +7,16 @@ class_name HeldHeartThrower extends HeldItem
 func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
     super.interact(sustain, data)
 
-    if not %CooldownTimer.is_stopped():
+    if not %CooldownTimer.is_stopped() or HeldGun.is_switch_fire(Ref.sun.session_cumulative_time, %CooldownTimer.wait_time, item):
         return false
 
-    if not Ref.world.is_position_loaded(holder.hand.global_position) or Ref.world.is_block_solid_at(holder.hand.global_position):
+    if not can_interact(data):
         return false
 
     var new_heart: Heart = heart_scene.instantiate()
     new_heart.entity_owner = holder
+    new_heart.position = holder.hand.global_position
     get_tree().get_root().add_child(new_heart)
-    new_heart.global_position = holder.hand.global_position
 
     new_heart.linear_velocity = holder.velocity + holder.get_look_direction() * throw_impulse
     _sync_visual_heart_throw(new_heart)
@@ -29,8 +29,9 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
     new_player.global_position = holder.hand.global_position
     new_player.play()
 
-    if holder == Ref.player:
-        Steamworks.set_achievement("BALL_WAND")
+    %CooldownTimer.start()
+
+    item.last_shot_time = Ref.sun.session_cumulative_time
 
     return true
 
@@ -51,4 +52,4 @@ func _sync_visual_heart_throw(new_heart: Heart) -> void:
 
 
 func can_interact(_data: Dictionary) -> bool:
-    return true
+    return Ref.world.is_position_loaded(holder.hand.global_position) and not Ref.world.is_block_solid_at(holder.hand.global_position)

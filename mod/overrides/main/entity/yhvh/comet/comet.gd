@@ -45,7 +45,10 @@ func explode(hit_point: Vector3) -> void:
 
     var explosion: Explosion = explosion_scene.instantiate()
     get_tree().get_root().add_child(explosion)
-    explosion.entity_owner = entity_owner
+    if is_instance_valid(entity_owner):
+        explosion.entity_owner = entity_owner
+    else:
+        explosion.entity_owner = null
     explosion.global_position = hit_point
     explosion.explode()
 

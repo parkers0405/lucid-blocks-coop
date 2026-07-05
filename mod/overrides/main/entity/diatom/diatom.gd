@@ -27,13 +27,15 @@ func _ready() -> void :
 
 
 func _on_body_entered_attack(body: Node3D) -> void :
-    super._on_body_entered_attack(body)
-    if body == self or dead or state == CHASE or disabled:
+    if not is_instance_valid(body):
         return
-
-    if state == IDLE and body is Entity and randf() < awaken_chance:
+    super._on_body_entered_attack(body)
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or target == self or dead or state == CHASE or disabled:
+        return
+    if state == IDLE and randf() < awaken_chance:
         state = CHASE
-        chase_target = body
+        chase_target = target
         initialize_state()
 
 
@@ -114,6 +116,8 @@ func attack() -> void :
         return
     %AttackAnimationPlayer.play("attack")
     await shoot_frame
+    if dead or not is_inside_tree() or disabled:
+        return
     throw_bomb()
 
 

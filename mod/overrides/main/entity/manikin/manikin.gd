@@ -326,7 +326,7 @@ func _on_fired() -> void:
     if not is_spacer() or dead or disabled or state != CHASE:
         return
     if held_item.can_interact({}):
-        held_item.interact(false, {})
+        held_item.interact(false)
 
 
 func _on_attacked(attacker) -> void:
@@ -363,17 +363,23 @@ func _on_attack_timeout() -> void:
 
 
 func _on_attack_entered(body: PhysicsBody3D) -> void:
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+
     if dead or state != CHASE:
         return
     var locked_target = _get_forced_session_target()
-    if is_instance_valid(locked_target) and body != locked_target:
+    if is_instance_valid(locked_target) and target != locked_target:
         _debug_log("ignore attack-enter body=%s locked=%s" % [
-            _debug_target_label(body),
+            _debug_target_label(target),
             _debug_target_label(locked_target),
         ])
         return
 
-    attack_target = body as Entity
+    attack_target = target
     _debug_log("attack-enter target=%s" % _debug_target_label(attack_target))
     attack()
 
@@ -381,26 +387,33 @@ func _on_attack_entered(body: PhysicsBody3D) -> void:
 func _on_attack_exited(body: PhysicsBody3D) -> void:
     if dead or not is_inside_tree() or not has_node("%RotationPivot/AttackArea3D") or not %RotationPivot / AttackArea3D.owner:
         return
-    if body == attack_target:
+    var target: Entity = EntityHelper.get_entity(body) if is_instance_valid(body) else null
+    if target == attack_target:
         var locked_target = _get_forced_session_target()
         attack_target = locked_target if is_instance_valid(locked_target) else null
 
 
 func _on_player_entered(body: PhysicsBody3D) -> void:
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+
     if dead:
         return
-    if not _is_session_player_entity(body):
+    if not _is_session_player_entity(target):
         return
     var locked_target = _get_forced_session_target()
-    if is_instance_valid(locked_target) and body != locked_target:
+    if is_instance_valid(locked_target) and target != locked_target:
         _debug_log("ignore detect-enter body=%s locked=%s" % [
-            _debug_target_label(body),
+            _debug_target_label(target),
             _debug_target_label(locked_target),
         ])
         return
     _force_session_runtime_active()
-    player = body
-    attack_target = body
+    player = target
+    attack_target = target
     interest_place = _get_target_position() + get_random_flat_vector() * wary_range
     _debug_log("detect-enter player=%s attack_target=%s" % [
         _debug_target_label(player),
@@ -410,11 +423,12 @@ func _on_player_entered(body: PhysicsBody3D) -> void:
 
 
 func _on_player_exited(body: PhysicsBody3D) -> void:
-    if dead or not is_inside_tree() or not has_node("%DetectionArea3D") or not %DetectionArea3D.owner:
+    if dead or not is_inside_tree() or not has_node("%DetectionArea3D") or not %DetectionArea3D.owner or not is_instance_valid(player):
         return
-    if body != player:
+    var target: Entity = EntityHelper.get_entity(body) if is_instance_valid(body) else null
+    if target != player:
         return
-    if body == _get_forced_session_target():
+    if target == _get_forced_session_target():
         return
 
     interest_place = _get_target_position()
@@ -615,7 +629,8 @@ func melee_attack() -> void:
     %WhiffPlayer3D.play()
     anim["parameters/attack/request"] = AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE
     attack_speed_modifier = 0.05
-    %Attack.attack(attack_target, attack_target.global_position)
+    if not WallChecker.is_obscured(head.global_position, attack_target):
+        %Attack.attack(attack_target, attack_target.global_position)
     %AttackTimer.start(melee_delay)
 
 

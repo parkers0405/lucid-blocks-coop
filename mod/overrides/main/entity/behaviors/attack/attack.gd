@@ -5,7 +5,6 @@ class_name Attack extends Behavior
 
 var damage_modifier: float = 1.0
 
-
 func attack(target, damage_position: Vector3, knockback_strength: float = 22.0, fly_strength: float = 0.15) -> bool:
     if Ref.coop_manager != null and not multiplayer.is_server() and entity == Ref.player:
         target = Ref.coop_manager._resolve_client_attack_target(target)
@@ -23,10 +22,6 @@ func attack(target, damage_position: Vector3, knockback_strength: float = 22.0, 
 
     if target.direct_damage_cooldown:
         return false
-
-    var horizontal_kb: Vector3 = target.global_position - entity.global_position
-    horizontal_kb.y = 0
-    horizontal_kb = horizontal_kb.normalized()
 
     if not is_remote_player_target and target.axe_weakness and is_instance_valid(entity.held_item) and entity.held_item is HeldTool and entity.held_item.item.axe_boost:
         @warning_ignore("narrowing_conversion")
@@ -66,21 +61,30 @@ func attack(target, damage_position: Vector3, knockback_strength: float = 22.0, 
     if should_sync_local_entity_attack and not target_is_guest_local_authority:
         return Ref.coop_manager.sync_local_attack_on_entity(entity, target, damage_position, actual_damage, knockback_strength, fly_strength, fire_aspect)
 
+    var horizontal_kb: Vector3 = target.global_position - entity.global_position
+    horizontal_kb.y = 0
+    horizontal_kb = horizontal_kb.normalized()
     var attacker_velocity: Vector3 = entity.velocity
     if Ref.coop_manager != null and Ref.coop_manager.has_connected_remote_peers():
         attacker_velocity = Ref.coop_manager.get_attack_impulse_velocity(entity)
     target.knockback_velocity += 0.45 * attacker_velocity + horizontal_kb * knockback_strength
     target.knockback_velocity.y += knockback_strength * target.jump_modifier * fly_strength * (0.5 if not target.is_on_floor() else 1.0)
-    target.attacked(entity, actual_damage)
 
     if entity.held_item != null and entity.held_item.item is Tool:
         entity.decrease_held_item_durability(1)
 
-    if fire_aspect and target.has_node("%Burn"):
-        target.get_node("%Burn").ignite()
-
-    if target.has_node("%Bleed"):
-        var target_to_attacker: Vector3 = (entity.global_position - target.global_position).normalized()
-        target.get_node("%Bleed").bleed(damage_position, target_to_attacker, actual_damage)
+    basic_attack(entity, target, actual_damage, damage_position, fire_aspect)
 
     return true
+
+static func basic_attack(attacker: Entity, target: Entity, direct_damage: int, damage_position: Vector3, burns: bool = false) -> void :
+    basic_attack_override_direction(attacker, target, direct_damage, damage_position, (attacker.global_position - target.global_position).normalized(), burns)
+
+static func basic_attack_override_direction(attacker: Entity, target: Entity, direct_damage: int, damage_position: Vector3, direction: Vector3, burns: bool = false) -> void :
+    if not is_instance_valid(target) or target.dead or not target.is_inside_tree():
+        return
+    target.attacked(attacker, direct_damage)
+    if target.has_node("%Bleed"):
+        target.get_node("%Bleed").bleed(damage_position, direction, direct_damage)
+    if burns and target.has_node("%Burn"):
+        target.get_node("%Burn").ignite()

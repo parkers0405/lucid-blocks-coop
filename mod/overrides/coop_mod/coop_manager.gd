@@ -9526,6 +9526,18 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
 
     var register_json: String = JSON.stringify(JSON.from_native(register_data))
     var snapshot_save_data: Dictionary = Ref.save_file_manager.loaded_file.data.duplicate_deep()
+
+    # As of game build 4.0.1 the on-disk save keeps chunk data in per-region files, not in
+    # loaded_file.data, so the in-memory dict no longer carries any terrain. Serialize the
+    # live loaded world into the snapshot under the dimension namespace the guest will load
+    # from, so the world travels over the network (guest has no host region files on disk).
+    # All callers load the target dimension into the live world before sending, so
+    # Ref.world.current_dimension matches actual_dimension here.
+    if is_instance_valid(Ref.world):
+        var snapshot_namespace: String = _resolve_dimension_namespace(actual_dimension, str(register_data.get("pocket_owner_key", "")))
+        Ref.world.save_data(snapshot_save_data, snapshot_namespace + "_")
+        SaveFile._set_data(snapshot_save_data, "%s/respawn_positions" % snapshot_namespace, Ref.world.respawn_positions.duplicate(true))
+
     _apply_peer_persistent_player_to_snapshot(snapshot_save_data, peer_id, actual_dimension)
     var save_json: String = JSON.stringify(JSON.from_native(snapshot_save_data))
     var save_buffer: PackedByteArray = save_json.to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)

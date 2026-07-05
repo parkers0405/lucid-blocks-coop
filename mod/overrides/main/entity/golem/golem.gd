@@ -161,10 +161,14 @@ func _get_priority_attack_target(preferred_target = null):
     return nearest
 
 
-func _on_entity_entered(entity: Node3D) -> void:
-    flush_deleted_entities()
-    if not (entity is Entity):
+func _on_entity_entered(body: Node3D) -> void:
+    if not is_instance_valid(body):
         return
+    var entity: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(entity):
+        return
+
+    flush_deleted_entities()
     if nearby_entities.size() >= nearby_entity_count:
         return
     if entity is Golem or entity is Yhvh or entity is Mimic:
@@ -173,7 +177,13 @@ func _on_entity_entered(entity: Node3D) -> void:
         nearby_entities.append(entity)
 
 
-func _on_entity_exited(entity: Node3D) -> void:
+func _on_entity_exited(body: Node3D) -> void:
+    if not is_instance_valid(body):
+        return
+    var entity: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(entity):
+        return
+
     flush_deleted_entities()
     nearby_entities.erase(entity)
 
@@ -359,15 +369,18 @@ func melee_attack() -> void:
 
     anim["parameters/interact/request"] = AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE
     await model.fired
-    %WhiffPlayer3D.play()
 
-    if not is_instance_valid(attack_shape) or not attack_shape.is_inside_tree() or not is_inside_tree() or dead or disabled or not is_instance_valid(attack_target) or attack_target.dead or attack_target.disabled:
+    if not is_instance_valid(self) or not is_instance_valid(attack_shape) or not attack_shape.is_inside_tree() or not is_inside_tree() or dead or disabled or not is_instance_valid(attack_target) or attack_target.dead or attack_target.disabled:
         return
+
+    %WhiffPlayer3D.play()
 
     attack_shape.force_shapecast_update()
     for i in range(attack_shape.get_collision_count()):
         if attack_shape.get_collider(i) != attack_target:
             continue
+        if WallChecker.is_obscured(head.global_position, attack_target):
+            break
         %Attack.attack(attack_target, attack_target.global_position, 16)
         break
 

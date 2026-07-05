@@ -35,12 +35,16 @@ func interact(sustain: bool = false, data: Dictionary = {}) -> bool:
             Ref.coop_manager.notify_local_world_state_dirty([Vector3i(place_position)])
         if block.can_drop:
             var new_state: ItemState = ItemState.new()
-            new_state.initialize(block)
+            if block.directional:
+                new_state.initialize(block.drop_item)
+            else:
+                new_state.initialize(block)
             new_state.count = 1
 
             var new_item: DroppedItem = dropped_item_scene.instantiate()
+            new_item.position = Vector3(place_position)
             get_tree().get_root().add_child(new_item)
-            new_item.global_position = Vector3(place_position)
+
             new_item.initialize(new_state)
 
         holder.decrease_held_item_durability(1)

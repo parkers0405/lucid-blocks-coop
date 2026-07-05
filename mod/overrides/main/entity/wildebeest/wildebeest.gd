@@ -57,21 +57,16 @@ func _ready() -> void :
     %WalkTimer.timeout.connect(_on_walk_timeout)
 
     %AttackArea3D.body_entered.connect(_on_body_entered_attack)
-    %AttackArea3D.body_entered.connect(_on_body_exited_attack)
 
 
 func _on_body_entered_attack(body: Node3D) -> void :
-    if state != CHASE or dead or disabled:
+    if state != CHASE or dead or disabled or not is_instance_valid(body):
         return
-    if body == self:
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target) or target == self:
         return
-    if Vector3(movement_velocity.x, 0, movement_velocity.z).length() > min_attack_speed:
-        %Attack.attack(body, body.global_position, 48.0, 1.2)
-
-
-func _on_body_exited_attack(_body: Node3D) -> void :
-    if state != CHASE or dead or disabled:
-        return
+    if Vector3(movement_velocity.x, 0, movement_velocity.z).length() > min_attack_speed and not WallChecker.is_obscured(head.global_position, target):
+        %Attack.attack(target, target.global_position, 48.0, 1.2)
 
 
 func _on_idle_timeout() -> void :
@@ -100,16 +95,26 @@ func _on_damage_taken(damage: int) -> void :
 
 
 func _on_body_entered(body: Node3D) -> void :
-    if len(bothersome_entities) > bothersome_limit:
+    if not is_instance_valid(body):
         return
-    if body is Wildebeest:
+    var target: Entity = EntityHelper.get_entity(body)
+
+    flush_deleted_entities()
+    if len(bothersome_entities) > bothersome_limit or not is_instance_valid(target) or target is Wildebeest:
         return
-    bothersome_entities.append(body)
+    bothersome_entities.append(target)
     update_bothersome_target()
 
 
 func _on_body_exited(body: Node3D) -> void :
-    var index: int = bothersome_entities.find(body)
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+
+    flush_deleted_entities()
+    var index: int = bothersome_entities.find(target)
     if index != -1:
         bothersome_entities.remove_at(index)
     update_bothersome_target()
@@ -129,6 +134,14 @@ func update_bothersome_target() -> void :
 
     if bothersome == null:
         bothersome = bothersome_entities.pick_random()
+
+
+func flush_deleted_entities() -> void :
+    var new_entities: Array[Entity] = []
+    for entity in bothersome_entities:
+        if is_instance_valid(entity):
+            new_entities.append(entity)
+    bothersome_entities = new_entities
 
 
 func _on_attacked(new_attacker: Entity) -> void :

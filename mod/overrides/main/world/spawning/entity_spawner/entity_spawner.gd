@@ -18,7 +18,6 @@ class_name EntitySpawner extends Node3D
 const DISCOVERY_SPAWN_COOLDOWN_MSEC: int = 200
 
 @onready var floor_raycast: RayCast3D = %FloorRayCast
-@onready var guard_checker: ShapeCast3D = %GuardChecker
 @onready var visible_checker: VisibleOnScreenNotifier3D = %VisibleChecker
 
 var risk_factor: int = 0
@@ -50,6 +49,8 @@ func _ready() -> void :
 
 func _on_chunk_loaded(chunk_position: Vector3i) -> void :
     if not can_spawn:
+        return
+    if Ref.world.is_chunk_modified(chunk_position):
         return
 
     if _can_use_multi_region_logic() and _get_same_instance_player_count() > 1:
@@ -254,19 +255,21 @@ func attempt_spawn(spawn_position: Vector3, rare: bool = false, care_for_visibil
             return false
 
         spawn_position = floor_raycast.get_collision_point()
-        if not _is_spawn_position_loaded(spawn_position + Vector3(0, 0.1, 0)) or Ref.world.is_under_water(spawn_position + Vector3(0, 0.1, 0)):
+        var below_position: Vector3 = spawn_position - Vector3(0, 0.1, 0)
+        var above_position: Vector3 = spawn_position + Vector3(0, 0.1, 0)
+        if not _is_spawn_position_loaded(spawn_position) or not _is_spawn_position_loaded(below_position) or not is_block_valid(Ref.world.get_block_type_at(below_position)) or not _is_spawn_position_loaded(above_position) or Ref.world.is_under_water(above_position):
             entity.queue_free()
             return false
+
 
     if _is_too_close_to_active_player(spawn_position):
         entity.queue_free()
         return false
 
-    guard_checker.global_position = spawn_position
-    guard_checker.force_shapecast_update()
-    if guard_checker.is_colliding():
+    if GuardChecker.is_guarded(spawn_position):
         entity.queue_free()
         return false
+
 
     if care_for_visibility:
         visible_checker.global_position = spawn_position
@@ -373,6 +376,10 @@ func stop_spawning() -> void :
     %SpawnTimer.stop()
     %RareSpawnTimer.stop()
     can_spawn = false
+
+
+func is_block_valid(block: Block) -> bool:
+    return block.id != 1442318884 and block.id != 1442318887 and block.id != 1442318885
 
 
 func save_file(file: SaveFile) -> void :

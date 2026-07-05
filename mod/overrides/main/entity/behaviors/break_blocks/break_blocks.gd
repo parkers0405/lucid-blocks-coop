@@ -72,8 +72,8 @@ func drop_item() -> void:
         var new_item: DroppedItem = dropped_item_scene.instantiate()
         if to_drop.size() > 1:
             new_item.delay_merge()
+        new_item.position = Vector3(active_position)
         get_tree().get_root().add_child(new_item)
-        new_item.global_position = Vector3(active_position)
         new_item.initialize(item_state)
 
 

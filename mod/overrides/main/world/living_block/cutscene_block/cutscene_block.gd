@@ -105,7 +105,7 @@ func interact(interactor: Entity) -> void:
             Ref.cutscene_menu.add_cutscene(cutscene_instance)
 
             await open_cutscene()
-            await cutscene_instance.play()
+            await cutscene_instance.play_wrapper()
 
             var first_bead: bool = Ref.save_file_manager.soul_file.get_data("first_bead", true)
             var bead_given: bool = Ref.plot_manager.bead_eligible
@@ -134,6 +134,7 @@ func open_cutscene() -> void:
 
 func close_cutscene(show_bead: bool, first_bead: bool) -> void:
     if not playing_cutscene:
+        printerr("Closing a cutscene that isn't playing")
         return
 
     await Ref.trans.open()
@@ -182,6 +183,8 @@ func clear_cutscene_screen() -> void:
 
 
 func give_tiamana() -> void:
+    if Ref.plot_manager.debug_disable_tiamana_gain_from_cutscene and Ref.main.debug:
+        return
     Ref.player.get_node("%Level").give_tiamana(tiamana_yield, Level.TiamanaSource.CUTSCENE)
 
 

@@ -5,14 +5,13 @@ class_name Leviathan extends Entity
 @export var sky_color: Color = Color.RED
 @export var melt_radius: float = 64.0
 @export var melt_chance: float = 0.25
+@export var max_lifetime: float = 200.0
 
 static var count: int = 0
-
+var lifetime: float = 0.0
 
 func _ready() -> void :
     super._ready()
-    remove_from_group("preserve_but_delete_on_unload")
-    add_to_group("preserve")
     global_position.y += 32
     if count == 0:
         Ref.audio_manager.play_song(music, 5)
@@ -26,6 +25,8 @@ func _ready() -> void :
 
     Ref.save_file_manager.settings_updated.connect(_on_settings_updated)
     _on_settings_updated()
+
+    lifetime = max_lifetime
 
 
 func _on_settings_updated() -> void :
@@ -71,7 +72,7 @@ func attempt_melt() -> void :
     if %MeltRayCast3D.is_colliding():
         var melt_position: Vector3 = %MeltRayCast3D.get_collision_point() - Vector3(0, 0.5, 0)
         var above_position: Vector3 = melt_position + Vector3(0, 1, 0)
-        if is_session_position_loaded(melt_position) and is_session_position_loaded(above_position) and not Ref.world.is_under_water(above_position):
+        if is_session_position_loaded(melt_position) and is_session_position_loaded(above_position) and not Ref.world.is_under_water(above_position) and not GuardChecker.is_guarded_entity(melt_position, self):
             var block_type: Block = Ref.world.get_block_type_at(melt_position)
             if not block_type.griefable:
                 return
@@ -91,5 +92,18 @@ func _physics_process(_delta: float) -> void :
         attempt_melt()
 
 
-func _process(_delta: float) -> void :
+func _process(delta: float) -> void :
     %RedSun.global_position = Ref.player.global_position + Vector3(0, 80, 0)
+    lifetime -= delta
+    if lifetime <= 0:
+        queue_free()
+
+func preserve_save(file: SaveFile, uuid: String) -> void :
+    super.preserve_save(file, uuid)
+
+    file.set_data("node/%s/lifetime" % uuid, lifetime)
+
+func preserve_load(file: SaveFile, uuid: String) -> void :
+    super.preserve_load(file, uuid)
+
+    lifetime = file.get_data("node/%s/lifetime" % uuid, max_lifetime)

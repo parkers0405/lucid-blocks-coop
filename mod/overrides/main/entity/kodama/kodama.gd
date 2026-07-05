@@ -100,6 +100,8 @@ func _on_attack_frame() -> void :
         return
     if attack_target.head.global_position.distance_to( %Core.global_position) > attack_actual_distance:
         return
+    if WallChecker.is_obscured(head.global_position, attack_target):
+        return
     %Attack.attack(attack_target, global_position, 24.0)
 
 
@@ -110,16 +112,26 @@ func _on_attacked(attacker: Entity) -> void :
 
 
 func _on_body_entered(body: Node3D) -> void :
-    if is_session_player_entity(body):
-        player = body
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+    if is_session_player_entity(target):
+        player = target
 
 
 func _on_body_exited(body: Node3D) -> void :
-    if body == player:
+    if not is_instance_valid(body):
+        return
+    var target: Entity = EntityHelper.get_entity(body)
+    if not is_instance_valid(target):
+        return
+    if target == player:
         player = null
 
 
-func _on_block_broken(break_position: Vector3i) -> void :
+func _on_block_broken(break_position: Vector3i, _radius: int) -> void :
     if is_instance_valid(player) and break_position.distance_to(global_position) <= break_trigger_distance:
         anger += randf_range(break_anger_min, break_anger_max)
 

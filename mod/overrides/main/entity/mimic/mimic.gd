@@ -71,7 +71,7 @@ func _on_attack_timeout() -> void:
     var target_direction: Vector3 = head.to_local(target_head).normalized()
     thrust(target_direction)
 
-    if target.global_position.distance_to(global_position + target_direction) < attack_distance:
+    if target.global_position.distance_to(global_position + target_direction) < attack_distance and not WallChecker.is_obscured_position(head.global_position, target_head):
         %Attack.attack(target, target.global_position, 30.0)
 
 

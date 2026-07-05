@@ -19,6 +19,9 @@ var state: int = IDLE
 func _ready() -> void :
     super._ready()
 
+    Ref.save_file_manager.settings_updated.connect(_on_settings_menu_updated)
+    _on_settings_menu_updated()
+
     modulate_changed.connect(_on_modulate_changed)
     alpha_changed.connect(_on_alpha_changed)
 
@@ -29,6 +32,15 @@ func _ready() -> void :
     %IdleTimer.start(randf_range(idle_time_min, idle_time_max))
 
     tree_exiting.connect(_on_tree_exiting)
+
+
+func _on_settings_menu_updated() -> void :
+    var lq: bool = Ref.save_file_manager.settings_file.get_data("low_quality_fractal", false)
+    %Fractal.material.set_shader_parameter("primary_max_iterations", 6 if lq else 24)
+    %Fractal.material.set_shader_parameter("collision_threshold", 0.08 if lq else 0.02)
+    %Fractal.material.set_shader_parameter("fractal_iterations", 5 if lq else 5)
+    %Fractal.material.set_shader_parameter("real_shadows_enabled", not lq)
+
 
 
 

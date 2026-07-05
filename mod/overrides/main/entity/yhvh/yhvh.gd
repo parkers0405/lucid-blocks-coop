@@ -98,34 +98,38 @@ func _ready() -> void:
     %ArmAnimationPlayer.play("RESET")
     %LaserAnimationPlayer.play("RESET")
 
+    Ref.save_file_manager.settings_updated.connect(_on_settings_menu_updated)
+    _on_settings_menu_updated()
+
+
+func _on_settings_menu_updated() -> void:
+    var lq: bool = Ref.save_file_manager.settings_file.get_data("low_quality_fractal", false)
+    for fractal in [%Fractal, %Arm]:
+        fractal.material.set_shader_parameter("primary_max_iterations", 6 if lq else 20)
+        fractal.material.set_shader_parameter("collision_threshold", 0.09 if lq else 0.03)
+        fractal.material.set_shader_parameter("fractal_iterations", 5 if lq else 5)
+        fractal.material.set_shader_parameter("real_shadows_enabled", not lq)
+
 
 func _on_area_entered_attack(area: Area3D) -> void:
     if not arm_hitbox or dead or disabled or not is_instance_valid(area) or not is_instance_valid(area.owner) or not is_inside_tree() or not has_node("%ArmTarget"):
         return
-    var entity: Entity = area.owner as Entity
+    var entity: Entity = EntityHelper.get_entity_from_area(area)
     if not is_instance_valid(entity) or entity == self or entity.disabled or entity.dead or entity.direct_damage_cooldown:
         return
-
     var horizontal_kb: Vector3 = entity.global_position - %ArmTarget.global_position
     horizontal_kb.y = 0
     horizontal_kb = horizontal_kb.normalized()
 
-    var actual_damage: int = int(arm_damage)
     var knockback_delta: Vector3 = 0.45 * arm_movement_velocity + horizontal_kb * arm_knockback_strength
     knockback_delta.y += arm_knockback_strength * entity.jump_modifier * (0.5 if not entity.is_on_floor() else 1.0)
-    if Ref.coop_manager != null and Ref.coop_manager.sync_host_direct_hit_on_remote_player(self, entity, entity.head.global_position, actual_damage, knockback_delta):
+    if Ref.coop_manager != null and Ref.coop_manager.sync_host_direct_hit_on_remote_player(self, entity, entity.head.global_position, arm_damage, knockback_delta):
         %AttackCooldown.start()
         return
 
     entity.knockback_velocity += knockback_delta
-    entity.attacked(self, actual_damage)
 
-    if entity.held_item != null and entity.held_item.item is Tool:
-        entity.decrease_held_item_durability(1)
-
-    if entity.has_node("%Bleed"):
-        var target_to_attacker: Vector3 = (global_position - entity.global_position).normalized()
-        entity.get_node("%Bleed").bleed(entity.head.global_position, target_to_attacker, actual_damage)
+    Attack.basic_attack(self, entity, arm_damage, entity.head.global_position, false)
 
     %AttackCooldown.start()
 
@@ -188,6 +192,7 @@ func _on_spawn_timeout() -> void:
         return
 
     var offset: Vector3 = randf_range(0, spawn_radius) * Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)).normalized() + Vector3(0, comet_height, 0)
+    %SpawnCheck.force_raycast_update()
     %SpawnCheck.global_position = offset + target.global_position
     %SpawnCheck.target_position = Vector3(0, -96, 0)
     if not %SpawnCheck.is_colliding():
@@ -214,10 +219,10 @@ func update_laser() -> void:
 
 
 func update_laser_visual() -> void:
-    if not is_inside_tree() or not has_node("%BeamIndicator"):
+    if not is_inside_tree() or not has_node("%BeamIndicator") or not has_node("%Laser"):
         return
     SpatialMath.look_at(%BeamIndicator, laser_position)
-    %BeamIndicator.scale.z = global_position.distance_to(laser_position) * 2.0
+    %BeamIndicator.scale.z = %Laser.global_position.distance_to(laser_position)
 
 
 func _on_laser_timeout() -> void:

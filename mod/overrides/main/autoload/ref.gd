@@ -44,6 +44,7 @@ var command_chat_manager
 @onready var level_up_menu = get_tree().get_root().get_node("Main/UI/LevelUpMenu")
 @onready var settings_menu = get_tree().get_root().get_node("Main/UI/SettingsMenu")
 @onready var bead_get_menu = get_tree().get_root().get_node("Main/UI/BeadGetMenu")
+@onready var challenge_status_menu = get_tree().get_root().get_node("Main/UI/ChallengeStatusMenu")
 @onready var dither_filter = get_tree().get_root().get_node("Main/UI/%DitheringFilter")
 @onready var shader_loader = get_tree().get_root().get_node("Main/ShaderLoader")
 @onready var splash_layer = get_tree().get_root().get_node("Main/SplashLayer")
@@ -81,8 +82,13 @@ func _bootstrap_native_patch() -> void:
     if executable_path.is_empty():
         return
 
-    var native_patch_dir: String = executable_path.get_base_dir().path_join("coop-native-patch")
+    var executable_dir: String = executable_path.get_base_dir()
+    var native_patch_dir: String = executable_dir.path_join("coop-native-patch")
     var extension_path: String = native_patch_dir.path_join("coop_native_patch.gdextension")
+    if not FileAccess.file_exists(extension_path):
+        # Pre-update installs kept the patch in the nested lucid-blocks/ folder.
+        native_patch_dir = executable_dir.path_join("lucid-blocks").path_join("coop-native-patch")
+        extension_path = native_patch_dir.path_join("coop_native_patch.gdextension")
     if not FileAccess.file_exists(extension_path):
         return
 

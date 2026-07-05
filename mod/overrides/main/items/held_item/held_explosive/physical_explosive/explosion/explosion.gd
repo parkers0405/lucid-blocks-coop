@@ -65,6 +65,8 @@ func _broadcast_world_change_snapshot(before_snapshot: Dictionary) -> void:
 func explode_blocks() -> void:
     if not Ref.world.is_position_loaded(global_position):
         return
+    if GuardChecker.is_guarded_entity(global_position, entity_owner):
+        return
 
     if Ref.coop_manager != null and Ref.coop_manager.has_active_session() and not Ref.coop_manager._is_local_world_authority():
         return
@@ -85,13 +87,17 @@ func explode_entities() -> void:
     var exploded: Array[Entity]
     for i in range(%EntityCast.get_collision_count()):
         var collider: Node3D = %EntityCast.get_collider(i)
+        if not is_instance_valid(collider):
+            continue
+
         var to_explode: Entity
         if collider is PhysicsBody3D:
-            to_explode = collider as Entity
-            if not is_instance_valid(to_explode):
-                to_explode = collider.owner as Entity
-        if collider is Area3D:
-            to_explode = collider.owner as Entity
+            to_explode = EntityHelper.get_entity(collider)
+        elif collider is Area3D:
+            to_explode = EntityHelper.get_entity_from_area(collider)
+
+        if not is_instance_valid(to_explode):
+            continue
         if exploded.find(to_explode) > -1:
             continue
         explode_entity(to_explode)
@@ -143,9 +149,6 @@ func explode_entity(target: Entity) -> void:
     if entity_owner == target and not attacks_self:
         return
 
-    if firey and target.has_node("%Burn"):
-        target.get_node("%Burn").ignite()
-
     var explode_vector: Vector3 = target.global_position - global_position
     var explosion_strength: float = sqrt(max(0.0, 1.0 - explode_vector.length() / float(explode_radius)))
 
@@ -166,7 +169,4 @@ func explode_entity(target: Entity) -> void:
     target.knockback_velocity += knockback_vector
 
     if actual_damage > 0:
-        target.attacked(entity_owner, actual_damage)
-
-    if target.has_node("%Bleed"):
-        target.get_node("%Bleed").bleed(target.head.global_position, -knockback_direction, actual_damage)
+        Attack.basic_attack_override_direction(entity_owner, target, actual_damage, target.head.global_position, - knockback_direction, firey)
