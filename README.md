@@ -34,11 +34,13 @@ Multiplayer Co-op mod For Lucid Blocks.
 ## Known Issues
 
 - Apotheosis is 'working' but its not super tested so make sure to back up your world
-- **Back up your world before co-op building.** The 4.0.1 save-format change is not yet
-  fully reconciled with how the mod syncs guest edits back to the host. Joining a host and
-  seeing their world works; a guest building/mining and the host then reloading is not
-  fully tested and can revert the host's world. Firmament/Apotheosis and Challenge/YHVH
-  co-op world-sharing are also still affected. Naraka/Creative/Pocket joins are fine.
+- **Shared-world co-op saves fine** on 4.0.1: when both players are in the same world,
+  the guest isn't the save authority, so its edits go through the host's live world and
+  persist normally.
+- **Private-instance features (separate pockets / per-player Apotheosis) are not yet
+  reconciled with the 4.0.1 region-file save format** and can lose/revert that instance's
+  data on reload. Back up before relying on them. See the co-op save-sync notes for the
+  exact spots (guest world-patches still persist via the old in-save-dict path).
 - Host can save and quit great, but guest has to relauch game after playing COOP
 - Manikin can't agro Guest, and will always attack
 - Gel, and small gel are invisble to Gust but can beat the heck out the guest anyway
