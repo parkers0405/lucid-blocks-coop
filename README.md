@@ -1,4 +1,14 @@
-# Lucid Blocks Co-op Mod
+# Lucid Blocks Co-op Updated
+
+Compatibility update and completion of [parkers0405/lucid-blocks-coop](https://github.com/parkers0405/lucid-blocks-coop). Original co-op implementation by parkers0405 and upstream contributors; this fork preserves their history and attribution.
+
+**Status: development, not yet verified on the target game.** Initial target: Steam build **25451214** (executable version **5.1.0.0**). Do not interpret the inherited compatibility claims below as verification of this fork.
+
+Scope: two-player Steam/LAN co-op, independent exploration and dimensions, persistent personal Apotheosis with visits, the known-issue fixes below, and personal ender-chest storage. New player models, skins, dedicated servers, and larger player counts are excluded.
+
+No new license is assigned to inherited code or assets. Existing attribution and notices remain applicable. Recovered commercial game files are not part of this repository.
+
+## Upstream README (historical)
 
 Multiplayer Co-op mod For Lucid Blocks.
 
