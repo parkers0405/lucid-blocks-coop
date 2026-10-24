@@ -5,7 +5,12 @@ const AvatarRegistry = preload("res://coop_mod/avatar_registry.gd")
 const RemotePlayerMarkerScript = preload("res://coop_mod/remote_player_marker.gd")
 const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
-const MAX_CLIENTS: int = 4
+const MAX_PLAYERS: int = 2
+const MAX_CLIENTS: int = MAX_PLAYERS - 1
+const MOD_PROTOCOL_VERSION: int = 1
+const TARGET_GAME_VERSION: String = "5.1.0"
+const AUTH_TIMEOUT_SECONDS: float = 5.0
+const AUTH_MAX_BYTES: int = 512
 const SESSION_TRANSPORT_LAN: String = "lan"
 const SESSION_TRANSPORT_STEAM: String = "steam"
 const SEND_INTERVAL: float = 0.025
@@ -116,6 +121,11 @@ var persist_timer: float = 0.0
 var guest_entity_state_timer: float = 0.0
 var autosave_timer: float = 0.0
 var status_message: String = "Idle"
+var auth_session_nonce: String = ""
+var auth_pending: Dictionary = {}
+var auth_rejections: Dictionary = {}
+var auth_is_host: bool = false
+var compatibility_failure_reason: String = ""
 var panel_visible: bool = false
 var restore_capture_on_close: bool = false
 var receiving_host_world: bool = false
@@ -283,6 +293,7 @@ func _ready() -> void:
         Ref.main.world_loaded.connect(_on_local_world_loaded)
     call_deferred("_install_game_menu_quit_hook")
 
+    _configure_session_authentication()
     multiplayer.peer_connected.connect(_on_peer_connected)
     multiplayer.peer_disconnected.connect(_on_peer_disconnected)
     multiplayer.connected_to_server.connect(_on_connected_to_server)
@@ -297,6 +308,127 @@ func _ready() -> void:
     _rebuild_tracked_root_runtime_lists()
 
     print("[lucid-blocks-coop] manager ready")
+    _update_status_text()
+
+
+func _configure_session_authentication() -> void:
+    var api := multiplayer as SceneMultiplayer
+    api.auth_callback = _on_auth_data
+    api.auth_timeout = AUTH_TIMEOUT_SECONDS
+    api.allow_object_decoding = false
+    if not api.peer_authenticating.is_connected(_on_peer_authenticating):
+        api.peer_authenticating.connect(_on_peer_authenticating)
+        api.peer_authentication_failed.connect(_on_peer_authentication_failed)
+
+
+func _assign_session_peer(peer: MultiplayerPeer) -> void:
+    _configure_session_authentication()
+    auth_session_nonce = Crypto.new().generate_random_bytes(16).hex_encode()
+    auth_pending.clear()
+    auth_rejections.clear()
+    compatibility_failure_reason = ""
+    multiplayer.multiplayer_peer = peer
+    auth_is_host = multiplayer.is_server()
+
+
+func _compatibility_hello() -> Dictionary:
+    return {
+        "protocol": MOD_PROTOCOL_VERSION,
+        "game": str(ProjectSettings.get_setting("application/config/version", "")),
+        "players": MAX_PLAYERS,
+        "native": "vanilla-5.1.0",
+        "nonce": auth_session_nonce,
+    }
+
+
+func _compatibility_error(message: Dictionary) -> String:
+    if message.size() != 5:
+        return "malformed"
+    var game = message.get("game")
+    if not game is String or game != TARGET_GAME_VERSION:
+        return "game"
+    var protocol = message.get("protocol")
+    if typeof(protocol) not in [TYPE_INT, TYPE_FLOAT] or protocol != MOD_PROTOCOL_VERSION:
+        return "protocol"
+    var players = message.get("players")
+    if typeof(players) not in [TYPE_INT, TYPE_FLOAT] or players != MAX_PLAYERS:
+        return "full"
+    var native_capability = message.get("native")
+    if not native_capability is String or native_capability != "vanilla-5.1.0":
+        return "native"
+    var nonce = message.get("nonce")
+    if not nonce is String or nonce.length() != 32 or not nonce.is_valid_hex_number():
+        return "malformed"
+    return ""
+
+
+func _compatibility_reason(code: String) -> String:
+    match code:
+        "game": return "Incompatible game version; both players need 5.1.0"
+        "protocol": return "Incompatible co-op version; install the same mod on both players"
+        "full": return "Co-op supports two players total; this session is full or incompatible"
+        "native": return "Incompatible native co-op capability"
+        "malformed": return "Invalid co-op compatibility handshake"
+        _: return "Co-op compatibility handshake failed or timed out"
+
+
+func _reject_authentication(id: int, code: String) -> void:
+    auth_rejections[id] = _compatibility_reason(code)
+    status_message = auth_rejections[id]
+    _update_status_text()
+    # Let the remote receive its reason; auth_timeout closes an unresponsive peer.
+    (multiplayer as SceneMultiplayer).send_auth(id, JSON.stringify({"reject": code}).to_utf8_buffer())
+
+
+func _on_peer_authenticating(id: int) -> void:
+    if multiplayer.is_server() and multiplayer.get_peers().size() + auth_pending.size() >= MAX_CLIENTS:
+        _reject_authentication(id, "full")
+        return
+    auth_pending[id] = false
+    (multiplayer as SceneMultiplayer).send_auth(id, JSON.stringify(_compatibility_hello()).to_utf8_buffer())
+
+
+func _on_auth_data(id: int, data: PackedByteArray) -> void:
+    if data.is_empty() or data.size() > AUTH_MAX_BYTES:
+        _reject_authentication(id, "malformed")
+        return
+    var parsed = JSON.parse_string(data.get_string_from_utf8())
+    if not parsed is Dictionary:
+        _reject_authentication(id, "malformed")
+        return
+    if parsed.size() == 1 and parsed.get("reject") is String:
+        auth_rejections[id] = _compatibility_reason(parsed["reject"])
+        # Locally initiated disconnect does not emit authentication_failed locally.
+        _on_peer_authentication_failed(id)
+        (multiplayer as SceneMultiplayer).disconnect_peer(id)
+        return
+    if auth_rejections.has(id) or not auth_pending.has(id) or bool(auth_pending[id]):
+        return
+    var error: String = _compatibility_error(parsed)
+    if not error.is_empty():
+        _reject_authentication(id, error)
+        return
+    auth_pending[id] = true
+    (multiplayer as SceneMultiplayer).complete_auth(id)
+
+
+func _on_peer_authentication_failed(id: int) -> void:
+    auth_pending.erase(id)
+    var fallback: String = compatibility_failure_reason if not compatibility_failure_reason.is_empty() else _compatibility_reason("timeout")
+    var reason: String = str(auth_rejections.get(id, fallback))
+    auth_rejections.erase(id)
+    if not auth_is_host:
+        compatibility_failure_reason = reason
+        _finish_compatibility_failure.call_deferred(reason)
+    else:
+        status_message = reason
+        _update_status_text()
+
+
+func _finish_compatibility_failure(reason: String) -> void:
+    reconnect_pending = false
+    disconnect_session(false)
+    status_message = reason
     _update_status_text()
 
 
@@ -494,7 +626,7 @@ func _start_steam_host_peer(lobby_id: int) -> void:
         _clear_active_steam_session_state(true)
         return
 
-    multiplayer.multiplayer_peer = peer
+    _assign_session_peer(peer)
     peer_states.clear()
     active_session_transport = SESSION_TRANSPORT_STEAM
     active_steam_lobby_id = lobby_id
@@ -530,7 +662,7 @@ func _start_steam_client_peer(lobby_id: int) -> void:
         _clear_active_steam_session_state(true)
         return
 
-    multiplayer.multiplayer_peer = peer
+    _assign_session_peer(peer)
     peer_states.clear()
     active_session_transport = SESSION_TRANSPORT_STEAM
     active_steam_lobby_id = lobby_id
@@ -566,7 +698,7 @@ func host_steam_session(auto_open_invite_dialog: bool = true) -> void:
     disconnect_session(false)
     status_message = "Creating Steam lobby..."
     _update_status_text()
-    _steam_call_alias(["createLobby", "create_lobby"], [STEAM_LOBBY_TYPE_FRIENDS_ONLY, MAX_CLIENTS])
+    _steam_call_alias(["createLobby", "create_lobby"], [STEAM_LOBBY_TYPE_FRIENDS_ONLY, MAX_PLAYERS])
 
 
 func _join_steam_lobby_by_id(lobby_id: int, reset_reconnect_state: bool = true) -> void:
@@ -2109,7 +2241,7 @@ func host_session() -> void:
         _update_status_text()
         return
 
-    multiplayer.multiplayer_peer = peer
+    _assign_session_peer(peer)
     peer_states.clear()
     active_session_transport = SESSION_TRANSPORT_LAN
     _install_player_death_hook()
@@ -2141,7 +2273,7 @@ func join_session() -> void:
         _update_status_text()
         return
 
-    multiplayer.multiplayer_peer = peer
+    _assign_session_peer(peer)
     peer_states.clear()
     active_session_transport = SESSION_TRANSPORT_LAN
     _install_player_death_hook()
@@ -2267,7 +2399,10 @@ func leave_session() -> void:
 
 
 func _has_live_peer() -> bool:
-    return multiplayer.multiplayer_peer != null and multiplayer.multiplayer_peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
+    var peer: MultiplayerPeer = multiplayer.multiplayer_peer
+    return peer != null and not peer is OfflineMultiplayerPeer \
+        and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED \
+        and (multiplayer.is_server() or multiplayer.get_peers().has(1))
 
 
 func has_active_session() -> bool:
@@ -9126,6 +9261,7 @@ func _save_config() -> void:
 
 
 func _on_peer_connected(id: int) -> void:
+    auth_pending.erase(id)
     status_message = "Peer %s connected" % id
     print("[lucid-blocks-coop] %s" % status_message)
     _update_status_text()
@@ -9134,6 +9270,8 @@ func _on_peer_connected(id: int) -> void:
 
 
 func _on_peer_disconnected(id: int) -> void:
+    auth_pending.erase(id)
+    auth_rejections.erase(id)
     peer_states.erase(id)
     if markers.has(id):
         markers[id].call_deferred("queue_free")
@@ -9160,6 +9298,9 @@ func _on_connected_to_server() -> void:
 
 
 func _on_connection_failed() -> void:
+    if not compatibility_failure_reason.is_empty():
+        _finish_compatibility_failure(compatibility_failure_reason)
+        return
     if reconnect_pending:
         disconnect_session(false)
         client_restore_in_progress = true
@@ -9206,6 +9347,9 @@ func _on_local_game_quit() -> void:
 
 
 func _on_server_disconnected() -> void:
+    if not compatibility_failure_reason.is_empty():
+        _finish_compatibility_failure(compatibility_failure_reason)
+        return
     if local_quit_in_progress:
         disconnect_session(false)
         status_message = "Server disconnected"
@@ -9336,6 +9480,9 @@ func _tick_reconnect(delta: float) -> void:
 
 
 func _attempt_reconnect() -> void:
+    var current_peer: MultiplayerPeer = multiplayer.multiplayer_peer
+    if current_peer != null and not current_peer is OfflineMultiplayerPeer and current_peer.get_connection_status() != MultiplayerPeer.CONNECTION_DISCONNECTED:
+        return
     if (multiplayer.is_server() and _has_live_peer()) or _has_live_peer() or receiving_host_world:
         return
 
@@ -9383,7 +9530,7 @@ func _attempt_reconnect() -> void:
             _set_reconnect_overlay_visible(true)
             return
 
-        multiplayer.multiplayer_peer = steam_peer
+        _assign_session_peer(steam_peer)
         peer_states.clear()
         active_session_transport = SESSION_TRANSPORT_STEAM
         active_steam_lobby_id = reconnect_steam_lobby_id
@@ -9403,7 +9550,7 @@ func _attempt_reconnect() -> void:
         _set_reconnect_overlay_visible(true)
         return
 
-    multiplayer.multiplayer_peer = peer
+    _assign_session_peer(peer)
     peer_states.clear()
     status_message = "Reconnecting to %s:%s" % [address, port]
     _update_status_text()

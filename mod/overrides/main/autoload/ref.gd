@@ -1,6 +1,14 @@
 extends Node
 
 
+# Native task must validate a patch build against each original DLL before enabling it.
+const VALIDATED_NATIVE_BUILD_HASHES: PackedStringArray = []
+
+
+static func is_native_patch_build_validated(dll_hash: String) -> bool:
+    return not dll_hash.is_empty() and VALIDATED_NATIVE_BUILD_HASHES.has(dll_hash)
+
+
 var coop_manager
 var coop_native_patch
 var command_chat_manager
@@ -90,6 +98,12 @@ func _bootstrap_native_patch() -> void:
         native_patch_dir = executable_dir.path_join("lucid-blocks").path_join("coop-native-patch")
         extension_path = native_patch_dir.path_join("coop_native_patch.gdextension")
     if not FileAccess.file_exists(extension_path):
+        return
+
+    var game_dll: String = executable_dir.path_join("libgdblocks.windows.template_release.double.x86_64.dll")
+    var dll_hash: String = FileAccess.get_sha256(game_dll) if FileAccess.file_exists(game_dll) else ""
+    if not is_native_patch_build_validated(dll_hash):
+        print("[lucid-blocks-coop] Native patch disabled: this game DLL has no validated patch build")
         return
 
     if not GDExtensionManager.is_extension_loaded(extension_path):

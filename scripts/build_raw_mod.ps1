@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)][string] $Gdre,
     [Parameter(Mandatory)][string] $GameExe,
     [Parameter(Mandatory)][string] $ProjectDir,
-    [Parameter(Mandatory)][string] $OutputDir
+    [Parameter(Mandatory)][string] $OutputDir,
+    [switch] $AdmissionTests
 )
 . (Join-Path $PSScriptRoot 'mod_files.ps1')
 $godotPath = (Resolve-Path -LiteralPath $Godot).Path
@@ -30,7 +31,8 @@ function Invoke-RawTool([string] $Executable, [string[]] $ToolArguments, [string
     }
     $quoted = ($ToolArguments | ForEach-Object { '"' + ($_ -replace '(\\+)$', '$1$1') + '"' }) -join ' '
     $process = Start-Process -FilePath $Executable -ArgumentList $quoted -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    if (-not $process.WaitForExit(45000)) { $process.Kill(); $process.WaitForExit(); throw "$Label exceeded 45 seconds. Logs: $logs" }
+    $timeout = if ($Label -eq 'runtime') { 90000 } else { 45000 }
+    if (-not $process.WaitForExit($timeout)) { $process.Kill(); $process.WaitForExit(); throw "$Label exceeded $($timeout / 1000) seconds. Logs: $logs" }
     @{ Code = $process.ExitCode; Lines = @(Get-Content -LiteralPath $stdout) + @(Get-Content -LiteralPath $stderr) }
 }
 $version = Invoke-RawTool $godotPath @('--headless', '--version') 'version'
@@ -143,6 +145,15 @@ func _check() -> void:
     if manager == null or manager.has_connected_remote_peers():
         print("COOP_BUILD_CHECK_FAILED offline peers")
         failures += 1
+    var test_args = OS.get_cmdline_user_args()
+    if not test_args.is_empty():
+        print("COOP_ADMISSION_SUITE_LOADING")
+        var suite = load(test_args[0].path_join("admission.gd")).new()
+        add_child(suite)
+        print("COOP_ADMISSION_SUITE_RUNNING")
+        failures += await suite.run()
+        suite.queue_free()
+        failures += load(test_args[0].path_join("native_guard.gd")).run()
     print("COOP_BUILD_CHECK_OK ", paths.size())
     # The original keyboard owns an unattached helper; release it for this short probe.
     var keyboard = get_node_or_null("/root/Main/UI/OnscreenKeyboard")
@@ -165,7 +176,12 @@ func _finish(failures: int) -> void:
     $env:APPDATA = Join-Path $buildDir 'profile'
     $env:TEMP = Join-Path $buildDir 'temp'
     $env:TMP = $env:TEMP
-    $check = Invoke-RawTool $runtimeEditor @('--headless', '--verbose', '--path', $runtime, '--main-pack', $gamePath) 'runtime'
+    $runtimeArgs = @('--headless', '--path', $runtime, '--main-pack', $gamePath)
+    if ($AdmissionTests) {
+        [IO.File]::WriteAllText((Join-Path $runtime '.coop-test-runtime'), '')
+        $runtimeArgs += @('--', [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../tests')))
+    }
+    $check = Invoke-RawTool $runtimeEditor $runtimeArgs 'runtime'
     $errors = @($check.Lines | Where-Object { "$_" -match '(?i)(SCRIPT ERROR:|ERROR:|Parse Error|Compile Error)' })
     if ($check.Code -ne 0 -or $errors.Count -gt 0 -or -not ($check.Lines -match '^COOP_BUILD_CHECK_OK ') -or $check.Lines -match '^COOP_BUILD_CHECK_FAILED ') {
         $errors | Select-Object -First 8 | ForEach-Object { Write-Output "$_" }

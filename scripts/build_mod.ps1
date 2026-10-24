@@ -3,13 +3,14 @@ param(
     [Parameter(Mandatory)][string] $Godot,
     [string] $Gdre,
     [string] $GameExe,
+    [switch] $AdmissionTests,
     [string] $ProjectDir = (Join-Path $PSScriptRoot '../mod/overrides'),
     [string] $OutputDir = (Join-Path $PSScriptRoot '../dist')
 )
 . (Join-Path $PSScriptRoot 'mod_files.ps1')
 if ($Gdre -or $GameExe) {
     if (-not $Gdre -or -not $GameExe) { throw 'Raw packaging requires both Gdre and GameExe.' }
-    & (Join-Path $PSScriptRoot 'build_raw_mod.ps1') -Godot $Godot -Gdre $Gdre -GameExe $GameExe -ProjectDir $ProjectDir -OutputDir $OutputDir
+    & (Join-Path $PSScriptRoot 'build_raw_mod.ps1') -Godot $Godot -Gdre $Gdre -GameExe $GameExe -ProjectDir $ProjectDir -OutputDir $OutputDir -AdmissionTests:$AdmissionTests
     return
 }
 $godotPath = (Resolve-Path -LiteralPath $Godot).Path
