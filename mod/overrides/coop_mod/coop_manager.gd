@@ -3753,6 +3753,7 @@ func _get_debug_spawn_catalog() -> Dictionary:
     if debug_spawn_catalog.is_empty():
         for spawn_id in DEBUG_SPAWN_FALLBACK_IDS:
             _register_debug_spawn_resource("%s_spawner.tres" % str(spawn_id))
+            _register_debug_spawn_resource("%s_capsule.tres" % str(spawn_id))
     return debug_spawn_catalog
 
 
@@ -3766,6 +3767,8 @@ func _register_debug_spawn_resource(file_name: String) -> void:
     if primary_id == "" or debug_spawn_catalog.has(primary_id):
         return
     var resource_path: String = "%s/%s" % [DEBUG_SPAWN_RESOURCE_DIR, file_name]
+    if not ResourceLoader.exists(resource_path):
+        return
     var resource = load(resource_path)
     if primary_id != "" and resource is Spawner and str(resource.entity_path) != "":
         debug_spawn_catalog[primary_id] = {
@@ -5195,7 +5198,7 @@ func has_connected_remote_peers() -> bool:
     if multiplayer.multiplayer_peer == null:
         return false
     if multiplayer.is_server():
-        return multiplayer.multiplayer_peer.get_peers().size() > 0
+        return not multiplayer.get_peers().is_empty()
     return _has_live_peer()
 
 

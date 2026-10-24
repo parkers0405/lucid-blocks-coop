@@ -14,7 +14,7 @@ class_name LucidBlocksWorld extends World
 signal start_up_done
 
 
-enum Dimension { DEBUG = 0, CREATIVE = 1, NARAKA = 2, POCKET = 3, CHALLENGE = 4, FIRMAMENT = 5, YHVH = 6, ALMA = 7 }
+enum Dimension { DEBUG = 0, CREATIVE = 1, NARAKA = 2, POCKET = 3, CHALLENGE = 4, FIRMAMENT = 5, YHVH = 6, ALMA = 7, LUCY = 8, TORUS = 9 }
 var current_dimension: Dimension = Dimension.NARAKA
 
 
@@ -512,6 +512,10 @@ func select_generator() -> void :
             generator = ResourceLoader.load("res://main/world/generators/yhvh_generator.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
         Dimension.ALMA:
             generator = ResourceLoader.load("res://main/world/generators/alma_generator.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
+        Dimension.LUCY:
+            generator = ResourceLoader.load("res://main/world/generators/lucy_generator.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
+        Dimension.TORUS:
+            generator = ResourceLoader.load("res://main/world/generators/torus_generator.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
         _:
             assert(false)
     generator.seed = current_seed

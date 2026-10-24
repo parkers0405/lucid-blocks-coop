@@ -1,5 +1,7 @@
 class_name Entity extends CharacterBody3D
 
+var dexterity: int = 0
+
 @export_group("Stats")
 @export var max_health: int = 10:
     set(val):
@@ -465,6 +467,20 @@ func rope_process(delta: float) -> void :
 
     for rope in rope_velocities:
         rope_velocity += rope_velocities[rope]
+
+
+static func get_water_flow(position: Vector3) -> Vector3:
+    if not Ref.world.is_position_loaded(position):
+        return Vector3.ZERO
+    var center: int = Ref.world.get_water_level_at(position)
+    if center == 0:
+        return Vector3.ZERO
+    var flow := Vector3.ZERO
+    for direction in [Vector3.LEFT, Vector3.RIGHT, Vector3.BACK, Vector3.FORWARD]:
+        var neighbor: Vector3 = position + direction
+        if Ref.world.is_position_loaded(neighbor) and not Ref.world.is_block_solid_at(neighbor):
+            flow += direction * (center - Ref.world.get_water_level_at(neighbor))
+    return flow / 255.0
 
 
 func water_physics_process(delta: float) -> void :

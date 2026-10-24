@@ -112,6 +112,40 @@ if ($env:COOP_TEST_MODE -eq 'error') { 'SCRIPT ERROR: simulated failure' }
     Assert ((Hash $target) -eq $originalHash) 'successful mock build leaves installation unchanged'
     Assert (([IO.File]::ReadAllText((Join-Path $project 'project.godot'))) -eq 'fixture') 'editor only changes staged project'
     Assert (@(Get-ChildItem -LiteralPath $dist -Force).Count -eq 1) 'no build staging files remain'
+    $rawMock = Join-Path $fixture 'raw tools.ps1'
+    @'
+$global:LASTEXITCODE = 0
+if ($args -contains '--version') { '4.6.stable.double'; return }
+$create = @($args | Where-Object { $_ -like '--pck-create=*' })
+if ($create.Count) {
+    $source = $create[0].Substring(13)
+    if (Test-Path -LiteralPath (Join-Path $source 'project.godot')) { throw 'Pack includes project settings.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $source 'coop_mod/fixture.gd.remap')) -and
+        -not (Test-Path -LiteralPath (Join-Path $source 'mods/coop_build_check/mod_init.gd'))) { throw 'Script remap or isolated probe missing.' }
+    $destination = @($args | Where-Object { $_ -like '--output=*' })[0].Substring(9)
+    Copy-Item -LiteralPath $env:COOP_TEST_PACK -Destination $destination
+    return
+}
+if ($env:COOP_TEST_MODE -eq 'rawexit') { $global:LASTEXITCODE = 1; return }
+if ($env:COOP_TEST_MODE -eq 'rawmissing') { return }
+'COOP_BUILD_CHECK_OK 1'
+if ($env:COOP_TEST_MODE -eq 'rawerror') { 'SCRIPT ERROR: Compile Error: simulated dependency mismatch' }
+'@ | Set-Content -LiteralPath $rawMock -Encoding UTF8
+    New-Item -ItemType Directory -Path (Join-Path $project 'coop_mod') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $project 'coop_mod/fixture.gd'), "extends Node`n")
+    foreach ($library in @('libgdblocks.windows.template_release.double.x86_64.dll', 'libgodotsteam.windows.template_release.double.x86_64.dll', 'steam_api64.dll')) {
+        [IO.File]::WriteAllText((Join-Path $game $library), 'fixture library')
+    }
+    Copy-Item -LiteralPath $pack -Destination $artifact
+    foreach ($mode in @('rawerror', 'rawexit', 'rawmissing')) {
+        $env:COOP_TEST_MODE = $mode
+        Expect-Failure { & "$scripts/build_mod.ps1" -Godot $rawMock -Gdre $rawMock -GameExe (Join-Path $game 'lucid-blocks.exe') -ProjectDir $project -OutputDir $dist } "raw check rejects $mode"
+        Assert ((Hash $artifact) -eq (Hash $pack)) "raw $mode retains old artifact"
+    }
+    $env:COOP_TEST_MODE = 'rawsuccess'
+    & "$scripts/build_mod.ps1" -Godot $rawMock -Gdre $rawMock -GameExe (Join-Path $game 'lucid-blocks.exe') -ProjectDir $project -OutputDir $dist
+    Assert ((Hash $artifact) -eq (Hash $update)) 'raw successful check publishes artifact'
+    Assert ((Hash $target) -eq $originalHash) 'raw builder leaves install unchanged'
     Write-Output "PASS: $checks assertions (synthetic fixtures; no game or engine execution)."
 } finally {
     Remove-Item Env:COOP_TEST_PACK, Env:COOP_TEST_MODE -ErrorAction SilentlyContinue
