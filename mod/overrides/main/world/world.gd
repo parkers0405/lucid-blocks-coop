@@ -1,6 +1,12 @@
 class_name LucidBlocksWorld extends World
 
 
+const RegionCheckpoint = preload("res://coop_mod/region_checkpoint.gd")
+var pending_dimension_instance: Dictionary = {}
+var region_checkpoint_load_failed: bool = false
+var region_checkpoint_store = RegionCheckpoint.new()
+
+
 @export_group("Editor Debug")
 @export var debug_extents: Vector3i = Vector3i(64, 64, 64)
 @export var raster_block_type: Block
@@ -521,6 +527,26 @@ func select_generator() -> void :
     generator.seed = current_seed
 
 
+func queue_dimension_instance(dimension: int, owner: String) -> bool:
+    if not SaveFile.DIMENSION_MAP.has(dimension):
+        return false
+    if dimension in [Dimension.POCKET, Dimension.FIRMAMENT] and not owner.is_empty() and not RegionCheckpoint.valid_component(owner):
+        return false
+    pending_dimension_instance = {"dimension": dimension, "owner": owner}
+    return true
+
+
+func apply_pending_dimension_instance(file_register: SaveFileRegister) -> bool:
+    if pending_dimension_instance.is_empty() or pending_dimension_instance["dimension"] != current_dimension:
+        return false
+    var owner: String = pending_dimension_instance["owner"] if current_dimension in [Dimension.POCKET, Dimension.FIRMAMENT] else ""
+    if not owner.is_empty() and not RegionCheckpoint.valid_component(owner):
+        return false
+    file_register.set_data("pocket_owner_key", owner, true)
+    pending_dimension_instance.clear()
+    return true
+
+
 func _get_private_instance_owner_key() -> String:
     if current_dimension != Dimension.POCKET and current_dimension != Dimension.FIRMAMENT:
         return ""
@@ -533,6 +559,8 @@ func _get_dimension_save_namespace() -> String:
     var dimension_namespace: String = SaveFile.DIMENSION_MAP[current_dimension]
     var owner_key: String = _get_private_instance_owner_key()
     if owner_key != "":
+        if not RegionCheckpoint.valid_component(owner_key):
+            return ""
         dimension_namespace = "%s__%s" % [dimension_namespace, owner_key]
     return dimension_namespace
 
@@ -541,10 +569,32 @@ func get_region_file_name(region_coordinate: Vector3i) -> String:
     return "c%d.%d.%d.txt" % [region_coordinate.x, region_coordinate.y, region_coordinate.z]
 
 
+func get_checkpoint_block_ids() -> Dictionary:
+    var ids: Dictionary = {}
+    for item_id in ItemMap.all_item_ids:
+        if ItemMap.map(item_id) is Block:
+            ids[item_id] = true
+    return ids
+
+
 func save_chunk_data(chunk_directory: String) -> void :
+    if region_checkpoint_load_failed:
+        push_warning("Region save refused after failed migration/load")
+        return
     register_loaded_chunks()
 
     var dimension_folder: String = _get_dimension_save_namespace()
+    if dimension_folder.is_empty():
+        push_warning("Invalid private world owner; region save refused")
+        return
+    var store = RegionCheckpoint.new()
+    if not _get_private_instance_owner_key().is_empty() or store.has_checkpoint(chunk_directory, dimension_folder):
+        var serialized: Dictionary = {}
+        save_data(serialized, dimension_folder + "_")
+        var committed: Dictionary = store.commit_patch(chunk_directory, dimension_folder, dimension_folder + "_", serialized, get_checkpoint_block_ids())
+        if not committed["ok"]:
+            push_error("Private region save failed: " + str(committed.get("error", "unknown error")))
+        return
     var dimension_directory = chunk_directory + "/" + dimension_folder + "/"
     if not DirAccess.dir_exists_absolute(dimension_directory):
         var status: Error = DirAccess.make_dir_absolute(dimension_directory)
@@ -564,46 +614,46 @@ func save_chunk_data(chunk_directory: String) -> void :
         var _buffer_saved: bool = region_file.store_buffer(buffer)
 
 
-func load_chunk_data(chunk_directory: String) -> void :
-    select_generator()
+func _checkpoint_chunks_directory() -> String:
+    var register = Ref.save_file_manager.loaded_file_register
+    return Ref.save_file_manager.get_save_file_directory(str(register.get_data("uuid", "")), register.is_downloaded).path_join("chunks")
 
+
+func _load_dimension_regions(chunk_directory: String, file: SaveFile) -> bool:
+    var register = Ref.save_file_manager.loaded_file_register
+    var previous_owner: String = str(register.get_data("pocket_owner_key", "", true))
+    var previous_pending: Dictionary = pending_dimension_instance.duplicate(true)
+    var changed_owner: bool = apply_pending_dimension_instance(register)
     var dimension_folder: String = _get_dimension_save_namespace()
-    var dimension_directory = chunk_directory + "/" + dimension_folder + "/"
+    var loaded: Dictionary = region_checkpoint_store.migrate_legacy(chunk_directory, dimension_folder, SaveFile.DIMENSION_MAP[current_dimension], file.data if file != null else {}, get_checkpoint_block_ids())
+    if loaded["ok"]:
+        loaded = region_checkpoint_store.read_regions(chunk_directory, dimension_folder, get_checkpoint_block_ids())
+    if not loaded["ok"]:
+        register.set_data("pocket_owner_key", previous_owner, true)
+        pending_dimension_instance = previous_pending
+        region_checkpoint_load_failed = true
+        push_warning("Region migration/load refused: " + str(loaded.get("error", "unknown error")))
+        return false
+    region_checkpoint_load_failed = false
+    select_generator()
+    for region in loaded["regions"].values():
+        load_region(region)
+    if changed_owner:
+        Ref.save_file_manager.write_register_file(register)
+    return true
 
-    if not DirAccess.dir_exists_absolute(dimension_directory):
-        # Co-op private instances (pocket__<owner>, firmament__<owner>) are invisible to the
-        # vanilla plain-key migration gate, so migrate their legacy in-file data here.
-        var legacy_file: SaveFile = Ref.save_file_manager.loaded_file if Ref.save_file_manager != null else null
-        if legacy_file != null and legacy_file.data.has(dimension_folder + "_world"):
-            load_data(legacy_file.data, dimension_folder + "_")
-            legacy_file.data.erase(dimension_folder + "_world")
-            make_all_regions_dirty()
-            return
-        print("No chunk directory found for this dimension.")
-        return
 
-    for region_file_name in DirAccess.get_files_at(dimension_directory):
-        var region_file = FileAccess.open(dimension_directory + region_file_name, FileAccess.READ)
-        var buffer: PackedByteArray = region_file.get_buffer(region_file.get_length()).decompress_dynamic(4000000000, FileAccess.COMPRESSION_GZIP)
-        var data: Dictionary = JSON.to_native(JSON.parse_string(buffer.get_string_from_utf8()))
-        region_file.close()
-        load_region(data)
+func load_chunk_data(chunk_directory: String) -> void :
+    _load_dimension_regions(chunk_directory, Ref.save_file_manager.loaded_file)
 
 
 func load_chunks_old(file: SaveFile) -> void :
-    select_generator()
-    var dimension_namespace: String = _get_dimension_save_namespace()
-    load_data(file.data, dimension_namespace + "_")
+    _load_dimension_regions(_checkpoint_chunks_directory(), file)
 
 
-
-func clear_old_chunk_data(file: SaveFile, dimension: Dimension) -> void :
-    file.data.erase(SaveFile.DIMENSION_MAP[dimension] + "_world")
-    if dimension == current_dimension:
-        var dimension_namespace: String = _get_dimension_save_namespace()
-        if dimension_namespace != SaveFile.DIMENSION_MAP[dimension]:
-            file.data.erase(dimension_namespace + "_world")
-
+func clear_old_chunk_data(_file: SaveFile, _dimension: Dimension) -> void :
+    # shortcut: retain legacy keys for recovery until explicit verified cleanup is implemented.
+    pass
 
 func save_file(file: SaveFile) -> void :
     var owner_key: String = _get_private_instance_owner_key()

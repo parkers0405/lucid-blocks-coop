@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string] $GameExe,
     [Parameter(Mandatory)][string] $ProjectDir,
     [Parameter(Mandatory)][string] $OutputDir,
+    [switch] $RegionTests,
     [switch] $AdmissionTests
 )
 . (Join-Path $PSScriptRoot 'mod_files.ps1')
@@ -147,13 +148,19 @@ func _check() -> void:
         failures += 1
     var test_args = OS.get_cmdline_user_args()
     if not test_args.is_empty():
-        print("COOP_ADMISSION_SUITE_LOADING")
-        var suite = load(test_args[0].path_join("admission.gd")).new()
-        add_child(suite)
-        print("COOP_ADMISSION_SUITE_RUNNING")
-        failures += await suite.run()
-        suite.queue_free()
-        failures += load(test_args[0].path_join("native_guard.gd")).run()
+        if test_args.size() > 1 and test_args[1] == "region":
+            var region_suite = load(test_args[0].path_join("region_runtime.gd")).new()
+            add_child(region_suite)
+            failures += await region_suite.run()
+            region_suite.free()
+        else:
+            print("COOP_ADMISSION_SUITE_LOADING")
+            var suite = load(test_args[0].path_join("admission.gd")).new()
+            add_child(suite)
+            print("COOP_ADMISSION_SUITE_RUNNING")
+            failures += await suite.run()
+            suite.queue_free()
+            failures += load(test_args[0].path_join("native_guard.gd")).run()
     print("COOP_BUILD_CHECK_OK ", paths.size())
     # The original keyboard owns an unattached helper; release it for this short probe.
     var keyboard = get_node_or_null("/root/Main/UI/OnscreenKeyboard")
@@ -177,9 +184,10 @@ func _finish(failures: int) -> void:
     $env:TEMP = Join-Path $buildDir 'temp'
     $env:TMP = $env:TEMP
     $runtimeArgs = @('--headless', '--path', $runtime, '--main-pack', $gamePath)
-    if ($AdmissionTests) {
+    if ($AdmissionTests -or $RegionTests) {
         [IO.File]::WriteAllText((Join-Path $runtime '.coop-test-runtime'), '')
         $runtimeArgs += @('--', [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../tests')))
+        if ($RegionTests) { $runtimeArgs += 'region' }
     }
     $check = Invoke-RawTool $runtimeEditor $runtimeArgs 'runtime'
     $errors = @($check.Lines | Where-Object { "$_" -match '(?i)(SCRIPT ERROR:|ERROR:|Parse Error|Compile Error)' })

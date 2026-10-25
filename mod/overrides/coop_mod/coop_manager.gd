@@ -3,11 +3,12 @@ extends Node
 
 const AvatarRegistry = preload("res://coop_mod/avatar_registry.gd")
 const RemotePlayerMarkerScript = preload("res://coop_mod/remote_player_marker.gd")
+const RegionCheckpoint = preload("res://coop_mod/region_checkpoint.gd")
 const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_PLAYERS: int = 2
 const MAX_CLIENTS: int = MAX_PLAYERS - 1
-const MOD_PROTOCOL_VERSION: int = 1
+const MOD_PROTOCOL_VERSION: int = 2
 const TARGET_GAME_VERSION: String = "5.1.0"
 const AUTH_TIMEOUT_SECONDS: float = 5.0
 const AUTH_MAX_BYTES: int = 512
@@ -69,7 +70,7 @@ const CLIENT_ENTITY_HIT_COOLDOWN_SEC: float = 0.33
 const WATER_SYNC_INTERVAL: float = 0.12
 const HOST_DYNAMIC_CELL_RESAMPLE_INTERVAL_SEC: float = 0.35
 const LOCAL_WORLD_PATCH_FLUSH_INTERVAL: float = 0.18
-const GUEST_WORLD_PATCH_FLUSH_TIMEOUT_SEC: float = 0.4
+const GUEST_WORLD_PATCH_FLUSH_TIMEOUT_SEC: float = 5.0
 const WATER_SYNC_HORIZONTAL_RADIUS: int = 12
 const WATER_SYNC_VERTICAL_RADIUS: int = 10
 const WATER_SYNC_BUCKET_SIZE: float = 4.0
@@ -185,6 +186,10 @@ var pending_local_world_patch_instance_key: String = ""
 var cached_world_chunk_size: Vector3i = Vector3i.ZERO
 var guest_world_patch_flush_request_counter: int = 0
 var pending_guest_world_patch_flush_acks: Dictionary = {}
+var failed_guest_world_patch_flushes: Dictionary = {}
+var guest_checkpoint_request_counter: int = 0
+var guest_checkpoint_results: Dictionary = {}
+var region_checkpoint = RegionCheckpoint.new()
 var group_dimension_transfer_in_progress: bool = false
 var pending_remote_block_changes: Dictionary = {}
 var pending_remote_water_changes: Dictionary = {}
@@ -1772,6 +1777,8 @@ func _install_game_menu_quit_hook() -> void:
 
 
 func _on_game_menu_quit_requested_coop() -> void:
+    if not await _await_local_world_checkpoint():
+        return
     if not _has_live_peer():
         if is_instance_valid(Ref.main) and Ref.main.has_method("_on_game_menu_quit_requested"):
             await Ref.main._on_game_menu_quit_requested()
@@ -1785,6 +1792,8 @@ func _on_game_menu_quit_requested_coop() -> void:
 
 
 func _host_save_and_quit_to_main_menu() -> void:
+    if not await _await_local_world_checkpoint():
+        return
     if not is_instance_valid(Ref.main):
         return
     if local_quit_in_progress:
@@ -1796,7 +1805,10 @@ func _host_save_and_quit_to_main_menu() -> void:
     clear_fake_death_override_after_shutdown = true
 
     if _has_live_peer() and multiplayer.is_server():
-        await _shutdown_host_session(false, "Host saved and quit")
+        if not await _shutdown_host_session(false, "Host saved and quit"):
+            local_quit_in_progress = false
+            clear_fake_death_override_after_shutdown = false
+            return
 
     local_quit_in_progress = false
     await Ref.main._on_game_menu_quit_requested()
@@ -1820,6 +1832,8 @@ func _guest_save_and_quit_to_main_menu(reason: String = "Left host session") -> 
     if multiplayer.is_server() and _has_live_peer():
         return
     if client_menu_kick_pending:
+        return
+    if not await _await_local_world_checkpoint():
         return
 
     reconnect_pending = false
@@ -2947,7 +2961,6 @@ func _resolve_target_pocket_owner_key(target_dimension: int, target_pocket_owner
     var pocket_owner_key: String = target_pocket_owner_key.strip_edges()
     if _is_private_instance_dimension(target_dimension) and pocket_owner_key == "":
         pocket_owner_key = _get_local_player_key()
-    _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension, pocket_owner_key)
     return pocket_owner_key
 
 
@@ -2955,11 +2968,15 @@ func _travel_group_to_dimension_async(target_dimension: int, immediate: bool = f
     if not _can_sample_player() or group_dimension_transfer_in_progress:
         return
 
+    if not await _await_local_world_checkpoint():
+        return
+
     _flush_pending_local_world_patch_to_host(true)
     _persist_current_owned_pocket_variants_if_needed()
     var pocket_owner_key: String = _resolve_target_pocket_owner_key(target_dimension, target_pocket_owner_key)
     if not _has_live_peer():
-        _set_loaded_dimension_instance(target_dimension, pocket_owner_key)
+        if not _queue_loaded_dimension_instance(target_dimension, pocket_owner_key):
+            return
         suppress_local_game_quit_session_shutdown = true
         await Ref.main.teleport_to_dimension(target_dimension, immediate, white_close)
         suppress_local_game_quit_session_shutdown = false
@@ -2975,7 +2992,9 @@ func _travel_group_to_dimension_async(target_dimension: int, immediate: bool = f
     group_dimension_transfer_in_progress = true
     status_message = "Opening dimension %s" % target_dimension
     _update_status_text()
-    _set_loaded_dimension_instance(target_dimension, pocket_owner_key)
+    if not _queue_loaded_dimension_instance(target_dimension, pocket_owner_key):
+        group_dimension_transfer_in_progress = false
+        return
     suppress_local_game_quit_session_shutdown = true
     await Ref.main.teleport_to_dimension(target_dimension, immediate, white_close)
     suppress_local_game_quit_session_shutdown = false
@@ -2996,6 +3015,8 @@ func _travel_group_to_dimension_async(target_dimension: int, immediate: bool = f
 
 func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_key: String = "") -> void:
     if not _can_sample_player():
+        return
+    if not await _await_local_world_checkpoint():
         return
 
     _flush_pending_local_world_patch_to_host(true)
@@ -3021,10 +3042,13 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
             return
 
     if multiplayer.is_server() and _has_live_peer() and target_instance_key != get_active_dimension_instance_key():
-        await _await_guest_world_patch_flush_for_instance(target_instance_key)
+        if not await _await_guest_world_patch_flush_for_instance(target_instance_key):
+            return
             
     # Load locally!
-    _set_loaded_dimension_instance(target_dimension, pocket_owner_key)
+    if not _queue_loaded_dimension_instance(target_dimension, pocket_owner_key):
+        group_dimension_transfer_in_progress = false
+        return
     suppress_local_game_quit_session_shutdown = true
     await Ref.main.teleport_to_dimension(target_dimension, false, false)
     suppress_local_game_quit_session_shutdown = false
@@ -3036,16 +3060,23 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
     await _position_local_player_after_dimension_open(source_dimension, target_dimension)
 
 
-func _set_loaded_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> void:
-    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file_register == null:
-        return
+func _queue_loaded_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> bool:
+    if not _prepare_target_legacy_checkpoint(target_dimension, target_pocket_owner_key):
+        return false
+    # Main saves and clears the outgoing world before either loader consumes this owner.
+    return Ref.world.queue_dimension_instance(target_dimension, target_pocket_owner_key)
 
-    Ref.save_file_manager.loaded_file_register.set_data("dimension", target_dimension, true)
-    if _is_private_instance_dimension(target_dimension):
-        Ref.save_file_manager.loaded_file_register.set_data("pocket_owner_key", target_pocket_owner_key, true)
-    else:
-        Ref.save_file_manager.loaded_file_register.set_data("pocket_owner_key", "", true)
 
+func _prepare_target_legacy_checkpoint(target_dimension: int, owner: String) -> bool:
+    if not SaveFile.DIMENSION_MAP.has(target_dimension) or Ref.save_file_manager.loaded_file == null:
+        return false
+    var target: String = _resolve_dimension_namespace(target_dimension, owner)
+    var local_adoption: bool = _is_private_instance_dimension(target_dimension) and owner == _get_local_player_key()
+    var result: Dictionary = region_checkpoint.migrate_legacy(_get_checkpoint_chunks_directory(), target, SaveFile.DIMENSION_MAP[target_dimension], Ref.save_file_manager.loaded_file.data, _checkpoint_block_ids(), local_adoption)
+    if not result["ok"]:
+        status_message = "Legacy region migration failed; dimension transfer cancelled"
+        _update_status_text()
+    return result["ok"]
 
 func _find_active_peer_position_in_instance(instance_key: String) -> Dictionary:
     for peer_id in peer_states.keys():
@@ -5026,31 +5057,12 @@ func _duplicate_world_namespace(save_data: Dictionary, source_prefix: String, ta
     return _copy_world_namespace_between_save_data(save_data, save_data, source_prefix, target_prefix)
 
 
-func _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension: int, target_pocket_owner_key: String) -> void:
-    if target_dimension != int(LucidBlocksWorld.Dimension.POCKET):
-        return
-    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
-        return
+func _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension: int, target_pocket_owner_key: String) -> bool:
+    if target_dimension != int(LucidBlocksWorld.Dimension.POCKET) or target_pocket_owner_key != _get_local_player_key():
+        return false
     if _has_live_peer() and not multiplayer.is_server():
-        return
-
-    var local_player_key: String = _get_local_player_key()
-    var target_owner_key: String = target_pocket_owner_key.strip_edges()
-    if target_owner_key == "" or target_owner_key != local_player_key:
-        return
-
-    var legacy_prefix: String = _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), "") + "_"
-    var owned_prefix: String = _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), target_owner_key) + "_"
-    var save_data: Dictionary = Ref.save_file_manager.loaded_file.data
-    if save_data.has(owned_prefix + "world"):
-        return
-    if not _duplicate_world_namespace(save_data, legacy_prefix, owned_prefix):
-        return
-
-    var legacy_respawns: Variant = Ref.save_file_manager.loaded_file.get_data("%s/respawn_positions" % _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), ""), null)
-    if legacy_respawns != null:
-        SaveFile._set_data(save_data, "%s/respawn_positions" % _resolve_dimension_namespace(int(LucidBlocksWorld.Dimension.POCKET), target_owner_key), legacy_respawns.duplicate(true))
-
+        return false
+    return _prepare_target_legacy_checkpoint(target_dimension, target_pocket_owner_key)
 
 func _migrate_loaded_legacy_pocket_to_local_owner_if_needed() -> void:
     if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or Ref.save_file_manager.loaded_file_register == null:
@@ -5066,7 +5078,8 @@ func _migrate_loaded_legacy_pocket_to_local_owner_if_needed() -> void:
     if local_player_key == "":
         return
 
-    _migrate_legacy_pocket_save_to_owner_if_needed(int(LucidBlocksWorld.Dimension.POCKET), local_player_key)
+    if not _migrate_legacy_pocket_save_to_owner_if_needed(int(LucidBlocksWorld.Dimension.POCKET), local_player_key):
+        return
     Ref.save_file_manager.loaded_file_register.set_data("pocket_owner_key", local_player_key, true)
     if _has_live_peer():
         call_deferred("_broadcast_local_state_now")
@@ -5228,27 +5241,33 @@ func _get_peer_ids_in_instance(instance_key: String) -> Array:
     return peer_ids
 
 
-func _await_guest_world_patch_flush_for_instance(instance_key: String) -> void:
+func _await_guest_world_patch_flush_for_instance(instance_key: String) -> bool:
     if not multiplayer.is_server() or not _has_live_peer() or instance_key == "":
-        return
+        return true
 
     var peer_ids: Array = _get_peer_ids_in_instance(instance_key)
     if peer_ids.is_empty():
-        return
+        return true
 
     guest_world_patch_flush_request_counter += 1
     var request_id: int = guest_world_patch_flush_request_counter
     var pending_acks: Dictionary = {}
     pending_guest_world_patch_flush_acks[request_id] = pending_acks
     for peer_id in peer_ids:
-        pending_acks[int(peer_id)] = true
+        pending_acks[int(peer_id)] = instance_key
         request_guest_world_patch_flush.rpc_id(int(peer_id), request_id, instance_key)
 
     var deadline_ms: int = Time.get_ticks_msec() + int(GUEST_WORLD_PATCH_FLUSH_TIMEOUT_SEC * 1000.0)
-    while pending_guest_world_patch_flush_acks.has(request_id) and Time.get_ticks_msec() < deadline_ms:
+    while pending_guest_world_patch_flush_acks.has(request_id) and not failed_guest_world_patch_flushes.has(request_id) and Time.get_ticks_msec() < deadline_ms:
         await get_tree().process_frame
 
+    var committed: bool = not pending_guest_world_patch_flush_acks.has(request_id) and not failed_guest_world_patch_flushes.has(request_id)
     pending_guest_world_patch_flush_acks.erase(request_id)
+    failed_guest_world_patch_flushes.erase(request_id)
+    if not committed:
+        status_message = "Partner region checkpoint failed or timed out; dimension transfer cancelled"
+        _update_status_text()
+    return committed
 
 
 func _send_requested_dimension_world_snapshot(sender_id: int, target_dimension: int, target_pocket_owner_key: String) -> void:
@@ -5257,7 +5276,8 @@ func _send_requested_dimension_world_snapshot(sender_id: int, target_dimension: 
 
     var target_instance_key: String = get_dimension_instance_key(target_dimension, target_pocket_owner_key)
     if multiplayer.is_server() and _has_live_peer() and target_instance_key != get_active_dimension_instance_key():
-        await _await_guest_world_patch_flush_for_instance(target_instance_key)
+        if not await _await_guest_world_patch_flush_for_instance(target_instance_key):
+            return
 
     _send_world_snapshot_to_peer.call_deferred(sender_id, target_dimension, target_pocket_owner_key, false)
 
@@ -7165,48 +7185,8 @@ func _capture_local_chunk_patch_for_world_positions(world_positions: Array) -> D
 
 
 func _capture_local_runtime_chunk_patch_for_world_positions(world_positions: Array) -> Dictionary:
-    if not _can_sample_player():
-        return {}
-
-    var chunk_positions: Array = _get_unique_chunk_positions_for_world_positions(world_positions)
-    if chunk_positions.is_empty():
-        return {}
-
-    # Avoid full world serialization on guest block actions; capture only touched chunks.
-    var dimension: int = int(Ref.world.current_dimension)
-    var pocket_owner_key: String = get_active_pocket_owner_key()
-    var prefix: String = _resolve_dimension_namespace(dimension, pocket_owner_key) + "_"
-    var chunk_blocks: Dictionary = {}
-    var chunk_water: Dictionary = {}
-    var chunk_water_awake: Dictionary = {}
-    var chunk_fire: Dictionary = {}
-
-    for chunk_position in chunk_positions:
-        var chunk_snapshot: Dictionary = _capture_runtime_chunk_snapshot(chunk_position)
-        if chunk_snapshot.is_empty():
-            continue
-        chunk_blocks[chunk_position] = chunk_snapshot.get("blocks", PackedInt32Array())
-        chunk_water[chunk_position] = chunk_snapshot.get("water", PackedByteArray())
-        chunk_water_awake[chunk_position] = chunk_snapshot.get("water_awake", PackedByteArray())
-        chunk_fire[chunk_position] = chunk_snapshot.get("fire", PackedByteArray())
-
-    if chunk_blocks.is_empty():
-        return {}
-
-    return {
-        "dimension": dimension,
-        "pocket_owner_key": pocket_owner_key,
-        "dimension_instance_key": get_dimension_instance_key(dimension, pocket_owner_key),
-        "world_data": {
-            prefix + "world": {
-                prefix + "chunk_block": chunk_blocks,
-                prefix + "chunk_water": chunk_water,
-                prefix + "chunk_water_awake": chunk_water_awake,
-                prefix + "chunk_fire": chunk_fire,
-            },
-        },
-    }
-
+    # Native serialization preserves block IDs and the 64-byte water-awake channel.
+    return _capture_local_chunk_patch_for_chunk_positions(_get_unique_chunk_positions_for_world_positions(world_positions))
 
 func _capture_runtime_chunk_snapshot(chunk_position: Vector3i) -> Dictionary:
     if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(chunk_position):
@@ -7317,7 +7297,117 @@ func _merge_patch_dictionary(target: Dictionary, source: Dictionary) -> Dictiona
     return merged
 
 
-func _merge_world_patch_into_save(world_patch: Dictionary) -> void:
+func _get_checkpoint_chunks_directory() -> String:
+    if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file_register == null:
+        return ""
+    var register = Ref.save_file_manager.loaded_file_register
+    var uuid: String = str(register.get_data("uuid", ""))
+    if uuid.is_empty():
+        return ""
+    return Ref.save_file_manager.get_save_file_directory(uuid, register.is_downloaded).path_join("chunks")
+
+
+func _checkpoint_block_ids() -> Dictionary:
+    return Ref.world.get_checkpoint_block_ids() if is_instance_valid(Ref.world) else {}
+
+
+func _validate_guest_world_patch(sender_state: Dictionary, world_patch: Dictionary) -> bool:
+    var dimension = world_patch.get("dimension")
+    var owner = world_patch.get("pocket_owner_key")
+    if not dimension is int or not SaveFile.DIMENSION_MAP.has(dimension) or not owner is String:
+        return false
+    if sender_state.get("dimension") != dimension or sender_state.get("pocket_owner_key", "") != owner:
+        return false
+    if _is_private_instance_dimension(dimension):
+        if not RegionCheckpoint.valid_component(owner) or sender_state.get("player_key", "") != owner:
+            return false
+    elif not owner.is_empty():
+        return false
+    var expected: String = get_dimension_instance_key(dimension, owner)
+    return sender_state.get("dimension_instance_key", "") == expected and world_patch.get("dimension_instance_key", "") == expected and world_patch.get("world_data") is Dictionary
+
+
+func _merge_world_patch_into_save(world_patch: Dictionary) -> bool:
+    var chunks_dir: String = _get_checkpoint_chunks_directory()
+    if chunks_dir.is_empty():
+        return false
+    var region_namespace: String = _resolve_dimension_namespace(world_patch["dimension"], world_patch["pocket_owner_key"])
+    var result: Dictionary = region_checkpoint.commit_patch(chunks_dir, region_namespace, region_namespace + "_", world_patch["world_data"], _checkpoint_block_ids())
+    if not result["ok"]:
+        status_message = "Region checkpoint failed: " + str(result.get("error", "unknown error"))
+        _update_status_text()
+        return false
+    _merge_world_patch_into_cache(world_patch)
+    return true
+
+
+func _send_region_checkpoint_result(peer_id: int, request_id: int, committed: bool) -> void:
+    guest_world_checkpoint_result.rpc_id(peer_id, request_id, committed)
+
+
+func _checkpoint_and_reply(sender_id: int, world_patch: Dictionary) -> bool:
+    var committed: bool = _validate_guest_world_patch(peer_states.get(sender_id, {}), world_patch) and _merge_world_patch_into_save(world_patch)
+    var request_id = world_patch.get("checkpoint_request_id", 0)
+    if request_id is int and request_id > 0:
+        _send_region_checkpoint_result(sender_id, request_id, committed)
+    var flush_id = world_patch.get("host_flush_request_id", 0)
+    if flush_id is int and flush_id > 0:
+        var pending: Dictionary = pending_guest_world_patch_flush_acks.get(flush_id, {})
+        if pending.get(sender_id, "") == world_patch.get("dimension_instance_key", "") and pending.has(sender_id):
+            if committed:
+                pending.erase(sender_id)
+                if pending.is_empty():
+                    pending_guest_world_patch_flush_acks.erase(flush_id)
+            else:
+                failed_guest_world_patch_flushes[flush_id] = true
+    return committed
+
+
+func _checkpoint_local_host_world() -> bool:
+    if not _can_sample_player():
+        return true
+    if Ref.world.region_checkpoint_load_failed:
+        return false
+    Ref.world.register_loaded_chunks()
+    return _merge_world_patch_into_save(_capture_local_world_patch())
+
+
+func _await_local_world_checkpoint(host_flush_request_id: int = 0) -> bool:
+    if multiplayer.is_server():
+        return _checkpoint_local_host_world()
+    if not _can_push_local_world_state_to_host():
+        return host_flush_request_id == 0
+    var world = Ref.world
+    var player = Ref.player
+    var previous_mode: int = world.process_mode
+    var was_disabled: bool = player.disabled
+    world.process_mode = Node.PROCESS_MODE_DISABLED
+    player.disabled = true
+    guest_checkpoint_request_counter += 1
+    var request_id: int = guest_checkpoint_request_counter
+    var patch: Dictionary = _capture_local_world_patch()
+    patch["checkpoint_request_id"] = request_id
+    patch["host_flush_request_id"] = host_flush_request_id
+    guest_checkpoint_results[request_id] = {"done": false, "ok": false}
+    submit_guest_world_patch.rpc_id(1, patch)
+    var deadline: int = Time.get_ticks_msec() + int(GUEST_WORLD_PATCH_FLUSH_TIMEOUT_SEC * 1000.0)
+    while not guest_checkpoint_results[request_id]["done"] and _has_live_peer() and Time.get_ticks_msec() < deadline:
+        await get_tree().process_frame
+    var committed: bool = bool(guest_checkpoint_results[request_id]["ok"])
+    guest_checkpoint_results.erase(request_id)
+    if is_instance_valid(world):
+        world.process_mode = previous_mode
+    if is_instance_valid(player):
+        player.disabled = was_disabled
+    if committed:
+        _clear_pending_local_world_patch_state()
+    else:
+        status_message = "Host could not save your region checkpoint; transition cancelled"
+        _update_status_text()
+    return committed
+
+
+func _merge_world_patch_into_cache(world_patch: Dictionary) -> void:
     if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null:
         return
 
@@ -7344,7 +7434,7 @@ func _apply_world_patch_locally(world_patch: Dictionary) -> void:
     if get_dimension_instance_key(dimension, pocket_owner_key) != get_active_dimension_instance_key():
         return
 
-    _merge_world_patch_into_save(world_patch)
+    _merge_world_patch_into_cache(world_patch)
     if world_patch.has("respawn_positions"):
         Ref.world.respawn_positions = world_patch.get("respawn_positions", {}).duplicate(true)
     Ref.world.load_data(Ref.save_file_manager.loaded_file.data, _resolve_dimension_namespace(dimension, pocket_owner_key) + "_")
@@ -9360,9 +9450,17 @@ func _on_server_disconnected() -> void:
     _begin_reconnect_flow("Server disconnected")
 
 
-func _shutdown_host_session(reconnectable: bool, reason: String = "") -> void:
+func _shutdown_host_session(reconnectable: bool, reason: String = "") -> bool:
+    if not await _await_local_world_checkpoint():
+        return false
     if not _has_live_peer() or not multiplayer.is_server():
-        return
+        return true
+
+    for peer_id in multiplayer.get_peers():
+        var instance_key: String = str(peer_states.get(int(peer_id), {}).get("dimension_instance_key", ""))
+        if instance_key != get_active_dimension_instance_key() and not instance_key.is_empty():
+            if not await _await_guest_world_patch_flush_for_instance(instance_key):
+                return false
 
     host_session_ending.rpc(reconnectable, reason)
     await get_tree().create_timer(0.5, true).timeout
@@ -9374,6 +9472,7 @@ func _shutdown_host_session(reconnectable: bool, reason: String = "") -> void:
     if not reconnectable:
         local_quit_in_progress = false
 
+    return true
 
 func _on_local_world_loaded() -> void:
     _set_single_player_shutdown_world_pause_override(false)
@@ -9677,17 +9776,24 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
     var register_json: String = JSON.stringify(JSON.from_native(register_data))
     var snapshot_save_data: Dictionary = Ref.save_file_manager.loaded_file.data.duplicate_deep()
 
-    # As of game build 4.0.1 the on-disk save keeps chunk data in per-region files, not in
-    # loaded_file.data, so the in-memory dict no longer carries any terrain. Serialize the
-    # live loaded world into the snapshot under the dimension namespace the guest will load
-    # from, so the world travels over the network (guest has no host region files on disk).
-    # All callers load the target dimension into the live world before sending, so
-    # Ref.world.current_dimension matches actual_dimension here.
-    if is_instance_valid(Ref.world):
-        var snapshot_namespace: String = _resolve_dimension_namespace(actual_dimension, str(register_data.get("pocket_owner_key", "")))
+    var snapshot_namespace: String = _resolve_dimension_namespace(actual_dimension, str(register_data.get("pocket_owner_key", "")))
+    var active_namespace: String = _resolve_dimension_namespace(int(Ref.world.current_dimension), get_active_pocket_owner_key())
+    if snapshot_namespace == active_namespace:
         Ref.world.save_data(snapshot_save_data, snapshot_namespace + "_")
         SaveFile._set_data(snapshot_save_data, "%s/respawn_positions" % snapshot_namespace, Ref.world.respawn_positions.duplicate(true))
-
+    else:
+        var stored: Dictionary = region_checkpoint.read_regions(_get_checkpoint_chunks_directory(), snapshot_namespace, _checkpoint_block_ids())
+        if not stored["ok"]:
+            status_message = "Cannot read destination region checkpoint"
+            _update_status_text()
+            return
+        var terrain: Dictionary = {}
+        for channel in RegionCheckpoint.CHANNELS:
+            terrain[snapshot_namespace + "_" + channel] = {}
+        for region in stored["regions"].values():
+            for channel in RegionCheckpoint.CHANNELS:
+                terrain[snapshot_namespace + "_" + channel].merge(region[channel], true)
+        snapshot_save_data[snapshot_namespace + "_world"] = terrain
     _apply_peer_persistent_player_to_snapshot(snapshot_save_data, peer_id, actual_dimension)
     var save_json: String = JSON.stringify(JSON.from_native(snapshot_save_data))
     var save_buffer: PackedByteArray = save_json.to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)
@@ -12419,50 +12525,24 @@ func submit_guest_persistent_state(player_key: String, player_name: String, save
 func submit_guest_world_patch(world_patch: Dictionary) -> void:
     if not multiplayer.is_server() or world_patch.is_empty():
         return
-
     var sender_id: int = multiplayer.get_remote_sender_id()
-    if sender_id <= 0:
+    if sender_id <= 0 or not multiplayer.get_peers().has(sender_id):
         return
-
-    var sender_state: Dictionary = peer_states.get(sender_id, {})
-    var sender_instance_key: String = str(sender_state.get("dimension_instance_key", ""))
-    var patch_instance_key: String = str(world_patch.get("dimension_instance_key", ""))
-    if sender_instance_key == "" or patch_instance_key == "" or sender_instance_key != patch_instance_key:
-        return
-
-    _merge_world_patch_into_save(world_patch)
+    _checkpoint_and_reply(sender_id, world_patch)
 
 
 @rpc("authority", "call_remote", "reliable")
 func request_guest_world_patch_flush(request_id: int, target_instance_key: String) -> void:
-    if multiplayer.is_server() or request_id <= 0:
+    if multiplayer.is_server() or request_id <= 0 or get_active_dimension_instance_key() != target_instance_key:
         return
-
-    if target_instance_key != "" and get_active_dimension_instance_key() == target_instance_key:
-        if pending_local_world_patch_chunks.is_empty():
-            _send_full_local_world_patch_to_host()
-        else:
-            _flush_pending_local_world_patch_to_host(true)
-    confirm_guest_world_patch_flush.rpc_id(1, request_id)
+    await _await_local_world_checkpoint(request_id)
 
 
-@rpc("any_peer", "call_remote", "reliable")
-func confirm_guest_world_patch_flush(request_id: int) -> void:
-    if not multiplayer.is_server() or request_id <= 0:
+@rpc("authority", "call_remote", "reliable")
+func guest_world_checkpoint_result(request_id: int, committed: bool) -> void:
+    if multiplayer.is_server() or not guest_checkpoint_results.has(request_id):
         return
-
-    var sender_id: int = multiplayer.get_remote_sender_id()
-    if sender_id <= 0:
-        return
-
-    var pending_acks: Variant = pending_guest_world_patch_flush_acks.get(request_id, null)
-    if not (pending_acks is Dictionary):
-        return
-
-    pending_acks.erase(sender_id)
-    if pending_acks.is_empty():
-        pending_guest_world_patch_flush_acks.erase(request_id)
-
+    guest_checkpoint_results[request_id] = {"done": true, "ok": committed}
 
 @rpc("any_peer", "call_remote", "reliable")
 func submit_guest_authoritative_entities(player_key: String, dimension_instance_key: String, entity_bundles: Array) -> void:
