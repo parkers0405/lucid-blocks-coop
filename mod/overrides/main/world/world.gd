@@ -155,21 +155,8 @@ func _notification(what: int) -> void :
 func _physics_process(_delta: float) -> void :
     if load_enabled:
         even = not even
-        var load_center: Vector3 = Ref.player.global_position
-        var using_multi_region: bool = _should_use_host_multi_region_loading()
-        if using_multi_region and Ref.coop_manager != null:
-            var session_positions: Array = Ref.coop_manager.get_same_instance_session_positions()
-            if session_positions.size() >= 2:
-                _do_multi_region_frame(session_positions)
-            else:
-                _clear_native_multi_region()
-                load_center = Ref.coop_manager.get_world_load_center(load_center)
-                set_loaded_region_center(load_center)
-        else:
-            _clear_native_multi_region()
-            if Ref.coop_manager != null:
-                load_center = Ref.coop_manager.get_world_load_center(load_center)
-            set_loaded_region_center(load_center)
+        _clear_native_multi_region()
+        set_loaded_region_center(Ref.player.global_position)
 
         var pause_blocks_sim: bool = get_tree().paused and not _is_coop_perf_override_active()
         var allow_dynamic_tick: bool = simulate_frame or _should_force_background_dynamic_ticks()
@@ -588,9 +575,11 @@ func save_chunk_data(chunk_directory: String) -> void :
         push_warning("Invalid private world owner; region save refused")
         return
     var store = RegionCheckpoint.new()
-    if not _get_private_instance_owner_key().is_empty() or store.has_checkpoint(chunk_directory, dimension_folder):
+    if (Ref.coop_manager != null and Ref.coop_manager.has_active_session()) or not _get_private_instance_owner_key().is_empty() or store.has_checkpoint(chunk_directory, dimension_folder):
         var serialized: Dictionary = {}
         save_data(serialized, dimension_folder + "_")
+        if Ref.coop_manager != null:
+            serialized = Ref.coop_manager.filter_local_checkpoint(serialized, dimension_folder + "_")
         var committed: Dictionary = store.commit_patch(chunk_directory, dimension_folder, dimension_folder + "_", serialized, get_checkpoint_block_ids())
         if not committed["ok"]:
             push_error("Private region save failed: " + str(committed.get("error", "unknown error")))
@@ -635,6 +624,12 @@ func _load_dimension_regions(chunk_directory: String, file: SaveFile) -> bool:
         push_warning("Region migration/load refused: " + str(loaded.get("error", "unknown error")))
         return false
     region_checkpoint_load_failed = false
+    if Ref.coop_manager != null and self == Ref.world:
+        if not Ref.coop_manager.prepare_instance_preserved_state(file, int(current_dimension), _get_private_instance_owner_key(), previous_owner):
+            register.set_data("pocket_owner_key", previous_owner, true)
+            pending_dimension_instance = previous_pending
+            region_checkpoint_load_failed = true
+            return false
     select_generator()
     for region in loaded["regions"].values():
         load_region(region)
@@ -652,13 +647,13 @@ func load_chunks_old(file: SaveFile) -> void :
 
 
 func clear_old_chunk_data(_file: SaveFile, _dimension: Dimension) -> void :
-    # shortcut: retain legacy keys for recovery until explicit verified cleanup is implemented.
+    # Keep the old data so a failed migration can be recovered.
     pass
 
 func save_file(file: SaveFile) -> void :
     var owner_key: String = _get_private_instance_owner_key()
     if owner_key != "":
-        file.set_data("%s/respawn_positions" % _get_dimension_save_namespace(), respawn_positions, false)
+        file.set_data("%s/respawn_positions" % _get_dimension_save_namespace(), respawn_positions.duplicate(true), true)
     else:
         file.set_data("respawn_positions", respawn_positions)
 
@@ -667,9 +662,26 @@ func load_file(file: SaveFile) -> void :
     var default_positions: Dictionary[Vector3i, bool] = {}
     var owner_key: String = _get_private_instance_owner_key()
     if owner_key != "":
-        respawn_positions = file.get_data("%s/respawn_positions" % _get_dimension_save_namespace(), file.get_data("respawn_positions", default_positions), false)
+        var manager = _respawn_manager()
+        # The earlier load step must prove who owns an old unqualified map.
+        var result: Dictionary
+        if manager != null:
+            result = manager.read_private_respawns(file.data, int(current_dimension), owner_key, "__unproven__")
+        else:
+            result = {"ok": true, "positions": file.get_data("%s/respawn_positions" % _get_dimension_save_namespace(), default_positions, true)}
+        if not result["ok"]:
+            region_checkpoint_load_failed = true
+            return
+        var positions: Dictionary[Vector3i, bool] = {}
+        positions.assign(result["positions"])
+        respawn_positions = positions
     else:
-        respawn_positions = file.get_data("respawn_positions", default_positions)
+        var positions: Dictionary[Vector3i, bool] = {}
+        positions.assign(file.get_data("respawn_positions", default_positions))
+        respawn_positions = positions
+
+func _respawn_manager():
+    return Ref.coop_manager
 
 
 func load_file_register(file_register: SaveFileRegister) -> void :

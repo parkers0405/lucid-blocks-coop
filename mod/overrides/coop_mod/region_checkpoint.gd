@@ -150,7 +150,7 @@ func has_checkpoint(chunks_dir: String, region_namespace: String) -> bool:
 
 func read_regions(chunks_dir: String, region_namespace: String, block_ids: Dictionary) -> Dictionary:
     if not valid_component(region_namespace):
-        return _failure("Invalid region region_namespace")
+        return _failure("Invalid region namespace")
     var manifest: Dictionary = _read_manifest(chunks_dir.path_join("coop").path_join(region_namespace))
     if not manifest["ok"]:
         return manifest
@@ -173,7 +173,7 @@ func read_regions(chunks_dir: String, region_namespace: String, block_ids: Dicti
 
 func commit_regions(chunks_dir: String, region_namespace: String, updates: Dictionary, block_ids: Dictionary) -> Dictionary:
     if not valid_component(region_namespace) or block_ids.is_empty():
-        return _failure("Invalid checkpoint region_namespace or block table")
+        return _failure("Invalid checkpoint namespace or block table")
     var directory: String = chunks_dir.path_join("coop").path_join(region_namespace)
     var manifest: Dictionary = _read_manifest(directory)
     if not manifest["ok"]:
@@ -201,6 +201,7 @@ func commit_regions(chunks_dir: String, region_namespace: String, updates: Dicti
     if DirAccess.make_dir_recursive_absolute(generation_dir) != OK:
         return _failure("Cannot create checkpoint directory")
     var entries: Dictionary = manifest["regions"].duplicate(true)
+    # Write every payload first; the manifest publishes the complete generation.
     for coordinate in regions:
         var name_value: String = region_name(coordinate)
         var bytes: PackedByteArray = JSON.stringify(JSON.from_native(regions[coordinate])).to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)
@@ -218,7 +219,7 @@ func commit_regions(chunks_dir: String, region_namespace: String, updates: Dicti
 
 func commit_patch(chunks_dir: String, region_namespace: String, prefix: String, world_data: Dictionary, block_ids: Dictionary) -> Dictionary:
     if world_data.size() != 1 or not world_data.get(prefix + "world") is Dictionary:
-        return _failure("Invalid patch region_namespace")
+        return _failure("Invalid patch namespace")
     var updates: Dictionary = {}
     var chunks: Dictionary = {}
     var root: Dictionary = world_data[prefix + "world"]
@@ -242,7 +243,7 @@ func commit_patch(chunks_dir: String, region_namespace: String, prefix: String, 
                 return _failure("Patch exceeds checkpoint limit")
     return commit_regions(chunks_dir, region_namespace, updates, block_ids)
 
-# Existing checkpoints take precedence; legacy input is retained as a recovery source.
+# Use a checkpoint when one exists. Keep the old save for recovery.
 func migrate_legacy(chunks_dir: String, region_namespace: String, plain_namespace: String, save_data: Dictionary, block_ids: Dictionary, allow_plain_owner: bool = false) -> Dictionary:
     if not valid_component(region_namespace) or not valid_component(plain_namespace):
         return _failure("Invalid migration namespace")
@@ -261,8 +262,8 @@ func migrate_legacy(chunks_dir: String, region_namespace: String, plain_namespac
         return _failure("Invalid legacy world channels")
     var prefix: String = region_namespace + "_"
     var converted: Dictionary = {}
-    var validation: Dictionary = {}
-    var count: Dictionary = {}
+    var regions_to_validate: Dictionary = {}
+    var seen_chunks: Dictionary = {}
     for channel in CHANNELS:
         var values = source.get(source_prefix + channel)
         if not values is Dictionary:
@@ -272,18 +273,18 @@ func migrate_legacy(chunks_dir: String, region_namespace: String, plain_namespac
             if not chunk is Vector3i:
                 return _failure("Invalid legacy coordinate")
             var coordinate: Vector3i = region_coordinate(chunk)
-            if not validation.has(coordinate):
-                validation[coordinate] = {"coordinate": coordinate}
+            if not regions_to_validate.has(coordinate):
+                regions_to_validate[coordinate] = {"coordinate": coordinate}
                 for entry in CHANNELS:
-                    validation[coordinate][entry] = {}
-            validation[coordinate][channel][chunk] = values[chunk]
-            count[chunk] = true
-            if count.size() > MAX_PATCH_CHUNKS:
+                    regions_to_validate[coordinate][entry] = {}
+            regions_to_validate[coordinate][channel][chunk] = values[chunk]
+            seen_chunks[chunk] = true
+            if seen_chunks.size() > MAX_PATCH_CHUNKS:
                 return _failure("Legacy migration exceeds checkpoint limit")
             if not existing["regions"].get(coordinate, {}).get(channel, {}).has(chunk):
                 converted[prefix + channel][chunk] = values[chunk]
-    for coordinate in validation:
-        if not _validate_region(validation[coordinate], coordinate, block_ids):
+    for coordinate in regions_to_validate:
+        if not _validate_region(regions_to_validate[coordinate], coordinate, block_ids):
             return _failure("Invalid legacy region payload")
     var committed: Dictionary = commit_patch(chunks_dir, region_namespace, prefix, {prefix + "world": converted}, block_ids)
     if not committed["ok"]:

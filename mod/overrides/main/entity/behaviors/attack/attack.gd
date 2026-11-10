@@ -81,9 +81,11 @@ static func basic_attack(attacker: Entity, target: Entity, direct_damage: int, d
     basic_attack_override_direction(attacker, target, direct_damage, damage_position, (attacker.global_position - target.global_position).normalized(), burns)
 
 static func basic_attack_override_direction(attacker: Entity, target: Entity, direct_damage: int, damage_position: Vector3, direction: Vector3, burns: bool = false) -> void :
+    if Ref.coop_manager != null and is_instance_valid(target) and not Ref.coop_manager.can_mutate_runtime_node(target):
+        return
     if not is_instance_valid(target) or target.dead or not target.is_inside_tree():
         return
-    target.attacked(attacker, direct_damage)
+    target.attacked(attacker, direct_damage, damage_position)
     if target.has_node("%Bleed"):
         target.get_node("%Bleed").bleed(damage_position, direction, direct_damage)
     if burns and target.has_node("%Burn"):

@@ -1,7 +1,7 @@
 extends Node
 
 
-# Native task must validate a patch build against each original DLL before enabling it.
+# Only enable a patch verified against this exact game DLL.
 const VALIDATED_NATIVE_BUILD_HASHES: PackedStringArray = []
 
 

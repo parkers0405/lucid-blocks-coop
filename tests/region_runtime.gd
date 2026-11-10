@@ -21,6 +21,21 @@ class ManagerFixture extends "res://coop_mod/coop_manager.gd":
     var ids: Dictionary
     var replies: Array = []
     var fixture_patch: Dictionary = {}
+    var session_positions: Array = [Vector3.ZERO]
+    func _get_same_instance_session_positions() -> Array:
+        return session_positions
+    func _has_live_peer() -> bool:
+        return true
+    func _capture_local_state() -> Dictionary:
+        return {"dimension_instance_key": "naraka", "position": Vector3.ZERO}
+    func _known_private_owner(key: String) -> bool:
+        return key in ["alice", "bob"]
+    func _send_canonical_patch(_peer: int, _patch: Dictionary) -> void:
+        pass
+    func _checkpoint_local_instance_nodes() -> bool:
+        return true
+    func _persist_host_profile() -> bool:
+        return true
     func _can_sample_player() -> bool:
         return true
     func _capture_local_world_patch() -> Dictionary:
@@ -49,12 +64,16 @@ func check(value: bool, label: String) -> void:
         print("REGION_RUNTIME_FAIL ", label)
 
 func run() -> int:
+    print("REGION_RUNTIME_START")
     var pure = load(get_script().resource_path.get_base_dir().path_join("region_checkpoint.gd")).new()
     add_child(pure)
     failures += pure.run()
     var manager := ManagerFixture.new()
     add_child(manager)
     manager.fixture_root = OS.get_user_data_dir().path_join("region-native-" + Crypto.new().generate_random_bytes(8).hex_encode())
+    var local_activity_radius: float = manager.get_same_instance_activity_radius()
+    manager.session_positions.append(Vector3(1024, 0, 0))
+    check(manager.get_same_instance_activity_radius() == local_activity_radius, "distant peer cannot shrink the initialized local activity bubble")
     var blocks: Array = Ref.world.get_block_types()
     var selected_id: int = -1
     for block in blocks:
@@ -70,13 +89,23 @@ func run() -> int:
     var patch: Dictionary = {"dimension": 3, "pocket_owner_key": "alice", "dimension_instance_key": "pocket:alice", "world_data": {"pocket__alice_world": {}}, "checkpoint_request_id": 1, "host_flush_request_id": 9}
     for channel in data:
         patch["world_data"]["pocket__alice_world"]["pocket__alice_" + channel] = data[channel]
-    manager.peer_states[2] = {"dimension": 3, "pocket_owner_key": "alice", "player_key": "alice", "dimension_instance_key": "pocket:alice"}
+    var chunk: Vector3i = data["chunk_block"].keys()[0]
+    var filtered: Dictionary = manager._filter_world_data_to_chunk_positions(patch["world_data"], "pocket__alice_", [chunk])
+    check(filtered["pocket__alice_world"]["pocket__alice_chunk_block"][chunk] is PackedInt32Array, "filter preserves native packed block array")
+    filtered["pocket__alice_world"]["pocket__alice_chunk_block"][chunk][0] = 0
+    check(data["chunk_block"][chunk][0] == selected_id, "filtered arrays do not alias outgoing native snapshot")
+    manager.peer_states[2] = {"dimension": 3, "pocket_owner_key": "alice", "player_key": "alice", "dimension_instance_key": "pocket:alice", "active": true, "position": Vector3(-16, 0, 0)}
+    manager.admitted_player_keys[2] = "alice"
     manager.pending_guest_world_patch_flush_acks[9] = {2: "pocket:alice"}
+    manager.terrain_epoch = "region_fixture:1"
+    check(manager.chunk_authority.install_lease(1, {manager.ChunkAuthority.chunk_key("pocket:alice", chunk): 2}, {}), "guest checkpoint uses explicitly granted old lease")
+    patch["epoch"] = manager.terrain_epoch
     check(manager._checkpoint_and_reply(2, patch), "host checkpoint commit")
     check(manager.replies == [true], "success ACK after commit")
     check(not manager.pending_guest_world_patch_flush_acks.has(9), "successful durable flush cleared")
     var manifest: String = manager.fixture_root.path_join("coop/pocket__alice/manifest.json")
     var before: PackedByteArray = manager.region_checkpoint._read_bytes(manifest)
+    patch["versions"] = manager.chunk_authority.revisions.duplicate()
     manager.region_checkpoint = FailStore.new()
     manager.pending_guest_world_patch_flush_acks[9] = {2: "pocket:alice"}
     check(not manager._checkpoint_and_reply(2, patch), "failed manifest publish")
@@ -85,7 +114,11 @@ func run() -> int:
     check(manager.failed_guest_world_patch_flushes.has(9), "host observes failed flush")
     check(manager.region_checkpoint._read_bytes(manifest) == before, "failed publish preserves prior manifest")
     var committed: Dictionary = manager.region_checkpoint.read_regions(manager.fixture_root, "pocket__alice", manager.ids)
-    check(committed["ok"], "prior generation remains usable")
+    check(committed["ok"] and committed["regions"].has(Vector3i(-1, 0, 0)), "prior generation remains usable")
+    if not committed["ok"] or not committed["regions"].has(Vector3i(-1, 0, 0)):
+        manager.free()
+        pure.free()
+        return failures
     var forged: Dictionary = patch.duplicate(true)
     forged["dimension"] = 5
     check(not manager._validate_guest_world_patch(manager.peer_states[2], forged), "independent dimension validation")
@@ -94,7 +127,7 @@ func run() -> int:
     check(not manager._validate_guest_world_patch(manager.peer_states[2], forged), "independent owner validation")
     var wrong_identity: Dictionary = manager.peer_states[2].duplicate(true)
     wrong_identity["player_key"] = "bob"
-    check(not manager._validate_guest_world_patch(wrong_identity, patch), "owner must match recorded player")
+    check(manager._validate_guest_world_patch(wrong_identity, patch), "authenticated visitor retains destination owner namespace")
     manager.fixture_patch = patch
     var pending_before: Dictionary = Ref.world.pending_dimension_instance.duplicate(true)
     await manager._open_dimension_instance_async(3, "bob")

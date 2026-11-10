@@ -3,15 +3,17 @@ param(
     [Parameter(Mandatory)][string] $Godot,
     [string] $Gdre,
     [string] $GameExe,
+    [switch] $CombatTests,
     [switch] $RegionTests,
     [switch] $AdmissionTests,
     [string] $ProjectDir = (Join-Path $PSScriptRoot '../mod/overrides'),
     [string] $OutputDir = (Join-Path $PSScriptRoot '../dist')
 )
 . (Join-Path $PSScriptRoot 'mod_files.ps1')
+if (($CombatTests -or $RegionTests -or $AdmissionTests) -and (-not $Gdre -or -not $GameExe)) { throw 'Runtime test switches require both Gdre and GameExe.' }
 if ($Gdre -or $GameExe) {
     if (-not $Gdre -or -not $GameExe) { throw 'Raw packaging requires both Gdre and GameExe.' }
-    & (Join-Path $PSScriptRoot 'build_raw_mod.ps1') -Godot $Godot -Gdre $Gdre -GameExe $GameExe -ProjectDir $ProjectDir -OutputDir $OutputDir -AdmissionTests:$AdmissionTests -RegionTests:$RegionTests
+    & (Join-Path $PSScriptRoot 'build_raw_mod.ps1') -Godot $Godot -Gdre $Gdre -GameExe $GameExe -ProjectDir $ProjectDir -OutputDir $OutputDir -AdmissionTests:$AdmissionTests -RegionTests:$RegionTests -CombatTests:$CombatTests
     return
 }
 $godotPath = (Resolve-Path -LiteralPath $Godot).Path

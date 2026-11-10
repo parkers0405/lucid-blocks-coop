@@ -2,13 +2,37 @@
 
 Compatibility update and completion of [parkers0405/lucid-blocks-coop](https://github.com/parkers0405/lucid-blocks-coop). Original co-op implementation by parkers0405 and upstream contributors; this fork preserves their history and attribution.
 
-**Status: development, not yet verified on the target game.** Initial target: Steam build **25451214** (executable version **5.1.0.0**). Do not interpret the inherited compatibility claims below as verification of this fork.
+**Status: development; local contracts pass, full co-op gameplay remains unverified.** Target: Steam build **26206996**, game **5.2.0.0**, Godot **4.6 double** with GodotSteam **4.17.1**. The strict local suite covers 388 assertions and 67 script checks with original native binaries. See [playtest.md](playtest.md) for dated evidence and limits. The inherited `dist` artifacts are stale; build from source rather than installing them. No new build has been installed or released.
 
-Scope: two-player Steam/LAN co-op, independent exploration and dimensions, persistent personal Apotheosis with visits, the known-issue fixes below, and personal ender-chest storage. New player models, skins, dedicated servers, and larger player counts are excluded.
+Scope: two-player Steam/LAN co-op, independent exploration and dimensions, persistent personal Apotheosis with visits, the known-issue fixes below, and personal ender-chest storage. New player models, skins, dedicated servers, and larger player counts are excluded. See [tasks.md](tasks.md) and [playtest.md](playtest.md) for actual progress and evidence.
 
 No new license is assigned to inherited code or assets. Existing attribution and notices remain applicable. Recovered commercial game files are not part of this repository.
 
+## Current mod behavior and remaining work
+
+Identity is bound to an authenticated Steam transport ID or a host-issued LAN reconnect credential. Names and peer numbers do not identify a saved character. Profiles, chest contents and preserved world objects share an atomic host ledger; region terrain uses separate verified checkpoints. Preserve the complete save folder, including its co-op sidecars, when backing it up.
+
+The host can designate an empty ordinary cache cube with `/enderchest`. It opens a personal21-slot chest with explicit quantity-based Store/Take actions. Contents belong to the authenticated character and survive destruction of the access block. Ordinary cubes and hoppers retain their normal behavior.
+
+Individual dimension travel, private owner namespaces, local terrain residency, authority handoffs and chest lifecycle recovery are implemented with local contract coverage. The retained two-process smoke exercises admission, initial ownership, a durable checkpoint and disconnect. Exploration/convergence, private visits, chest transactions and reconnect still need full gameplay verification. Real two-account Steam invite/reconnect and human playfeel checks are deferred. Earlier local world controls and the smoke report shutdown/resource errors, including in the original-game control; their causes remain unresolved. This branch is for code review, with no release certification.
+
+## Build and verify locally
+
+Use the matching Godot 4.6 double editor and GDRETools 2.7.4 with your owned game 5.2 installation. Generic single-precision Godot builds are incompatible. From the repository root in PowerShell:
+
+```powershell
+./scripts/build_mod.ps1 -Godot <matching-editor.exe> -Gdre <gdre_tools.exe> -GameExe <lucid-blocks.exe> -OutputDir ./work/local-build -RegionTests -AdmissionTests
+./tests/test_install.ps1
+./tests/test_build_switches.ps1
+./tests/test_shader_deadline.ps1 -Godot <matching-editor.exe>
+./tests/test_native_timeout.ps1 -Godot <matching-editor.exe>
+```
+
+Replace the angle-bracket paths with quoted absolute paths. The builder uses disposable profiles and copies of the original libraries, validates explicit result markers and errors, then publishes only the mod PCK to the chosen output directory. It leaves the original installation and personal saves unchanged. Admission fixtures need local ENet socket access. Installer tests use synthetic game directories; they do not install into Steam. Keep recovered commercial files, tool binaries, test profiles and logs under ignored `work/`.
+
 ## Upstream README (historical)
+
+The instructions and known issues below describe the upstream 4.0.1 release, not the current 5.2 development branch. In particular, its download/install steps refer to old artifacts.
 
 Multiplayer Co-op mod For Lucid Blocks.
 

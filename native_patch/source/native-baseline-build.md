@@ -1,6 +1,6 @@
 # Published native-source baseline
 
-Status: baseline compilation PASS (exit0,2026-10-24); runtime compatibility UNVERIFIED. This DLL is not approved for installation.
+Status: baseline compilation PASS (exit0,2026-10-24); isolated runtime/region/collision probes PASS (2026-10-25). Multiplayer, streaming changes and gameplay compatibility remain UNVERIFIED. This DLL is not approved for installation.
 
 Inputs:
 - Source: https://github.com/kiwijuice56/lucid-blocks-gdblocks at 9fbdd398b63a9359299730a98b678bb8b4e6a671 (GPL3; preserve its license if distributing a derived DLL).
@@ -25,3 +25,12 @@ Logs: work/native-baseline-build.log and work/native-baseline-mounted-build.log 
 
 
 Output: work/native-baseline-output/libgdblocks.windows.template_release.double.x86_64.dll (2,863,104 bytes), SHA256:4F66CFFE038960E624773F8363452CC811A5B91156EA1CB2201BEA132C0B1FB9. Warnings remain in published source; no compilation error. No original game DLL was changed.
+
+## Isolated runtime evidence — 2026-10-25
+
+- Original-library collision control: `work/build-logs/888d21a6a0304ea9973457d3ee8e6ea8`; baseline comparison: `work/build-logs/dccba86e445d4642a39aecad9c785a68`. Both passed region28/runtime43/startup62 and collision3, with strict error/exit gates. Residual ObjectDB warning is recorded; it was not an ERROR or a failed assertion.
+- `tests/native_collision.gd` uses a separate physics world and native World with a seeded chunk. It checks loaded block identity/solidity, the exact solid top-face hit and an air ray bounded inside the seeded chunk. This does not establish streaming continuity, separated players, cross-dimension authority or save/rejoin.
+- Direct launcher flags: `-RegionTests -CollisionTests -NativeBaseline`; baseline hash is enforced before copying only into the disposable runtime, and this path never publishes an artifact. First overlapping baseline attempt timed out; serialized runs passed. Do not rebuild for orientation.
+- The native-load timeout requires a disposable-runtime marker and terminates the owned test process rather than freeing objects referenced by active worker jobs. Windows self-termination can exit zero; missing completion markers still fail the launcher.
+
+Final latest-source baseline run c2e277a7048341beaf6a6a0459b93b6f also passed28/43/62 pluscollision3 and strict gates after disposable-marker/timeout safety correction.

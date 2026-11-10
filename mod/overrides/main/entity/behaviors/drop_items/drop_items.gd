@@ -14,6 +14,8 @@ func _ready() -> void:
 
 
 func drop_and_remove_from_inventory(inventory: Inventory, index: int) -> void:
+    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(entity):
+        return
     if entity.disabled or not enabled:
         return
     if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
@@ -28,6 +30,8 @@ func drop_and_remove_from_inventory(inventory: Inventory, index: int) -> void:
 
 
 func drop_item(item: ItemState, override_disable: bool = false) -> void:
+    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(entity):
+        return
     if not override_disable and (entity.disabled or not enabled):
         return
     if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):

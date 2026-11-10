@@ -133,11 +133,12 @@ func save_file(file: SaveFile) -> void :
 
 
 func load_file(file: SaveFile) -> void :
-    var empty: Dictionary[Vector3i, PackedStringArray] = {}
+    var restored_chunks: Dictionary[Vector3i, PackedStringArray] = {}
     if _is_guest_replica_mode():
-        chunk_to_uuid_map = empty
+        chunk_to_uuid_map = restored_chunks
         return
-    chunk_to_uuid_map = file.get_data("world/chunk_to_uuid_map", empty).duplicate(true)
+    restored_chunks.assign(file.get_data("world/chunk_to_uuid_map", restored_chunks))
+    chunk_to_uuid_map = restored_chunks
 
 
 func enter_game() -> void :

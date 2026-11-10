@@ -21,6 +21,9 @@ func _on_inventory_refreshed(_index: int) -> void:
 func interact(interactor: Entity) -> void:
     if not can_currently_interact(interactor):
         return
+    if Ref.coop_manager != null and Ref.coop_manager.is_personal_chest(Vector3i(global_position)):
+        Ref.coop_manager.open_personal_chest(self)
+        return
     super.interact(interactor)
 
     open = true
@@ -43,11 +46,14 @@ func interact(interactor: Entity) -> void:
 
 
 func before_breaking() -> void:
+    if Ref.coop_manager != null and Ref.coop_manager.is_personal_chest(Vector3i(global_position)):
+        Ref.coop_manager.personal_chest_broken(Vector3i(global_position))
     broken = true
     if open:
         Ref.game_menu.close_inventory(true)
     open = false
-    drop_block_items(%Inventory, global_position, get_tree())
+    if Ref.coop_manager == null or not Ref.coop_manager.is_personal_chest(Vector3i(global_position)):
+        drop_block_items(%Inventory, global_position, get_tree())
 
 
 func before_unloading() -> void:

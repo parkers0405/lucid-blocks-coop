@@ -27,7 +27,10 @@ func legacy(region_namespace: String, block_id: int) -> Dictionary:
     return {region_namespace + "_world": channels}
 
 func run() -> int:
-    checkpoint_script = load(get_script().resource_path.get_base_dir().path_join("../mod/overrides/coop_mod/region_checkpoint.gd"))
+    var path: String = "res://coop_mod/region_checkpoint.gd"
+    if not ResourceLoader.exists(path):
+        path = get_script().resource_path.get_base_dir().path_join("../mod/overrides/coop_mod/region_checkpoint.gd")
+    checkpoint_script = load(path)
     var store = checkpoint_script.new()
     var root: String = OS.get_user_data_dir().path_join("region-fixture-" + Crypto.new().generate_random_bytes(8).hex_encode())
     var ids: Dictionary = {1000: true, 2000: true}
