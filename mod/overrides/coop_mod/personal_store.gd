@@ -220,28 +220,6 @@ func instance_respawns(path: String, instance: String) -> Dictionary:
     var record: Dictionary = ledger["instances"].get(instance, {})
     return {"ok": true, "present": record.has("respawn_positions"), "positions": record.get("respawn_positions", {}).duplicate(true)}
 
-# Change owners only if every object still belongs to the expected player.
-func transfer_objects(path: String, instance: String, uuids: Array, expected_owner: String, new_owner: String) -> bool:
-    var ledger: Dictionary = read_ledger(path)
-    if ledger.is_empty() or not Files.valid_component(instance) or uuids.size() > 4096 or not Files.valid_component(expected_owner) or not Files.valid_component(new_owner):
-        return false
-    var record: Dictionary = ledger["instances"].get(instance, {})
-    if record.is_empty():
-        return false
-    for uuid in uuids:
-        if not _valid_uuid(uuid) or record["owners"].get(uuid) != expected_owner or record["tombstones"].has(uuid):
-            return false
-    if uuids.is_empty():
-        return true
-    if not ledger["profiles"].has(new_owner):
-        ledger["profiles"][new_owner] = _new_profile()
-    var observed: Dictionary = record["observed"].get(new_owner, {})
-    for uuid in uuids:
-        record["owners"][uuid] = new_owner
-        observed[uuid] = true
-    record["observed"][new_owner] = observed
-    return _write_ledger(path, ledger)
-
 func save_checkpoint(path: String, state: Dictionary, revision: int, instance: String, dimension: String, bundles: Array, allowed_scenes: Dictionary, respawn_update: Dictionary = {}) -> Dictionary:
     var ledger: Dictionary = read_ledger(path)
     if ledger.is_empty() or not valid_state(state) or not Files.valid_component(instance) or not Files.valid_component(dimension) or bundles.size() > 512 or var_to_bytes(bundles).size() > 8388608:
@@ -314,14 +292,6 @@ func commit_lease(path: String, epoch: int, chunks: Dictionary, objects: Diction
         record["observed"][owner][uuid] = true
     ledger["lease"] = {"epoch": epoch, "chunks": chunks.duplicate(), "objects": objects.duplicate()}
     return _write_ledger(path, ledger)
-
-func save_state(path: String, state: Dictionary, revision: int) -> Dictionary:
-    var record: Dictionary = read_profile(path)
-    if record.is_empty() or record["revision"] != revision or not valid_state(state):
-        return {}
-    record["state"] = state.duplicate(true)
-    record["revision"] += 1
-    return record if commit(path, record) else {}
 
 func collect_drop(path: String, revision: int, request: String, instance: String, uuid: String, stack_limit: Callable) -> Dictionary:
     var ledger: Dictionary = read_ledger(path)

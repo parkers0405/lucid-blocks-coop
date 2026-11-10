@@ -44,7 +44,7 @@ func run() -> int:
     check(store.commit_lease(path, 1, {key: 2}, {instance + "|" + UUID: 2}, transfers), "owner CAS and epoch commit together")
     check(store.read_ledger(path)["lease"]["epoch"] == 1 and store.read_ledger(path)["instances"]["dimension__2"]["owners"][UUID] == "guest", "restart sees matching owner and epoch")
     check(not store.commit_lease(path, 1, {key: 1}, {}, []) and not store.commit_lease(path, 2, {key: 1}, {}, transfers), "stale epoch or stale expected owner cannot commit")
-    check(store.save_state(guest_path, inventory, 0).get("revision") == 1, "guest pre-pickup inventory ready")
+    check(store.save_checkpoint(guest_path, inventory, 0, "dimension__2", "naraka", [bundle], {DROP: true}).get("revision") == 1, "guest pre-pickup inventory ready")
     var request: String = "a".repeat(64)
     original = store.files._read_bytes(Store.storage_path(path))
     check(failing.collect_drop(guest_path, 1, request, "dimension__2", UUID, func(_id): return 64).is_empty() and store.files._read_bytes(Store.storage_path(path)) == original, "failed pickup preserves drop and inventory together")
@@ -59,11 +59,11 @@ func run() -> int:
     original = store.files._read_bytes(Store.storage_path(path))
     check(store.collect_drop(spill_path, 1, "c".repeat(64), "spill", UUID, func(_id): return 64).is_empty() and store.files._read_bytes(Store.storage_path(path)) == original, "full inventory retains drop and bytes")
     full["node"]["player"]["Inventory"]["items"][0][1] = 63
-    check(store.save_state(spill_path, full, 1).get("revision") == 2, "partially fitting inventory fixture committed")
+    check(store.save_checkpoint(spill_path, full, 1, "spill", "naraka", [bundle], {DROP: true}).get("revision") == 2, "partially fitting inventory fixture committed")
     original = store.files._read_bytes(Store.storage_path(path))
     check(store.collect_drop(spill_path, 2, "c".repeat(64), "spill", UUID, func(_id): return 64).is_empty() and store.files._read_bytes(Store.storage_path(path)) == original, "partial fit cannot remove or partially credit drop")
     full["node"]["player"]["Inventory"]["items"][2] = PackedInt32Array()
-    check(store.save_state(spill_path, full, 2).get("revision") == 3, "spill inventory fixture committed")
+    check(store.save_checkpoint(spill_path, full, 2, "spill", "naraka", [bundle], {DROP: true}).get("revision") == 3, "spill inventory fixture committed")
     var split: Dictionary = store.collect_drop(spill_path, 3, "c".repeat(64), "spill", UUID, func(_id): return 64)
     var split_items: Array = split["state"]["node"]["player"]["Inventory"]["items"]
     check(split_items[0][1] == 64 and split_items[2][1] == 3 and store.instance_bundles(path, "spill")["bundles"].is_empty(), "cross-slot spill conserves all four items and removes exact UUID")

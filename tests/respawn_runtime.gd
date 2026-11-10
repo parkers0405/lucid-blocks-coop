@@ -48,6 +48,14 @@ func check(value: bool, label: String) -> void:
 func state(revision: int, positions: Dictionary, chunks: Array) -> Dictionary:
     return {"_coop_revision": revision, "node": {"player": {"marker": "profile"}}, "_coop_respawns": {"positions": positions, "chunks": chunks}}
 func run() -> int:
+    check(Store.respawn_chunk(Vector3i(-1, 0, 0)) == Vector3i(-16, 0, 0), "negative respawn coordinates snap down")
+    check(not Store.valid_respawns({Vector3i.ZERO: false}) and not Store.valid_respawns({Vector3i.ZERO: 1}) and not Store.valid_respawns({Vector3.ZERO: true}), "respawn maps reject invalid values and coordinate types")
+    check(not Store.valid_respawn_update({"positions": {}, "chunks": [Vector3i.ZERO, Vector3i.ZERO]}) and not Store.valid_respawn_update({"positions": {}, "chunks": [Vector3i.ONE]}), "coverage rejects duplicate and unsnapped chunks")
+    var excessive: Dictionary = {}
+    for index in range(Store.MAX_RESPAWNS + 1):
+        excessive[Vector3i(index, 0, 0)] = true
+    check(not Store.valid_respawns(excessive), "respawn count stays bounded")
+    check(not Store.valid_respawn_update({"positions": {Vector3i(32, 0, 0): true}, "chunks": [Vector3i.ZERO]}), "respawn update cannot escape declared coverage")
     var manager := Manager.new()
     manager.fixture_root = "user://respawn_runtime_" + Crypto.new().generate_random_bytes(8).hex_encode()
     add_child(manager)
@@ -193,6 +201,10 @@ func run() -> int:
     world.load_file(ownerless)
     check(world.respawn_positions == {a: true}, "ownerless solo private load retains native plain path")
     world.free()
+    var corrupt: Dictionary = manager.personal_store.read_ledger(host_path)
+    corrupt["instances"]["pocket__alice"]["respawn_positions"][a] = false
+    manager.personal_store.files._replace_file(Store.storage_path(host_path), var_to_bytes(corrupt))
+    check(manager.personal_store.read_ledger(host_path).is_empty(), "corrupt persisted metadata fails the shared ledger closed")
     restarted.free()
     manager.free()
     Ref.world.current_dimension = previous_dimension

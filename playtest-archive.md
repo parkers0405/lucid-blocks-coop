@@ -130,3 +130,11 @@ PowerShell launcher parsing passed with matching Godot 4.6 double identity. No p
 - Strict3d21aab9ba904f2d833f37257430def1 passed383assertions0failures+67scripts, Steam0/original5.2binaries/noERROR. LANfixturecompilemarker present without executing it. Fournewchunkchannel/seedchecks pass (chunk17). Existingchest23/otherfixturespassed. Firstbroadattemptpassed/norepairs. PSparsers/scopeddiff/tooling3pass; independentreview no significantissues.
 -15 implementation/test/toolfiles changed; fullcoverage revision-coverage.md. Originalprotocol/saveformat/guards preserved. Artifactwork/mod-revise-full-output SHA F5FBC38A96127C19F4D3DEE8A0ED77E7ED84CCDE1FBEE7873604A2B3063B5219. No native/livegameplayretry/install/push/release. Earliernativecrashandtwo-repairlimitremain; fullco-opnotcertified.
 
+
+## 2026-10-31: radius and runtime restoration; strict gameplay gate blocked
+- Commits `db9794e` and `c08bcf7`. Strict `b545424d8da440e08843fde1bc7e8ada` passed 388 assertions and 67 script checks; build-switch checks 3 passed. Original game 5.2 and native DLL unchanged. Independent review found no significant issue.
+- Actual two-process run `5b8064fc2ec744ce84a3d997997c02fb`: host 3/0 and guest 5/0 assertions, both completion markers and exit 0. Guest joins from menu, loads world, installs lease 1 and durably saves revision 2 to 3 with loading enabled and player enabled.
+- Overall strict result FAILED: 10 shutdown/resource errors per process. Earlier original/offline controls report matching categories/count; exact causes unproven. Gates remain unchanged. Full exploration, travel, chest, reconnect/restart and soak remain unrun.
+- Previous host radius crash no longer reproduces in matched control. Terrain restore no longer queries identity while loading is deliberately disabled; checkpoint/lease restores the original player lock state. Canonical dependency and four lease-lock checks retained. Renewed two-repair budget spent; final owned process audit 0. No install/push/merge/release.
+- Package `work/mod-runtime-restore-output/lucid-blocks-coop.pck`, SHA256 `0B9AE192C10BCE1B3E891D0E007B0543702A39C8232887ABBBF5BD67D195B157`. Detailed sequence: process-log-revise.md section 15.
+

@@ -70,7 +70,7 @@ func run() -> int:
     add_child(manager)
     var state: Dictionary = {"node": {"player": {"Inventory": {"items": [PackedInt32Array([7, 10, 0]), Vector3i.ZERO, PackedInt32Array(), Vector3i.ZERO], "capacity": 2}}}}
     var path: String = manager._profile_path("fixture_host")
-    var saved: Dictionary = manager.personal_store.save_state(path, state, 0)
+    var saved: Dictionary = manager.personal_store.save_checkpoint(path, state, 0, "fixture", "naraka", [], {})
     saved = manager.personal_store.transfer(path, saved["revision"], "a".repeat(64), "Inventory", 0, 0, 4, true, func(_id): return 64)
     check(saved.get("revision") == 2, "host deposit durable before restart")
     manager._restore_host_profile()

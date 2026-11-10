@@ -48,6 +48,19 @@ func run() -> int:
     if not FileAccess.file_exists(OS.get_executable_path().get_base_dir().path_join(".coop-test-runtime")):
         print("CANONICAL_RUNTIME_FAIL disposable runtime required")
         return 1
+    var authority = preload("res://coop_mod/chunk_authority.gd").new()
+    var fingerprint_root: Dictionary = {"test_chunk_block": {Vector3i.ZERO: PackedInt32Array([7])}}
+    authority.accept("fixture", fingerprint_root, "test_")
+    for channel in ["chunk_water", "chunk_water_awake", "chunk_fire"]:
+        fingerprint_root["test_" + channel] = {Vector3i.ZERO: PackedByteArray([1])}
+        check(authority.changed("fixture", fingerprint_root, "test_") == [Vector3i.ZERO], channel + " triggers canonical checkpoint")
+        authority.accept("fixture", fingerprint_root, "test_")
+    var chunks: Array = []
+    for index in range(35):
+        chunks.append(Vector3i(index * 16, 0, 0))
+    var batches: Array = authority.batches(chunks)
+    check(batches.size() == 3 and batches[0].size() == 16 and batches[1].size() == 16 and batches[2].size() == 3, "checkpoint batching preserves partial final batch")
+    check(batches[0] + batches[1] + batches[2] == chunks, "batching preserves every chunk in order")
     var viewport := SubViewport.new()
     viewport.own_world_3d = true
     add_child(viewport)

@@ -1874,10 +1874,6 @@ func _steam_has_any_method(method_names: Array[String]) -> bool:
     return false
 
 
-func _steam_call(method_name: String, args: Array = []) -> Variant:
-    return _steam_call_alias([method_name], args)
-
-
 func _steam_call_alias(method_names: Array[String], args: Array = []) -> Variant:
     var steam_api: Object = _get_steam_api()
     if steam_api == null:
@@ -6522,10 +6518,6 @@ func _copy_world_namespace_between_save_data(source_save_data: Dictionary, targe
     return true
 
 
-func _duplicate_world_namespace(save_data: Dictionary, source_prefix: String, target_prefix: String) -> bool:
-    return _copy_world_namespace_between_save_data(save_data, save_data, source_prefix, target_prefix)
-
-
 func _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension: int, target_pocket_owner_key: String) -> bool:
     if target_dimension != int(LucidBlocksWorld.Dimension.POCKET) or target_pocket_owner_key != _get_local_player_key():
         return false
@@ -6604,12 +6596,6 @@ func get_active_dimension_instance_key() -> String:
     if not _can_sample_player():
         return ""
     return get_dimension_instance_key(int(Ref.world.current_dimension), get_active_pocket_owner_key())
-
-
-func _get_host_dimension_instance_key() -> String:
-    if peer_states.has(1):
-        return str(peer_states[1].get("dimension_instance_key", ""))
-    return ""
 
 
 func _can_push_local_world_state_to_host() -> bool:
@@ -6747,35 +6733,11 @@ func _is_local_world_authority() -> bool:
         return not guest_world_loaded
     return _leased_chunk_owner(_lease_chunk(Ref.player.global_position), get_active_dimension_instance_key()) == 2
 
-func _get_nearest_other_same_instance_player_distance(fallback_distance: float = INF) -> float:
-    if not _can_sample_player() or not _has_live_peer():
-        return fallback_distance
-
-    var active_instance_key: String = get_active_dimension_instance_key()
-    var nearest_distance: float = INF
-    var local_peer_id: int = multiplayer.get_unique_id()
-    for peer_id in peer_states.keys():
-        var int_peer_id: int = int(peer_id)
-        if int_peer_id == local_peer_id:
-            continue
-        var state: Dictionary = peer_states.get(int_peer_id, {})
-        if not _is_peer_state_same_instance(state, active_instance_key):
-            continue
-        var peer_position: Vector3 = state.get("position", Vector3.ZERO)
-        nearest_distance = minf(nearest_distance, Ref.player.global_position.distance_to(peer_position))
-
-    return nearest_distance if nearest_distance < INF else fallback_distance
-
-
 func _has_local_guest_entity_authority() -> bool:
     return not multiplayer.is_server() and not lease_frozen and _can_sample_player() and _has_live_peer() and _leased_chunk_owner(_lease_chunk(Ref.player.global_position), get_active_dimension_instance_key()) == 2
 
 func _has_local_entity_authority() -> bool:
     return _is_local_world_authority() or _has_local_guest_entity_authority()
-
-
-func has_local_entity_authority() -> bool:
-    return _has_local_entity_authority()
 
 
 func can_use_same_instance_load_proxies() -> bool:
@@ -7227,65 +7189,12 @@ func is_client_synced_entity(node) -> bool:
     return is_instance_valid(node) and bool(node.get_meta("coop_synced_entity", false))
 
 
-func push_client_entity_authoritative_change(node) -> void:
-    return
-
-
-func pop_client_entity_authoritative_change(node) -> void:
-    return
-
-
-func is_client_entity_authoritative_change_active(node) -> bool:
-    return false
-
-
-func get_world_load_center(default_center: Vector3) -> Vector3:
-    if not multiplayer.is_server() or not _has_live_peer():
-        return default_center
-    return default_center
-
-
-func _snap_world_stream_position(position: Vector3) -> Vector3:
-    return Vector3(
-        floor(position.x / 16.0) * 16.0 + 8.0,
-        floor(position.y / 16.0) * 16.0 + 8.0,
-        floor(position.z / 16.0) * 16.0 + 8.0
-    )
-
-
 func _is_near_any_session_position(world_position: Vector3, positions: Array, radius: float) -> bool:
     var radius_squared: float = radius * radius
     for position in positions:
         if world_position.distance_squared_to(position) <= radius_squared:
             return true
     return false
-
-
-func _get_nearest_connected_peer_state() -> Dictionary:
-    if not _has_live_peer() or not _can_sample_player():
-        return {}
-    var active_instance_key: String = get_active_dimension_instance_key()
-    var nearest_state: Dictionary = {}
-    var nearest_distance_squared: float = INF
-    for peer_id in peer_states.keys():
-        var int_peer_id: int = int(peer_id)
-        if int_peer_id == multiplayer.get_unique_id():
-            continue
-        var state: Dictionary = peer_states[peer_id]
-        if not _is_peer_state_same_instance(state, active_instance_key):
-            continue
-        var peer_position: Vector3 = state.get("position", Vector3.ZERO)
-        var distance_squared: float = Ref.player.global_position.distance_squared_to(peer_position)
-        if distance_squared < nearest_distance_squared:
-            nearest_distance_squared = distance_squared
-            nearest_state = state
-    return nearest_state
-
-
-func _supports_multi_region_world_loading() -> bool:
-    return is_instance_valid(Ref.world) \
-        and Ref.world.has_method("supports_coop_multi_region_loading") \
-        and bool(Ref.world.call("supports_coop_multi_region_loading"))
 
 
 func _enforce_shared_bubble_tether(delta: float) -> void:
@@ -8641,45 +8550,6 @@ func _capture_local_runtime_chunk_patch_for_world_positions(world_positions: Arr
     # Native serialization preserves block IDs and the 64-byte water-awake channel.
     return _capture_local_chunk_patch_for_chunk_positions(_get_unique_chunk_positions_for_world_positions(world_positions))
 
-func _capture_runtime_chunk_snapshot(chunk_position: Vector3i) -> Dictionary:
-    if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(chunk_position):
-        return {}
-
-    var chunk_size: Vector3i = _get_cached_world_chunk_size()
-    var cell_count: int = chunk_size.x * chunk_size.y * chunk_size.z
-    if cell_count <= 0:
-        return {}
-
-    var blocks: PackedInt32Array = PackedInt32Array()
-    var water: PackedByteArray = PackedByteArray()
-    var water_awake: PackedByteArray = PackedByteArray()
-    var fire: PackedByteArray = PackedByteArray()
-    blocks.resize(cell_count)
-    water.resize(cell_count)
-    water_awake.resize(cell_count)
-    fire.resize(cell_count)
-
-    var index: int = 0
-    for y in range(chunk_size.y):
-        for z in range(chunk_size.z):
-            for x in range(chunk_size.x):
-                var world_position: Vector3 = Vector3(chunk_position + Vector3i(x, y, z))
-                var block: Block = Ref.world.get_block_type_at(world_position)
-                var water_level: int = _clamp_chunk_byte_value(Ref.world.get_water_level_at(world_position))
-                blocks[index] = block.id if block != null else 0
-                water[index] = water_level
-                water_awake[index] = 1 if water_level > 0 else 0
-                fire[index] = _clamp_chunk_byte_value(Ref.world.get_fire_at(world_position))
-                index += 1
-
-    return {
-        "blocks": blocks,
-        "water": water,
-        "water_awake": water_awake,
-        "fire": fire,
-    }
-
-
 func _clamp_chunk_byte_value(value: Variant) -> int:
     return clampi(int(value), 0, 255)
 
@@ -8992,10 +8862,6 @@ func _apply_world_patch_locally(world_patch: Dictionary) -> void:
     Ref.world.load_data(Ref.save_file_manager.loaded_file.data, _resolve_dimension_namespace(dimension, pocket_owner_key) + "_")
 
 
-func _send_local_world_patch_if_needed(force_send: bool = false) -> void:
-    return
-
-
 func is_client_session() -> bool:
     return _has_live_peer() and not multiplayer.is_server()
 
@@ -9258,12 +9124,6 @@ func _apply_entity_model_head_look_state(root: Node, state: Dictionary) -> void:
         model.set("look_ratio", float(state.get("look_ratio", 0.0)))
     if state.has("look_target") and _object_has_property(model, "look_target"):
         model.set("look_target", state.get("look_target", Vector3.ZERO))
-
-
-func _capture_node_local_rotation(node: Node3D) -> Variant:
-    if node == null or not is_instance_valid(node):
-        return null
-    return node.rotation
 
 
 func _capture_entity_procedural_visual_state(entity) -> Dictionary:

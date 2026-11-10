@@ -16,7 +16,7 @@ func run() -> int:
     var path: String = "user://personal_" + Crypto.new().generate_random_bytes(8).hex_encode() + "/alice.bin"
     var items: Array = [PackedInt32Array([7, 10, 0]), Vector3i(1, 2, 3), PackedInt32Array(), Vector3i.ZERO]
     var state: Dictionary = {"node": {"player": {"Inventory": {"items": items, "capacity": 2}}}}
-    var record: Dictionary = store.save_state(path, state, 0)
+    var record: Dictionary = store.save_checkpoint(path, state, 0, "fixture", "naraka", [], {})
     check(record.get("revision") == 1, "profile committed before acknowledgement")
     check(store.read_profile(path)["chest"].size() == 21, "bounded21 slots")
     var request: String = "a".repeat(64)
@@ -26,7 +26,7 @@ func run() -> int:
     check(record["state"]["node"]["player"]["Inventory"]["items"][0][1] == 6 and record["chest"][0]["item"][1] == 4, "both sides conserve items")
     check(record["chest"][0]["position"] == Vector3i(1, 2, 3), "item position retained")
     check(store.transfer(path, 1, request, "Inventory", 0, 0, 4, true, limit)["revision"] == 2, "request replay idempotent")
-    check(store.save_state(path, state, 1).is_empty(), "stale profile cannot roll back chest inventory")
+    check(store.save_checkpoint(path, state, 1, "fixture", "naraka", [], {}).is_empty(), "stale profile cannot roll back chest inventory")
     check(store.transfer(path, 1, "b".repeat(64), "Inventory", 0, 0, 4, true, limit).is_empty(), "stale transfer rejected")
     check(store.transfer(path, 2, "b".repeat(64), "Inventory", 0, 21, 1, true, limit).is_empty(), "slot22 rejected")
     check(store.transfer(path, 2, "b".repeat(64), "Inventory", 0, 0, 7, true, limit).is_empty(), "overdraw rejected")
@@ -47,7 +47,7 @@ func run() -> int:
     var merge_path: String = path.get_base_dir().path_join("merge.bin")
     var merge_items: Array = [PackedInt32Array([7, 10, 0]), Vector3i(1, 2, 3), PackedInt32Array([7, 2, 0]), Vector3i(1, 2, 3)]
     var merge_state: Dictionary = {"node": {"player": {"Inventory": {"items": merge_items, "capacity": 2}}}}
-    store.save_state(merge_path, merge_state, 0)
+    store.save_checkpoint(merge_path, merge_state, 0, "merge", "naraka", [], {})
     record = store.transfer(merge_path, 1, "e".repeat(64), "Inventory", 0, 0, 4, true, limit)
     record = store.transfer(merge_path, 2, "f".repeat(64), "Inventory", 0, 0, 2, true, limit)
     check(record.get("revision") == 3 and record["chest"][0]["item"][1] == 6, "deposit merges matching stacks")
@@ -55,7 +55,7 @@ func run() -> int:
     check(record.get("revision") == 4 and record["state"]["node"]["player"]["Inventory"]["items"][2][1] == 4, "withdrawal merges matching stacks")
     merge_state = record["state"].duplicate(true)
     merge_state["node"]["player"]["Inventory"]["items"][1] = Vector3i(9, 9, 9)
-    store.save_state(merge_path, merge_state, 4)
+    store.save_checkpoint(merge_path, merge_state, 4, "merge", "naraka", [], {})
     check(store.transfer(merge_path, 5, "2".repeat(64), "Inventory", 0, 0, 1, true, limit).is_empty(), "deposit refuses different item positions")
     check(store.transfer(merge_path, 5, "3".repeat(64), "Inventory", 0, 0, 1, false, limit).is_empty(), "withdrawal refuses different item positions")
     check(store.transfer(merge_path, 5, "4".repeat(64), "Inventory", 0, 1, 1, false, limit).is_empty(), "withdrawal from empty chest slot refused")

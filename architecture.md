@@ -11,7 +11,7 @@ Target Steam app3495730/build26206996, game5.2.0.0, Windows x86-64, Godot4.6 dou
 - Native hook/multi-region proposals and `native_patch/` are historical reference only. No replacement DLL, RVA patch or native-union capability is required. Keep unsupported-native guards fail closed; do not enable historical native deployment.
 - Recovered assets/scripts are private reference. Single-precision recovery does not reproduce original double-precision resources; never package/commit commercial recovered material.
 - One source writer owns each task, callers and fixtures. Architecture work edits only this file; no source, project file or engine configuration edits. Preserve unrelated `.import` changes.
-- `scripts/build_raw_mod.ps1` owns isolated staging, packed checks and local output publication. `install_mod.ps1`/`uninstall_mod.ps1` own separately authorized deployment/rollback. Avoid inherited combined build/deploy scripts.
+- `scripts/build_mod.ps1` owns isolated staging, packed checks and local output publication. `install_mod.ps1`/`uninstall_mod.ps1` own separately authorized deployment/rollback. Avoid inherited combined build/deploy scripts.
 
 ## Systems and state owners
 
@@ -74,27 +74,15 @@ Dedicated UI avoids native drag/cursor mutation paths. It shows21slots and expli
 
 Remaining barriers cover ordinary guest profile writes racing chest commits, host close/restart, disk failure and preserved-node changes. No durable write means no success acknowledgement. Retain previous valid state and failed migration sources. Backup/restore consistency among vanilla data, regions, identities/designations and personal ledgers requires explicit checks; clean save/reload alone does not prove crash durability.
 
-## Evidence and remaining verification
+## Verification for a solo maintainer
 
-Strict combined run `work/build-logs/33c9c4ab9c854c6096683443b229df96/`: region28/runtime45, admission73, native guard4, personal store17, chunk authority13, profile runtime16, canonical runtime9 and startup66, all zero failures. Stdout ends `COOP_BUILD_CHECK_OK 66`; stderr retains the deliberate failed-load warning and ObjectDB exit warning. Strict runner accepted the run. These prove named local contracts, not production two-player play. Earlier55combat assertions/two original Gel renders are separate evidence. Inherited rendered shutdown errors reproduce without co-op and do not authorize base-game/native repairs.
+Routine verification is `scripts/build_mod.ps1` with matching `-Godot`, `-Gdre`, `-GameExe` paths and `-Test`, then `tests/test_install.ps1`. The single builder packages mod resources, loads scripts against the original runtime, and runs focused identity, region, inventory/chest, private-node, canonical-terrain, lease and respawn regressions. The installer suite uses synthetic directories and verifies rollback and preservation of existing files. Neither command installs into the owned game.
 
-Exact existing combined command from project root:
+Use `-CombatTests` separately after combat/render changes; preserve its original assets, renderer, deadlines and explicit result/error gates. Other changes do not need rendered controls, native rebuilds, diagnostic self-tests or a one-hour soak by default. The removed native/startup/world-process diagnostic harnesses remain in Git history; their historical logs do not become passing gameplay evidence.
 
-```powershell
-& ./scripts/build_raw_mod.ps1 -Godot ./work/tools/godot.windows.editor.double.x86_64.exe -Gdre ./work/tools/gdre-2.7.4/gdre_tools.exe -GameExe 'C:/Program Files (x86)/Steam/steamapps/common/lucid-blocks/lucid-blocks.exe' -ProjectDir ./mod/overrides -OutputDir ./work/mod-only-verification-output -RegionTests -AdmissionTests
-```
+Validation, atomic persistence, revision/receipt guards, owner checks and fail-closed native capability gating remain production requirements. Tests of the same helper through several alternate APIs are unnecessary; fixtures use the actual checkpoint and lease APIs. Run the routine checks once after the relevant changes; repeat only for new failures or changed inputs.
 
-Uses original native files, never `-NativeBaseline`. Runner freezes fixture input in staging, checks scripts and explicit markers/errors/exit/deadlines, isolates profiles and owns process cleanup. Reuse unchanged evidence. Expand fixtures for changed behavior, run costly checks sequentially; missing gameplay/transport execution remains unverified, never passed.
-
-| Order | One-writer files | Existing exact hook and required assertions |
-|---|---|---|
-|1 Saved nodes/private instances | Manager, preserve-node override, implicated entity/living-block callers; `tests/region_runtime.gd`, `tests/profile_runtime.gd` | Combined command above: identical coordinates in two owner instances; UUID isolation, visitor mutation, tombstones, restart and ordinary cache regression. |
-|2 Live authority handoff | Manager, chunk owner, world, implicated entity callers; `tests/chunk_authority.gd`, `tests/canonical_runtime.gd` | Same command: final checkpoint before new owner, old packet rejected, edits/water/fire converge, interrupted handoff preserves durable state; live path still requires retained scenario. |
-|3 Independent travel/reconnect | Manager and exact portal/Hamsa/cutscene/plot/player callers listed above; admission/profile/region fixtures | Same command: initiator-only travel, both private visits persist, reconnect restores identity/position/instance, stale profile cannot overwrite chest. |
-|4 Chest lifecycle/failures | Personal store/UI, manager, cache cube; personal-store/profile fixtures | Same command: conservation, full stacks/inventory, duplicate/reordered transfer, write failure, close/death/break/reconnect, private visibility and ordinary cubes. |
-|5 Local integration | Only failed-feature owners above and runtime fixtures | Same command plus retained isolated two-process gameplay scenario: distant movement/build/combat, dimensions/visits/chest, save/rejoin, original native hashes unchanged. Unimplemented live scenario is remaining work, not an executable claim. |
-
-Stop after requested mod work and truthful local verification report. Real two-account Steam invite/reconnect and multiplayer soak remain unavailable external evidence; do not expand into base-game shutdown cleanup/native development.
+Earlier actual two-process smoke completed eight assertions but strict shutdown failed ten resource errors per role; original/offline controls reported matching categories/count. Causes remain unresolved. Expanded exploration/private travel/chest/reconnect gameplay and real two-account Steam/human checks remain unverified and deferred under the current scope. Local contract passes do not certify a release.
 
 ## Risks and exclusions
 

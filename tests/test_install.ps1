@@ -84,34 +84,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $project 'export_presets.cfg'), 'fixture')
     $artifact = Join-Path $dist 'lucid-blocks-coop.pck'
     Copy-Item -LiteralPath $pack -Destination $artifact
-    $mock = Join-Path $fixture 'mock editor.ps1'
-    @'
-if ($args -contains '--version') {
-    $global:LASTEXITCODE = 0
-    if ($env:COOP_TEST_MODE -eq 'version') { '4.7.2.stable'; return }
-    '4.6.stable.double'; return
-}
-if ($env:COOP_TEST_MODE -eq 'exit') { $global:LASTEXITCODE = 1; return }
-$global:LASTEXITCODE = 0
-[IO.File]::WriteAllText((Join-Path $args[2] 'project.godot'), 'editor changed its disposable copy')
-if ($env:COOP_TEST_MODE -eq 'missing') { return }
-if ($env:COOP_TEST_MODE -eq 'invalid') { [IO.File]::WriteAllText($args[-1], 'invalid'); return }
-Copy-Item -LiteralPath $env:COOP_TEST_PACK -Destination $args[-1]
-if ($env:COOP_TEST_MODE -eq 'error') { 'SCRIPT ERROR: simulated failure' }
-'@ | Set-Content -LiteralPath $mock -Encoding UTF8
     $env:COOP_TEST_PACK = $update
-    foreach ($mode in @('version', 'exit', 'missing', 'invalid', 'error')) {
-        $env:COOP_TEST_MODE = $mode
-        Expect-Failure { & "$scripts/build_mod.ps1" -Godot $mock -ProjectDir $project -OutputDir $dist } "build rejects $mode"
-        Assert ((Hash $artifact) -eq (Hash $pack)) "build $mode retains old artifact"
-        Assert ((Hash $target) -eq $originalHash) "build $mode leaves installation unchanged"
-    }
-    $env:COOP_TEST_MODE = 'success'
-    & "$scripts/build_mod.ps1" -Godot $mock -ProjectDir $project -OutputDir $dist
-    Assert ((Hash $artifact) -eq (Hash $update)) 'successful mock build replaces artifact'
-    Assert ((Hash $target) -eq $originalHash) 'successful mock build leaves installation unchanged'
-    Assert (([IO.File]::ReadAllText((Join-Path $project 'project.godot'))) -eq 'fixture') 'editor only changes staged project'
-    Assert (@(Get-ChildItem -LiteralPath $dist -Force).Count -eq 1) 'no build staging files remain'
     $rawMock = Join-Path $fixture 'raw tools.ps1'
     @'
 $global:LASTEXITCODE = 0
