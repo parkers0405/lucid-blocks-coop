@@ -82,6 +82,10 @@ var known_profile_directory: String = ""
 var lease_probe_busy: bool = false
 var pickup_checkpoint_allowed: bool = false
 var lease_started_at: int = 0
+const LEASE_HYSTERESIS: float = 32.0
+const LEASE_MIN_INTERVAL_MS: int = 3000
+var lease_finished_at: int = 0
+var lease_recommit_needed: bool = false
 var lease_origins: Dictionary = {}
 
 func _lease_chunk(position: Vector3) -> Vector3i:
@@ -130,6 +134,7 @@ func _resume_lease_runtime() -> void:
     lease_frozen = false
     lease_checkpoint_allowed = false
     lease_busy = false
+    lease_finished_at = Time.get_ticks_msec()
     if is_instance_valid(Ref.entity_spawner):
         _set_lease_node_mode(Ref.entity_spawner, true)
     if _can_sample_player():
@@ -274,8 +279,13 @@ func _lease_proposal() -> Dictionary:
         for chunk in entry["chunks"]:
             var key: String = ChunkAuthority.chunk_key(entry["instance"], chunk)
             var desired: int = ChunkAuthority.owner(chunk, entry["instance"], host, guest)
-            if chunk_authority.lease_owners.get(key, 1) == 2 and entry["instance"] == lease_guest_instance and lease_guest_chunks.has(chunk) and (host.get("dimension_instance_key") != entry["instance"] or (Vector3(chunk) + Vector3(8, 8, 8)).distance_to(host.get("position", Vector3.INF)) > ChunkAuthority.HOST_RADIUS):
+            # Hysteresis: a chunk changes owner only after the player is LEASE_HYSTERESIS units past the boundary, so walking back and forth over it does not trigger repeated handoffs.
+            var host_distance: float = (Vector3(chunk) + Vector3(8, 8, 8)).distance_to(host.get("position", Vector3.INF))
+            var host_here: bool = host.get("dimension_instance_key") == entry["instance"]
+            if chunk_authority.lease_owners.get(key, 1) == 2 and entry["instance"] == lease_guest_instance and lease_guest_chunks.has(chunk) and (not host_here or host_distance > ChunkAuthority.HOST_RADIUS - LEASE_HYSTERESIS):
                 desired = 2
+            elif chunk_authority.lease_owners.has(key) and chunk_authority.lease_owners[key] == 1 and desired == 2 and host_here and host_distance <= ChunkAuthority.HOST_RADIUS + LEASE_HYSTERESIS:
+                desired = 1
             chunks[key] = desired
     return chunks
 
@@ -325,7 +335,7 @@ func _tick_runtime_lease(delta: float) -> void:
             if is_instance_valid(node) and owns_runtime_node(node):
                 positions[_get_sync_uuid(node)] = node.global_position
         request_runtime_lease.rpc_id(1, get_active_dimension_instance_key(), _local_loaded_lease_chunks(), positions)
-    elif not admitted_player_keys.is_empty() and not lease_guest_instance.is_empty() and not lease_probe_busy:
+    elif not admitted_player_keys.is_empty() and not lease_guest_instance.is_empty() and not lease_probe_busy and Time.get_ticks_msec() - lease_finished_at >= LEASE_MIN_INTERVAL_MS:
         lease_probe_busy = true
         var probe_generation: int = save_queue.generation
         var probe_file = Ref.save_file_manager.loaded_file
@@ -333,7 +343,7 @@ func _tick_runtime_lease(delta: float) -> void:
         var probe_epoch: String = terrain_epoch
         _record_host_residency()
         var proposal: Dictionary = _lease_proposal()
-        var changed: bool = _lease_owners_changed(proposal) or chunk_authority.lease_epoch == 0 or await _lease_objects_changed(proposal)
+        var changed: bool = _lease_owners_changed(proposal) or chunk_authority.lease_epoch == 0 or lease_recommit_needed or await _lease_objects_changed(proposal)
         lease_probe_busy = false
         if changed and _same_save_context(probe_generation, probe_file) and _can_sample_player() and probe_instance == get_active_dimension_instance_key() and probe_epoch == terrain_epoch and not lease_busy and not durable_pickup_busy:
             _handoff_runtime_lease.call_deferred(proposal)
@@ -420,27 +430,22 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
             if record["owners"][uuid] != key:
                 transfers.append({"instance": instance, "uuid": uuid, "old": record["owners"][uuid], "new": key})
     var epoch: int = maxi(chunk_authority.lease_epoch, int(ledger.get("lease", {}).get("epoch", 0))) + 1
-    var committed: bool = await _store_job(personal_store, "commit_lease", [path, epoch, proposal, objects, transfers], false)
-    if lease_token != token or not _same_save_context(generation, file):
-        return
-    if not committed:
-        cancel_runtime_lease.rpc(token, terrain_epoch)
-        _resume_lease_runtime()
-        return
+    # Write-behind: the durable ownership commit is queued (FIFO, kept across session invalidation) after the payload reads and is not awaited, so no disk job sits in the frozen window after the checkpoints.
     var previous_chunks: Dictionary = chunk_authority.lease_owners.duplicate()
     lease_pending_install_epoch = epoch
     lease_pending_previous_chunks = previous_chunks
     terrain_epoch = auth_session_nonce + ":" + str(epoch)
     chunk_authority.install_lease(epoch, proposal, objects)
     # Both sides stay frozen until all terrain, objects and maps are installed.
-    var local_payload: Dictionary = await _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), previous_chunks)
-    var remote_payload: Dictionary = await _lease_install_payload(lease_guest_instance, lease_guest_chunks, previous_chunks, 2)
+    var local_payload: Dictionary = await _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), previous_chunks, 1, ledger)
+    var remote_payload: Dictionary = await _lease_install_payload(lease_guest_instance, lease_guest_chunks, previous_chunks, 2, ledger)
     if lease_token != token or not _same_save_context(generation, file):
         return
     if local_payload.is_empty() or remote_payload.is_empty():
         status_message = "Cannot construct bounded lease installation; gameplay remains frozen"
         _update_status_text()
         return
+    _commit_lease_write_behind(path, epoch, proposal, objects, transfers)
     local_ok = true
     for part in local_payload["parts"]:
         if not await _install_lease_payload(part):
@@ -540,7 +545,26 @@ func resume_runtime_lease(token: String, epoch: String) -> void:
     if token == lease_token and epoch == terrain_epoch:
         _resume_lease_runtime()
 
-func _lease_install_payload(instance: String, resident: Array, previous_chunks: Dictionary, recipient: int = 1) -> Dictionary:
+func _commit_lease_write_behind(path: String, epoch: int, proposal: Dictionary, objects: Dictionary, transfers: Array) -> void:
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
+    for attempt in range(3):
+        if await _store_job(personal_store, "commit_lease", [path, epoch, proposal, objects, transfers], false):
+            lease_recommit_needed = false
+            return
+        # A lost result must not turn a durable commit into a retry loop.
+        var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
+        if int(ledger.get("lease", {}).get("epoch", 0)) >= epoch:
+            lease_recommit_needed = false
+            return
+        if not _same_save_context(generation, file):
+            break
+    # Memory is ahead of disk: force a fresh handoff that recommits current ownership.
+    lease_recommit_needed = true
+    status_message = "Ownership commit not durable yet; retrying"
+    _update_status_text()
+
+func _lease_install_payload(instance: String, resident: Array, previous_chunks: Dictionary, recipient: int = 1, known_ledger: Dictionary = {}) -> Dictionary:
     var token: String = lease_token
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
@@ -571,7 +595,7 @@ func _lease_install_payload(instance: String, resident: Array, previous_chunks: 
         root[prefix + channel] = {}
         for region in stored["regions"].values():
             root[prefix + channel].merge(region[channel], true)
-    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [_profile_path(_get_local_player_key())], {})
+    var ledger: Dictionary = known_ledger if not known_ledger.is_empty() else await _store_job(personal_store, "read_ledger", [_profile_path(_get_local_player_key())], {})
     if lease_token != token or not _same_save_context(generation, file) or ledger.is_empty():
         return {}
     var record: Dictionary = ledger.get("instances", {}).get(ledger_instance, {})
@@ -1167,7 +1191,7 @@ func _same_save_context(generation: int, file: Variant) -> bool:
     return generation == save_queue.generation and Ref.save_file_manager != null and Ref.save_file_manager.loaded_file == file
 
 func _store_job(store: RefCounted, method: String, arguments: Array, fallback: Variant) -> Variant:
-    var own_checkpoint: bool = method == "save_checkpoint" and arguments[0] == _profile_path(_get_local_player_key())
+    var own_checkpoint: bool = (method == "save_checkpoint" or method == "commit_lease") and arguments[0] == _profile_path(_get_local_player_key())
     var priority: bool = method in ["collect_drop", "transfer", "commit_lease"]
     var result = await save_queue.run(get_tree(), Callable(store, method).bindv(arguments.duplicate(true)), own_checkpoint, priority)
     if store == personal_store and method == "read_ledger" and result is Dictionary and not result.is_empty():

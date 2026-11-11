@@ -190,6 +190,13 @@ func run() -> int:
     check(not await manager._wait_lease_ack("current_token") and manager.lease_frozen, "lost install acknowledgement never resumes gameplay")
     manager._accept_runtime_lease_ack("current_token", "install_1", "session:1", true)
     check(await manager._wait_lease_ack("current_token"), "matching install acknowledgement completes wait")
+    var host_path: String = manager._profile_path("host")
+    manager.lease_recommit_needed = true
+    await manager._commit_lease_write_behind(host_path, 2, {key: 2}, {}, [])
+    check(manager.personal_store.read_ledger(host_path)["lease"]["epoch"] == 2 and not manager.lease_recommit_needed, "write-behind ownership commit becomes durable and clears the recommit flag")
+    await manager._commit_lease_write_behind(host_path, 5, {key: 2}, {}, [{"instance": "dimension__2", "uuid": "missing", "old": "host", "new": "guest"}])
+    check(manager.lease_recommit_needed and manager.personal_store.read_ledger(host_path)["lease"]["epoch"] == 2, "failed write-behind commit leaves the durable epoch and forces a recommit handoff")
+    manager.lease_recommit_needed = false
     manager.lease_frozen = false
     manager.lease_preparing = false
     var prior_disabled: bool = Ref.player.disabled
