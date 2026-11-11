@@ -12,7 +12,9 @@ param(
     # One process with the mod and no peer (baseline).
     [switch] $Solo,
     [string] $RunRoot = "$PSScriptRoot/../work/friction/runs",
+    # Hard-kill a role when the probe publishes <role>_killpoint.json, then relaunch it on the same profile (G7 kill tests).
     [string] $KillGuestAt = '',
+    [ValidateSet('guest', 'host')][string] $KillRole = 'guest',
     [int] $TimeoutSeconds = 420,
     [int] $Blocks = 40,
     [switch] $Diag,
@@ -64,7 +66,7 @@ $relayPort = $port + 1
 $roles = if ($WorldControl) { @($WorldControl) } elseif ($Solo) { @('solo') } else { @('host', 'guest') }
 $processes = @{}
 $useRelay = (-not $WorldControl) -and (-not $Solo) -and $Profile -ne 'clean'
-[IO.File]::WriteAllText((Join-Path $run 'config.json'), (@{ scenario = $Scenario; disk = $Disk; profile = $Profile; solo = [bool]$Solo; host_port = $port; kill_guest_at = $KillGuestAt; control = [string]$WorldControl; control_enters = $ControlEnters; blocks = $Blocks; trips = $Trips; diag = [int][bool]$Diag } | ConvertTo-Json))
+[IO.File]::WriteAllText((Join-Path $run 'config.json'), (@{ scenario = $Scenario; disk = $Disk; profile = $Profile; solo = [bool]$Solo; host_port = $port; kill_guest_at = $KillGuestAt; kill_role = $KillRole; control = [string]$WorldControl; control_enters = $ControlEnters; blocks = $Blocks; trips = $Trips; diag = [int][bool]$Diag } | ConvertTo-Json))
 $relay = $null
 $relayStop = Join-Path $run 'relay.stop'
 try {
@@ -84,7 +86,8 @@ try {
         $relayOut = $relay.StandardOutput.ReadToEndAsync()
         Start-Sleep -Milliseconds 1500
     }
-    foreach ($role in $roles) {
+    $launch = {
+        param($role)
         # The game loads mods and native libraries relative to its exe, so the runtime lives beside the fixed exe; only profile/temp data is per run.
         $runtime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../work/friction/bin/$role"))
         $data = Join-Path $run $role
@@ -133,13 +136,26 @@ try {
         [IO.File]::WriteAllText((Join-Path $data 'owned-pid.txt'), "$($process.Id)")
         Write-Output "LOCAL_COOP_STARTED $role $($process.Id)"
     }
+    foreach ($role in $roles) { & $launch $role }
+    $killed = $false
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while (@($processes.Values | Where-Object { -not $_.Process.HasExited }).Count -gt 0) {
         foreach ($role in $roles) {
             if ($Scenario -eq 'smoke' -and (Test-Path -LiteralPath (Join-Path $run ($role + '_failed.json')))) { throw "Local co-op role failed: $run" }
         }
+        if ($KillGuestAt -and -not $killed -and (Test-Path -LiteralPath (Join-Path $run "${KillRole}_killpoint.json"))) {
+            $victim = $processes[$KillRole]
+            $victim.Process.Kill($true)
+            $victim.Process.WaitForExit()
+            [IO.File]::WriteAllText((Join-Path $run "${KillRole}1.stdout.log"), $victim.StandardOutput.GetAwaiter().GetResult())
+            [IO.File]::WriteAllText((Join-Path $run "${KillRole}1.stderr.log"), $victim.StandardError.GetAwaiter().GetResult())
+            [IO.File]::WriteAllText((Join-Path $run "${KillRole}_recover.flag"), $KillGuestAt)
+            Write-Output "LOCAL_COOP_KILLED $KillRole at $KillGuestAt"
+            $killed = $true
+            & $launch $KillRole
+        }
         if ([DateTime]::UtcNow -ge $deadline) { throw "Local co-op overall deadline: $run" }
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds $(if ($KillGuestAt) { 100 } else { 500 })
     }
 }
 finally {

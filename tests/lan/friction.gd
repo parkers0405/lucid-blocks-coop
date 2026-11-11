@@ -345,7 +345,117 @@ func _scn_handoff_motion(_manager: Node) -> bool:
     _bot_off()
     return true
 
+# G7 kill tests: the runner hard-kills the guest when it publishes guest_killpoint, relaunches it with guest_recover.flag, and the
+# recovered guest reports its inventory so conservation (host + guest + drops left = spawned) can be checked.
+func _publish_kill_and_hold() -> void:
+    _mark("killpoint", {"point": str(config.get("kill_guest_at", "")), "t": Time.get_ticks_msec()})
+    await get_tree().create_timer(300.0, true, false, true).timeout
+
+func _spawn_pile(count: int) -> void:
+    var pile: Vector3 = Ref.player.global_position
+    var block_id: int = _solid_block_ids()[0]
+    for index in range(count):
+        _spawn_drop(block_id, pile + Vector3(0.1 * (index % 5), 1.0, 0.1 * (index / 5)))
+    _mark("pile", {"x": pile.x, "y": pile.y, "z": pile.z, "block": block_id, "count": count})
+
+func _scn_kill_pickup(manager: Node) -> bool:
+    return await _scn_kill(manager)
+
+func _scn_kill_chest(manager: Node) -> bool:
+    return await _scn_kill(manager)
+
+func _scn_kill_handoff(manager: Node) -> bool:
+    return await _scn_kill(manager)
+
+func _scn_kill(manager: Node) -> bool:
+    var point: String = str(config.get("kill_guest_at", "pickup"))
+    _bot_on()
+    if role != "guest":
+        if point != "chest":
+            _spawn_pile(30)
+        else:
+            var accesses: Dictionary = Ref.save_file_manager.loaded_file.get_data("coop/chest_access", {}, true).duplicate(true)
+            accesses[manager._chest_access_key(manager.get_active_dimension_instance_key(), Vector3i(Ref.player.global_position))] = true
+            Ref.save_file_manager.loaded_file.set_data("coop/chest_access", accesses, true)
+            _mark("chest", {"x": Ref.player.global_position.x, "y": Ref.player.global_position.y, "z": Ref.player.global_position.z})
+        if not await _wait_marker("guest", "recovered", 300.0):
+            return false
+        await get_tree().create_timer(10.0, true, false, true).timeout
+        _event("scenario_done", {"name": "kill_" + point})
+        _bot_off()
+        return true
+    if point != "chest" and not await _wait_marker("host", "pile"):
+        return false
+    if point == "pickup":
+        if not await _wait(func(): return not manager.pickup_pending.is_empty(), "pickup pending"):
+            return false
+        await _publish_kill_and_hold()
+    elif point == "chest":
+        if not await _wait_marker("host", "chest"):
+            return false
+        # Grant 5 items locally; the chest request carries this state to the host, so the oracle is exactly 5 across inventory + chest.
+        var granted := ItemState.new()
+        granted.initialize(ItemMap.map(_solid_block_ids()[0]))
+        granted.count = 5
+        Ref.player_hotbar.set_item(0, granted)
+        var cube := Node3D.new()
+        add_child(cube)
+        var spot: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("host_chest.json")))
+        cube.global_position = Vector3(spot["x"], spot["y"], spot["z"])
+        manager.open_personal_chest(cube)
+        if not await _wait(func(): return is_instance_valid(manager.chest_panel) and manager.chest_panel.session != "" and not manager.chest_panel.busy, "chest session", 20.0):
+            return false
+        manager.chest_panel._select_slot(0)
+        manager.chest_panel._request_transfer("Hotbar", 0, true)
+        # With the slow disk the transfer job outlasts the runner's 100 ms kill poll; the request is in flight either way.
+        await get_tree().physics_frame
+        await get_tree().physics_frame
+        check(not manager.chest_pending_token.is_empty(), "chest transfer in flight at kill point")
+        await _publish_kill_and_hold()
+    elif point == "install0":
+        var origin: Vector3 = Ref.player.global_position
+        _aim(-PI / 2.0, 0.0)
+        Input.action_press("up")
+        Input.action_press("sprint")
+        # Guest is frozen, its checkpoint is acknowledged and the host is installing the new owners (phase install_0 .. resume).
+        var deadline: int = Time.get_ticks_msec() + 150000
+        while not (manager.lease_frozen and not manager.lease_checkpoint_allowed) and Time.get_ticks_msec() < deadline:
+            await get_tree().physics_frame
+        if not (manager.lease_frozen and not manager.lease_checkpoint_allowed):
+            check(false, "guest never reached the install phase of a handoff")
+            return false
+        await _publish_kill_and_hold()
+    else:
+        check(false, "unknown kill point " + point)
+    return false
+
+func _open_chest_and_read(manager: Node) -> int:
+    var cube := Node3D.new()
+    add_child(cube)
+    var spot: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("host_chest.json")))
+    cube.global_position = Vector3(spot["x"], spot["y"], spot["z"])
+    manager.open_personal_chest(cube)
+    if not await _wait(func(): return is_instance_valid(manager.chest_panel) and manager.chest_panel.session != "" and not manager.chest_panel.busy, "chest session after recovery", 30.0):
+        return -1
+    var total: int = 0
+    for entry in manager.chest_panel.record.get("chest", []):
+        var item = entry.get("item") if entry is Dictionary else null
+        if item is PackedInt32Array and item.size() == 3:
+            total += item[1]
+    return total
+
+func _scn_recover(manager: Node) -> bool:
+    await get_tree().create_timer(8.0, true, false, true).timeout
+    check(await _wait(func(): return Ref.world.is_all_loaded(), "world loaded after recovery", 60.0), "recovered guest loaded")
+    var chest_items: int = -2
+    if str(config.get("kill_guest_at", "")) == "chest":
+        chest_items = await _open_chest_and_read(manager)
+    _mark("recovered", {"items": _item_total(), "chest_items": chest_items, "tally": _item_tally(), "t": Time.get_ticks_msec()})
+    return true
+
 func _run_scenario(manager: Node) -> bool:
+    if FileAccess.file_exists(scenario.path_join(role + "_recover.flag")):
+        return await _scn_recover(manager)
     var name_value: String = str(config.get("scenario", "mine_tunnel"))
     _event("scenario_start", {"name": name_value})
     var method := "_scn_" + name_value

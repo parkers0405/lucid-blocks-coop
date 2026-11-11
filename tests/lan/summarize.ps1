@@ -132,6 +132,20 @@ foreach ($run in ($rows | Where-Object scenario -eq 'shared_loot' | Group-Object
     $conservation += [pscustomobject]@{ run = $run.Name; gained = $gained; drops_left_host = $drops; expected = 30; ok = ($gained + [int]$drops -eq 30) }
 }
 
+# G7 kill tests: the recovered guest's inventory (plus chest for chest kills) and the host's inventory and leftover drops must equal what was spawned/granted.
+foreach ($dir in (Get-ChildItem -LiteralPath $Batch -Directory)) {
+    $cfgPath = Join-Path $dir.FullName 'config.json'
+    $recPath = Join-Path $dir.FullName 'guest_recovered.json'
+    if (-not (Test-Path $cfgPath) -or -not (Test-Path $recPath)) { continue }
+    $cfg = Get-Content -Raw $cfgPath | ConvertFrom-Json
+    $rec = Get-Content -Raw $recPath | ConvertFrom-Json
+    $hostPick = Join-Path $dir.FullName 'host_pickups.json'
+    if (-not (Test-Path $hostPick)) { $conservation += [pscustomobject]@{ run = $dir.Name; kill = $cfg.kill_guest_at; ok = $false; note = 'host did not finish' }; continue }
+    $h = Get-Content -Raw $hostPick | ConvertFrom-Json
+    if ($cfg.kill_guest_at -eq 'chest') { $total = [int]$rec.items + [int]$rec.chest_items; $expected = 5 } else { $total = [int]$rec.items + [int]$h.items + [int]$h.drops_left; $expected = 30 }
+    $conservation += [pscustomobject]@{ run = $dir.Name; kill = $cfg.kill_guest_at; gained = $total; expected = $expected; ok = ($total -eq $expected) }
+}
+
 # G8 release purity.
 $g8 = 'BLOCKED (no -Pck given)'
 if ($Pck) {
@@ -164,7 +178,7 @@ foreach ($c in $cells) {
     $md += "| $($c.scenario) | $($c.profile) | $($c.disk) | $($c.role) | $($c.repeats)$(if (-not $c.complete) { ' (INCOMPLETE)' }) | $($c.max_handoff_lock_ms) | $($c.freeze_p95_ms)/$($c.freeze_max_ms) | $($c.lock_fraction) | $($c.break_resets) | $($c.gates.G3) | $($c.gates.G4) | $($c.gates.G5) | $($c.gates.G6) | $($c.gates.G7) |"
 }
 $md += ''; $md += "G8: $g8"; $md += ''; $md += 'Conservation (shared_loot):'
-foreach ($c in $conservation) { $md += "- $($c.run): gained $($c.gained) + drops left $($c.drops_left_host) vs expected $($c.expected): $(if ($c.ok) { 'PASS' } else { 'FAIL' })" }
+foreach ($c in $conservation) { $md += "- $($c.run)$(if ($c.kill) { ' kill=' + $c.kill }): total $($c.gained) (drops left $($c.drops_left_host)) vs expected $($c.expected): $(if ($c.ok) { 'PASS' } else { 'FAIL' })" }
 $md += ''; $md += 'G9 error categories (normalised; mod = mod runs, control-* = controls):'
 foreach ($k in ($errorCats.Keys | Sort-Object)) { $md += "- $k = $($errorCats[$k])" }
 $md | Set-Content -LiteralPath (Join-Path $Batch 'friction-report.md') -Encoding UTF8
