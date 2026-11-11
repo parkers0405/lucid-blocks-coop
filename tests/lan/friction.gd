@@ -32,6 +32,9 @@ class FaultQueue extends "res://coop_mod/save_queue.gd":
         mutex.unlock()
         super(job)
 
+class FakeChestBlock extends Node3D:
+    var broken: bool = false
+
 var role: String
 var scenario: String
 var port: int
@@ -398,7 +401,7 @@ func _scn_kill(manager: Node) -> bool:
         granted.initialize(ItemMap.map(_solid_block_ids()[0]))
         granted.count = 5
         Ref.player_hotbar.set_item(0, granted)
-        var cube := Node3D.new()
+        var cube := FakeChestBlock.new()
         add_child(cube)
         var spot: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("host_chest.json")))
         cube.global_position = Vector3(spot["x"], spot["y"], spot["z"])
@@ -430,7 +433,7 @@ func _scn_kill(manager: Node) -> bool:
     return false
 
 func _open_chest_and_read(manager: Node) -> int:
-    var cube := Node3D.new()
+    var cube := FakeChestBlock.new()
     add_child(cube)
     var spot: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("host_chest.json")))
     cube.global_position = Vector3(spot["x"], spot["y"], spot["z"])
@@ -514,7 +517,7 @@ func _chest_record_total(manager: Node) -> int:
     return total
 
 func _open_chest_session(manager: Node) -> bool:
-    var cube := Node3D.new()
+    var cube := FakeChestBlock.new()
     add_child(cube)
     var spot: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("host_chest.json")))
     cube.global_position = Vector3(spot["x"], spot["y"], spot["z"])
