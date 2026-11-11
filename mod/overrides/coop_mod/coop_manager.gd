@@ -86,6 +86,11 @@ const LEASE_HYSTERESIS: float = 32.0
 const LEASE_MIN_INTERVAL_MS: int = 3000
 var lease_finished_at: int = 0
 var lease_recommit_needed: bool = false
+# Highest epoch whose write-behind commit failed; a later successful commit at or above it clears the flag.
+var lease_recommit_epoch: int = 0
+var lease_recommit_failures: int = 0
+var lease_recommit_after: int = 0
+const LEASE_RECOMMIT_MAX_FAILURES: int = 5
 var lease_origins: Dictionary = {}
 
 func _lease_chunk(position: Vector3) -> Vector3i:
@@ -335,7 +340,7 @@ func _tick_runtime_lease(delta: float) -> void:
             if is_instance_valid(node) and owns_runtime_node(node):
                 positions[_get_sync_uuid(node)] = node.global_position
         request_runtime_lease.rpc_id(1, get_active_dimension_instance_key(), _local_loaded_lease_chunks(), positions)
-    elif not admitted_player_keys.is_empty() and not lease_guest_instance.is_empty() and not lease_probe_busy and Time.get_ticks_msec() - lease_finished_at >= LEASE_MIN_INTERVAL_MS:
+    elif not admitted_player_keys.is_empty() and not lease_guest_instance.is_empty() and not lease_probe_busy and chest_sessions.is_empty() and Time.get_ticks_msec() - lease_finished_at >= LEASE_MIN_INTERVAL_MS:
         lease_probe_busy = true
         var probe_generation: int = save_queue.generation
         var probe_file = Ref.save_file_manager.loaded_file
@@ -343,7 +348,7 @@ func _tick_runtime_lease(delta: float) -> void:
         var probe_epoch: String = terrain_epoch
         _record_host_residency()
         var proposal: Dictionary = _lease_proposal()
-        var changed: bool = _lease_owners_changed(proposal) or chunk_authority.lease_epoch == 0 or lease_recommit_needed or await _lease_objects_changed(proposal)
+        var changed: bool = _lease_owners_changed(proposal) or chunk_authority.lease_epoch == 0 or _lease_recommit_due() or await _lease_objects_changed(proposal)
         lease_probe_busy = false
         if changed and _same_save_context(probe_generation, probe_file) and _can_sample_player() and probe_instance == get_active_dimension_instance_key() and probe_epoch == terrain_epoch and not lease_busy and not durable_pickup_busy:
             _handoff_runtime_lease.call_deferred(proposal)
@@ -430,8 +435,9 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
             if record["owners"][uuid] != key:
                 transfers.append({"instance": instance, "uuid": uuid, "old": record["owners"][uuid], "new": key})
     var epoch: int = maxi(chunk_authority.lease_epoch, int(ledger.get("lease", {}).get("epoch", 0))) + 1
-    # Write-behind: the durable ownership commit is queued (FIFO, kept across session invalidation) after the payload reads and is not awaited, so no disk job sits in the frozen window after the checkpoints.
+    # Write-behind: the durable ownership commit is queued (priority lane, kept across session invalidation) after the payload reads and is not awaited, so no disk job sits in the frozen window after the checkpoints.
     var previous_chunks: Dictionary = chunk_authority.lease_owners.duplicate()
+    var previous_state: Dictionary = {"epoch": chunk_authority.lease_epoch, "owners": previous_chunks, "objects": chunk_authority.lease_objects.duplicate(), "terrain_epoch": terrain_epoch}
     lease_pending_install_epoch = epoch
     lease_pending_previous_chunks = previous_chunks
     terrain_epoch = auth_session_nonce + ":" + str(epoch)
@@ -442,8 +448,13 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     if lease_token != token or not _same_save_context(generation, file):
         return
     if local_payload.is_empty() or remote_payload.is_empty():
-        status_message = "Cannot construct bounded lease installation; gameplay remains frozen"
+        # Nothing was committed or sent: put memory back at the durable epoch so disk and memory agree, then resume.
+        _rollback_pending_lease(previous_state)
+        status_message = "Cannot construct bounded lease installation; handoff cancelled"
         _update_status_text()
+        if _has_live_peer():
+            cancel_runtime_lease.rpc(token, terrain_epoch)
+        _resume_lease_runtime()
         return
     _commit_lease_write_behind(path, epoch, proposal, objects, transfers)
     local_ok = true
@@ -545,23 +556,44 @@ func resume_runtime_lease(token: String, epoch: String) -> void:
     if token == lease_token and epoch == terrain_epoch:
         _resume_lease_runtime()
 
+func _rollback_pending_lease(previous: Dictionary) -> void:
+    chunk_authority.lease_epoch = int(previous["epoch"])
+    chunk_authority.lease_owners = previous["owners"]
+    chunk_authority.lease_objects = previous["objects"]
+    terrain_epoch = str(previous["terrain_epoch"])
+    lease_pending_install_epoch = 0
+    lease_pending_previous_chunks.clear()
+
+func _lease_recommit_due() -> bool:
+    return lease_recommit_needed and lease_recommit_failures < LEASE_RECOMMIT_MAX_FAILURES and Time.get_ticks_msec() >= lease_recommit_after
+
+# Priority jobs jump the queue, so ordering relies on this commit being queued before the later jobs that read the ledger. The job is kept
+# across session invalidation on purpose: _reclaim_disconnected_runtime_lease reads the ledger after it and must see the epoch memory already used.
 func _commit_lease_write_behind(path: String, epoch: int, proposal: Dictionary, objects: Dictionary, transfers: Array) -> void:
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
-    for attempt in range(3):
-        if await _store_job(personal_store, "commit_lease", [path, epoch, proposal, objects, transfers], false):
-            lease_recommit_needed = false
-            return
-        # A lost result must not turn a durable commit into a retry loop.
+    var committed: bool = await _store_job(personal_store, "commit_lease", [path, epoch, proposal, objects, transfers], false)
+    if not committed:
+        # A lost result must not turn a durable commit into a failure.
         var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
-        if int(ledger.get("lease", {}).get("epoch", 0)) >= epoch:
+        committed = int(ledger.get("lease", {}).get("epoch", 0)) >= epoch
+    if committed:
+        if lease_recommit_epoch <= epoch:
             lease_recommit_needed = false
-            return
-        if not _same_save_context(generation, file):
-            break
-    # Memory is ahead of disk: force a fresh handoff that recommits current ownership.
+            lease_recommit_epoch = 0
+            lease_recommit_failures = 0
+        return
+    if not _same_save_context(generation, file):
+        return
+    # Memory is ahead of disk: force a fresh handoff that recommits current ownership, with exponential backoff and a cap.
     lease_recommit_needed = true
-    status_message = "Ownership commit not durable yet; retrying"
+    lease_recommit_epoch = maxi(lease_recommit_epoch, epoch)
+    lease_recommit_failures += 1
+    lease_recommit_after = Time.get_ticks_msec() + mini(250 << mini(lease_recommit_failures, 5), 8000)
+    if lease_recommit_failures >= LEASE_RECOMMIT_MAX_FAILURES:
+        status_message = "Ownership commits keep failing; live handoffs paused until the session restarts"
+    else:
+        status_message = "Ownership commit not durable yet; retrying"
     _update_status_text()
 
 func _lease_install_payload(instance: String, resident: Array, previous_chunks: Dictionary, recipient: int = 1, known_ledger: Dictionary = {}) -> Dictionary:
@@ -1931,6 +1963,11 @@ func _assign_session_peer(peer: MultiplayerPeer) -> void:
     lease_token = ""
     lease_pending_install_epoch = 0
     lease_pending_previous_chunks.clear()
+    lease_recommit_needed = false
+    lease_recommit_epoch = 0
+    lease_recommit_failures = 0
+    lease_recommit_after = 0
+    lease_finished_at = 0
     lease_guest_instance = ""
     lease_guest_chunks.clear()
     terrain_sync_busy = false

@@ -192,11 +192,27 @@ func run() -> int:
     check(await manager._wait_lease_ack("current_token"), "matching install acknowledgement completes wait")
     var host_path: String = manager._profile_path("host")
     manager.lease_recommit_needed = true
+    manager.lease_recommit_epoch = 2
+    manager.lease_recommit_failures = 2
     await manager._commit_lease_write_behind(host_path, 2, {key: 2}, {}, [])
-    check(manager.personal_store.read_ledger(host_path)["lease"]["epoch"] == 2 and not manager.lease_recommit_needed, "write-behind ownership commit becomes durable and clears the recommit flag")
+    check(manager.personal_store.read_ledger(host_path)["lease"]["epoch"] == 2 and not manager.lease_recommit_needed and manager.lease_recommit_failures == 0, "write-behind ownership commit becomes durable and clears the recommit state")
     await manager._commit_lease_write_behind(host_path, 5, {key: 2}, {}, [{"instance": "dimension__2", "uuid": "missing", "old": "host", "new": "guest"}])
-    check(manager.lease_recommit_needed and manager.personal_store.read_ledger(host_path)["lease"]["epoch"] == 2, "failed write-behind commit leaves the durable epoch and forces a recommit handoff")
+    check(manager.lease_recommit_needed and manager.lease_recommit_epoch == 5 and manager.lease_recommit_failures == 1 and manager.personal_store.read_ledger(host_path)["lease"]["epoch"] == 2, "failed write-behind commit keeps the durable epoch and schedules a backed-off recommit")
+    check(not manager._lease_recommit_due(), "recommit waits for its backoff timer")
+    await manager._commit_lease_write_behind(host_path, 3, {key: 2}, {}, [])
+    check(manager.lease_recommit_needed and manager.personal_store.read_ledger(host_path)["lease"]["epoch"] == 3, "an older commit succeeding cannot clear a newer commit's failure")
+    manager.lease_recommit_failures = manager.LEASE_RECOMMIT_MAX_FAILURES
+    manager.lease_recommit_after = 0
+    check(not manager._lease_recommit_due(), "recommit cycling stops after repeated failures")
+    manager.lease_recommit_failures = 0
+    var before: Dictionary = {"epoch": manager.chunk_authority.lease_epoch, "owners": manager.chunk_authority.lease_owners.duplicate(), "objects": manager.chunk_authority.lease_objects.duplicate(), "terrain_epoch": manager.terrain_epoch}
+    manager.chunk_authority.install_lease(before["epoch"] + 1, {key: 1}, {})
+    manager.terrain_epoch = "session:other"
+    manager.lease_pending_install_epoch = 99
+    manager._rollback_pending_lease(before)
+    check(manager.chunk_authority.lease_epoch == before["epoch"] and manager.terrain_epoch == before["terrain_epoch"] and manager.lease_pending_install_epoch == 0 and manager.chunk_authority.lease_owners == before["owners"], "empty install payload rolls memory back to the durable epoch")
     manager.lease_recommit_needed = false
+    manager.lease_recommit_epoch = 0
     manager.lease_frozen = false
     manager.lease_preparing = false
     var prior_disabled: bool = Ref.player.disabled
