@@ -1,5 +1,5 @@
 # Lucid Blocks co-op state
-Updated2026-11-11. Review follow-up in progress. NOT READY: confirmed pickup locks, asynchronous pickup races and checkpoint/persistence issues require fixes and current verification. 2026-11-11 rerun: contracts PASS (run bb6a00f126f448ffabe46433077ef01a), LAN 19 assertions PASS, but handoff lock (~230 ms sample) and offline Steam error count above control fail; handoff gates G2,G5-G8 unmeasured. See playtest.md.
+Updated 2026-11-11. NOT READY. Friction harness (scripts/test_friction.ps1, tests/lan) measured: handoff locks actions 267 ms clean and 5.1 s typical+slow (G4/G6 fail, needs a protocol decision); pickup lock fixed; 2 real bugs fixed (null terrain collider, living_block_path). G2/G5/G7 partial. See top entry of playtest.md.
 
 - Branch: fix/review-ready-compatibility. Preserve102unrelated.import edits and status-only test line endings.
 - Scope: smooth two-player gameplay with compatibility/functionality retained. No PR creation, merge, main push, installation or release performed.
