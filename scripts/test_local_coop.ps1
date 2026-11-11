@@ -15,7 +15,8 @@ param(
     [string] $KillGuestAt = '',
     [int] $TimeoutSeconds = 420,
     [int] $Blocks = 40,
-    [switch] $Diag
+    [switch] $Diag,
+    [int] $ControlEnters = 1
 )
 $ErrorActionPreference = 'Stop'
 $game = (Resolve-Path -LiteralPath $GameExe).Path
@@ -58,7 +59,7 @@ $relayPort = $port + 1
 $roles = if ($WorldControl) { @($WorldControl) } elseif ($Solo) { @('solo') } else { @('host', 'guest') }
 $processes = @{}
 $useRelay = (-not $WorldControl) -and (-not $Solo) -and $Profile -ne 'clean'
-[IO.File]::WriteAllText((Join-Path $run 'config.json'), (@{ scenario = $Scenario; disk = $Disk; profile = $Profile; solo = [bool]$Solo; host_port = $port; kill_guest_at = $KillGuestAt; control = [string]$WorldControl; blocks = $Blocks; diag = [int][bool]$Diag } | ConvertTo-Json))
+[IO.File]::WriteAllText((Join-Path $run 'config.json'), (@{ scenario = $Scenario; disk = $Disk; profile = $Profile; solo = [bool]$Solo; host_port = $port; kill_guest_at = $KillGuestAt; control = [string]$WorldControl; control_enters = $ControlEnters; blocks = $Blocks; diag = [int][bool]$Diag } | ConvertTo-Json))
 $relay = $null
 $relayStop = Join-Path $run 'relay.stop'
 try {

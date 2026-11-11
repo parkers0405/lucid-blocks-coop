@@ -127,6 +127,11 @@ func _run() -> void:
     await Ref.main.enter_game()
     _snapshot("after_enter_game")
     _check(Ref.world.load_enabled and Ref.world.is_all_loaded() and not Ref.player.disabled, "actual creative world loaded")
+    # The setAchievement error is raised once per enter_game; the co-op runs enter 2 (host) or 3 (guest) times, so the control repeats entries.
+    var extra: int = int(JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("config.json"))).get("control_enters", 1)) - 1
+    for index in range(extra):
+        await Ref.main.teleport_to_dimension(1, true)
+        _check(await _wait(func(): return Ref.world.load_enabled and Ref.world.is_all_loaded() and not Ref.player.disabled, "control re-entry"), "control re-entered the world")
     var loaded_radius: int = Ref.world.instance_radius
     var loaded_buffer_radius: int = Ref.world.buffer_instance_radius
     if role == "host":

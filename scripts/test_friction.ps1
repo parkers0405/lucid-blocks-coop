@@ -6,6 +6,7 @@ param(
     [string[]] $Cells = @('mine_tunnel:clean:fast', 'mine_tunnel:typical:slow', 'shared_loot:clean:fast', 'handoff_motion:clean:fast', 'handoff_motion:typical:slow'),
     [int] $Repeats = 3,
     [switch] $SkipControls,
+    [switch] $SkipSolo,
     [int] $Blocks = 20
 )
 $ErrorActionPreference = 'Stop'
@@ -18,13 +19,15 @@ $log = Join-Path $batch 'batch.log'
 function Invoke-Run([hashtable] $Arguments) {
     $started = Get-Date
     $output = & $driver -ModPack $ModPack -RunRoot $runs -Blocks $Blocks @Arguments 2>&1 | Out-String
-    "[{0:s}] {1} ({2:N0}s)`n{3}" -f $started, ($Arguments.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ', ((Get-Date) - $started).TotalSeconds, ($output -split "`n" | Select-Object -Last 3 | Out-String) | Add-Content -LiteralPath $log
+    $label = ($Arguments.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '
+    $tail = ($output -split "`n" | Select-Object -Last 4) -join "`n"
+    Add-Content -LiteralPath $log -Value ("[{0:s}] {1} ({2:N0}s)`n{3}" -f $started, $label, ((Get-Date) - $started).TotalSeconds, $tail)
 }
 $scenarios = $Cells | ForEach-Object { ($_ -split ':')[0] } | Select-Object -Unique
 if (-not $SkipControls) {
     foreach ($control in @('original', 'offline')) { Invoke-Run @{ WorldControl = $control } }
 }
-foreach ($scenario in $scenarios) {
+foreach ($scenario in $(if ($SkipSolo) { @() } else { $scenarios })) {
     for ($i = 0; $i -lt $Repeats; $i++) { Invoke-Run @{ Scenario = $scenario; Solo = $true; TimeoutSeconds = 400 } }
 }
 foreach ($cell in $Cells) {

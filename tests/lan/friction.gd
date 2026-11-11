@@ -172,6 +172,8 @@ func _physics_process(_delta: float) -> void:
     prev_bb = breaking
     prev_progress = progress
     var total: int = _item_total()
+    while not pending_breaks.is_empty() and Time.get_ticks_msec() - int(pending_breaks[0]) > 3000:
+        pending_breaks.pop_front()
     if item_total_prev >= 0 and total > item_total_prev and not pending_breaks.is_empty():
         pickup_ms.append(Time.get_ticks_msec() - int(pending_breaks.pop_front()))
     item_total_prev = total
@@ -235,15 +237,17 @@ func _wait_marker(from_role: String, name_value: String, seconds: float = 120.0)
 
 # Scenarios: bot input only; the co-op code runs unmodified.
 func _scn_mine_tunnel(_manager: Node) -> bool:
+    # The test world is a thin slab (about 4 mineable blocks), so the bot digs down with real attack input and steps two cells aside when the floor is reached.
     _bot_on()
     var count: int = int(config.get("blocks", 40))
     var started: int = Time.get_ticks_msec()
     var bb = Ref.player.get_node("%BreakBlocks")
-    for index in range(count):
+    var misses: int = 0
+    while mined < count and misses < 6:
         _aim(0.0, -deg_to_rad(89.0))
         Input.action_press("attack")
         var broke: bool = false
-        var deadline: int = Time.get_ticks_msec() + 15000
+        var deadline: int = Time.get_ticks_msec() + 5000
         var target := Vector3i.ZERO
         var seen: bool = false
         while Time.get_ticks_msec() < deadline:
@@ -252,15 +256,20 @@ func _scn_mine_tunnel(_manager: Node) -> bool:
                 target = bb.active_position
                 seen = true
             elif seen:
-                if Ref.world.get_block_type_at(target).id <= 1 or Ref.world.get_block_type_at(target).no_collision_block:
+                if Ref.world.get_block_type_at(target).id <= 1:
                     broke = true
                     break
                 seen = false
         Input.action_release("attack")
         if broke:
             mined += 1
+            misses = 0
             pending_breaks.append(Time.get_ticks_msec())
-        await get_tree().create_timer(0.25, true, false, true).timeout
+            await get_tree().create_timer(0.4, true, false, true).timeout
+        else:
+            misses += 1
+            Ref.player.global_position += Vector3(2.0, 0.5, 0.0)
+            await get_tree().create_timer(0.6, true, false, true).timeout
     _event("scenario_done", {"name": "mine_tunnel", "mined": mined, "elapsed_ms": Time.get_ticks_msec() - started})
     check(mined >= count / 2, "mined %d of %d blocks" % [mined, count])
     _bot_off()
