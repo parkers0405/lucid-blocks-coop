@@ -11362,7 +11362,14 @@ func _save_config() -> void:
     file.store_string(JSON.stringify(config, "  "))
 
 
+const LAN_PEER_TIMEOUT: Array = [16, 3000, 6000]
+
 func _on_peer_connected(id: int) -> void:
+    # A hard-killed peer is otherwise noticed only after ENet's default 5-30 s, leaving the host waiting on acks from a dead guest.
+    if multiplayer.multiplayer_peer is ENetMultiplayerPeer:
+        var enet_peer = multiplayer.multiplayer_peer.get_peer(id)
+        if enet_peer != null:
+            enet_peer.set_timeout(LAN_PEER_TIMEOUT[0], LAN_PEER_TIMEOUT[1], LAN_PEER_TIMEOUT[2])
     if multiplayer.is_server():
         (await _restore_host_profile())
     auth_pending.erase(id)

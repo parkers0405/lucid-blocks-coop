@@ -31,8 +31,11 @@ func run(tree: SceneTree, operation: Callable, keep: bool = false, priority: boo
         pending.insert(index, job)
     else:
         pending.append(job)
-    while not job.done:
+    # Check completion right after polling so a finished job does not cost one extra frame.
+    while true:
         poll()
+        if job.done:
+            break
         await tree.process_frame
     return job.result if job.started or job.generation == generation else null
 
