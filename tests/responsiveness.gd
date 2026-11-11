@@ -263,5 +263,14 @@ func run() -> int:
     var before_checkpoint: int = Time.get_ticks_msec()
     check(not await streaming._checkpoint_local_host_world() and streaming.save_yielded and Time.get_ticks_msec() - before_checkpoint < 1000, "lease checkpoint aborts promptly if streaming is active after asynchronous profile IO")
     streaming.free()
+    var living := Guest.new()
+    add_child(living)
+    var living_mismatch: int = 0
+    for id in ItemMap.all_item_ids:
+        var block = ItemMap.map(id)
+        if block is Block and living._get_living_block_scene_path(id) != str(block.living_block_path):
+            living_mismatch += 1
+    check(living_mismatch == 0, "living block scene path reads the 5.2 Block property for every block")
+    living.free()
     print("RESPONSIVENESS_RESULT ", checks, " checks ", failures, " failures")
     return failures

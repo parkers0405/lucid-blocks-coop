@@ -7,7 +7,8 @@ param(
     [int] $Repeats = 3,
     [switch] $SkipControls,
     [switch] $SkipSolo,
-    [int] $Blocks = 20
+    [int] $Blocks = 20,
+    [int] $Trips = 1
 )
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $PSScriptRoot '../work/friction'
@@ -18,7 +19,7 @@ $driver = Join-Path $PSScriptRoot 'test_local_coop.ps1'
 $log = Join-Path $batch 'batch.log'
 function Invoke-Run([hashtable] $Arguments) {
     $started = Get-Date
-    $output = & $driver -ModPack $ModPack -RunRoot $runs -Blocks $Blocks @Arguments 2>&1 | Out-String
+    $output = try { & $driver -ModPack $ModPack -RunRoot $runs -Blocks $Blocks -Trips $Trips @Arguments 2>&1 | Out-String } catch { "DRIVER_EXCEPTION $_" }
     $label = ($Arguments.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '
     $tail = ($output -split "`n" | Select-Object -Last 4) -join "`n"
     Add-Content -LiteralPath $log -Value ("[{0:s}] {1} ({2:N0}s)`n{3}" -f $started, $label, ((Get-Date) - $started).TotalSeconds, $tail)

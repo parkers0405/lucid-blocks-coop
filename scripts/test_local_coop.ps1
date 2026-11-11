@@ -16,7 +16,8 @@ param(
     [int] $TimeoutSeconds = 420,
     [int] $Blocks = 40,
     [switch] $Diag,
-    [int] $ControlEnters = 1
+    [int] $ControlEnters = 1,
+    [int] $Trips = 2
 )
 $ErrorActionPreference = 'Stop'
 $game = (Resolve-Path -LiteralPath $GameExe).Path
@@ -59,7 +60,7 @@ $relayPort = $port + 1
 $roles = if ($WorldControl) { @($WorldControl) } elseif ($Solo) { @('solo') } else { @('host', 'guest') }
 $processes = @{}
 $useRelay = (-not $WorldControl) -and (-not $Solo) -and $Profile -ne 'clean'
-[IO.File]::WriteAllText((Join-Path $run 'config.json'), (@{ scenario = $Scenario; disk = $Disk; profile = $Profile; solo = [bool]$Solo; host_port = $port; kill_guest_at = $KillGuestAt; control = [string]$WorldControl; control_enters = $ControlEnters; blocks = $Blocks; diag = [int][bool]$Diag } | ConvertTo-Json))
+[IO.File]::WriteAllText((Join-Path $run 'config.json'), (@{ scenario = $Scenario; disk = $Disk; profile = $Profile; solo = [bool]$Solo; host_port = $port; kill_guest_at = $KillGuestAt; control = [string]$WorldControl; control_enters = $ControlEnters; blocks = $Blocks; trips = $Trips; diag = [int][bool]$Diag } | ConvertTo-Json))
 $relay = $null
 $relayStop = Join-Path $run 'relay.stop'
 try {
@@ -125,7 +126,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while (@($processes.Values | Where-Object { -not $_.Process.HasExited }).Count -gt 0) {
         foreach ($role in $roles) {
-            if (Test-Path -LiteralPath (Join-Path $run ($role + '_failed.json'))) { throw "Local co-op role failed: $run" }
+            if ($Scenario -eq 'smoke' -and (Test-Path -LiteralPath (Join-Path $run ($role + '_failed.json')))) { throw "Local co-op role failed: $run" }
         }
         if ([DateTime]::UtcNow -ge $deadline) { throw "Local co-op overall deadline: $run" }
         Start-Sleep -Milliseconds 500

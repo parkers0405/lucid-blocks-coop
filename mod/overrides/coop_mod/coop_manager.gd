@@ -7832,7 +7832,7 @@ func _upsert_saved_living_block_at_position(block_position: Vector3i, block_id: 
         return
 
     var block: Block = ItemMap.map(block_id)
-    if block == null or str(block.living_block_scene_path) == "":
+    if block == null or str(block.living_block_path) == "":
         return
 
     var uuid: String = _find_saved_preserve_uuid_at_block_position(block_position)
@@ -7846,14 +7846,14 @@ func _upsert_saved_living_block_at_position(block_position: Vector3i, block_id: 
         _store_saved_chunk_to_uuid_map(chunk_to_uuid_map)
 
     Ref.save_file_manager.loaded_file.set_data("node/%s/global_position" % uuid, Vector3(block_position))
-    Ref.save_file_manager.loaded_file.set_data("node/%s/file_path" % uuid, str(block.living_block_scene_path))
+    Ref.save_file_manager.loaded_file.set_data("node/%s/file_path" % uuid, str(block.living_block_path))
 
 
 func _get_living_block_scene_path(block_id: int) -> String:
     var block: Block = ItemMap.map(block_id)
     if block == null:
         return ""
-    return str(block.living_block_scene_path)
+    return str(block.living_block_path)
 
 
 func _is_living_block_id(block_id: int) -> bool:

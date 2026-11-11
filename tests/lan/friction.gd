@@ -243,6 +243,10 @@ func _scn_mine_tunnel(_manager: Node) -> bool:
     var started: int = Time.get_ticks_msec()
     var bb = Ref.player.get_node("%BreakBlocks")
     var misses: int = 0
+    if role == "guest":
+        # Separate columns so the two players do not mine the same blocks.
+        Ref.player.global_position += Vector3(0.0, 0.5, 8.0)
+        await get_tree().create_timer(0.5, true, false, true).timeout
     while mined < count and misses < 6:
         _aim(0.0, -deg_to_rad(89.0))
         Input.action_press("attack")
