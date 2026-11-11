@@ -453,6 +453,74 @@ func _scn_recover(manager: Node) -> bool:
     _mark("recovered", {"items": _item_total(), "chest_items": chest_items, "tally": _item_tally(), "t": Time.get_ticks_msec()})
     return true
 
+func _host_chest_setup(manager: Node) -> void:
+    var accesses: Dictionary = Ref.save_file_manager.loaded_file.get_data("coop/chest_access", {}, true).duplicate(true)
+    accesses[manager._chest_access_key(manager.get_active_dimension_instance_key(), Vector3i(Ref.player.global_position))] = true
+    Ref.save_file_manager.loaded_file.set_data("coop/chest_access", accesses, true)
+    _mark("chest", {"x": Ref.player.global_position.x, "y": Ref.player.global_position.y, "z": Ref.player.global_position.z})
+
+func _chest_idle(manager: Node) -> bool:
+    return is_instance_valid(manager.chest_panel) and manager.chest_panel.session != "" and not manager.chest_panel.busy and manager.chest_pending_token.is_empty()
+
+# chest_cycle: 10 store/take moves, close in the middle of a pending move, reopen; all 10 granted items must be accounted for.
+func _scn_chest_cycle(manager: Node) -> bool:
+    _bot_on()
+    if role != "guest":
+        _host_chest_setup(manager)
+        if not await _wait_marker("guest", "chest_done", 300.0):
+            return false
+        _event("scenario_done", {"name": "chest_cycle"})
+        _bot_off()
+        return true
+    if not await _wait_marker("host", "chest"):
+        return false
+    var granted := ItemState.new()
+    granted.initialize(ItemMap.map(_solid_block_ids()[0]))
+    granted.count = 10
+    Ref.player_hotbar.set_item(0, granted)
+    var started: int = Time.get_ticks_msec()
+    var items_total: int = 10
+    var chest_total: int = 0
+    if await _open_chest_session(manager) == false:
+        return false
+    for move in range(10):
+        manager.chest_panel._select_slot(0)
+        manager.chest_panel._request_transfer("Hotbar", 0, move % 2 == 0)
+        if move == 4:
+            await get_tree().physics_frame
+            await get_tree().physics_frame
+            manager.close_personal_chest(manager.chest_active_token)
+            if not await _wait(func(): return not is_instance_valid(manager.chest_panel) and manager.chest_pending_token.is_empty(), "chest closed with a pending move", 30.0):
+                return false
+            if await _open_chest_session(manager) == false:
+                return false
+            continue
+        if not await _wait(func(): return _chest_idle(manager), "chest move %d" % move, 30.0):
+            return false
+    chest_total = _chest_record_total(manager)
+    var total: int = _item_total() + chest_total
+    check(total == items_total, "chest_cycle conserves items: inventory %d + chest %d = %d of %d" % [_item_total(), chest_total, total, items_total])
+    _event("scenario_done", {"name": "chest_cycle", "elapsed_ms": Time.get_ticks_msec() - started, "total": total})
+    _mark("chest_done", {"total": total})
+    _bot_off()
+    return true
+
+func _chest_record_total(manager: Node) -> int:
+    var total: int = 0
+    for entry in manager.chest_panel.record.get("chest", []):
+        var item = entry.get("item") if entry is Dictionary else null
+        if item is PackedInt32Array and item.size() == 3:
+            total += item[1]
+    return total
+
+func _open_chest_session(manager: Node) -> bool:
+    var cube := Node3D.new()
+    add_child(cube)
+    var spot: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("host_chest.json")))
+    cube.global_position = Vector3(spot["x"], spot["y"], spot["z"])
+    manager.open_personal_chest(cube)
+    return await _wait(func(): return _chest_idle(manager), "chest session", 30.0)
+
 func _run_scenario(manager: Node) -> bool:
     if FileAccess.file_exists(scenario.path_join(role + "_recover.flag")):
         return await _scn_recover(manager)
