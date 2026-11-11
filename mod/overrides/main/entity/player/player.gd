@@ -1289,11 +1289,13 @@ func get_interact_data(skip_look: bool = false) -> Dictionary:
         data.interact_end = %InteractRayCast3D.get_collision_point()
         var collider: Object = %InteractRayCast3D.get_collider()
         var resolved_target = _resolve_interact_owner_from_collider(collider)
-        var collider_name: String = collider.name if collider is Node else str(collider)
-        var resolved_name: String = resolved_target.name if resolved_target is Node else str(resolved_target)
-        data["debug_collider"] = "%s:%s" % [collider.get_class(), collider_name]
-        data["debug_resolved"] = "%s:%s" % [resolved_target.get_class(), resolved_name] if is_instance_valid(resolved_target) else "<none>"
-        if collider.owner is Star:
+        # Native terrain bodies can have no collider object; the original script guarded this the same way.
+        if is_instance_valid(collider):
+            var collider_name: String = collider.name if collider is Node else str(collider)
+            var resolved_name: String = resolved_target.name if resolved_target is Node else str(resolved_target)
+            data["debug_collider"] = "%s:%s" % [collider.get_class(), collider_name]
+            data["debug_resolved"] = "%s:%s" % [resolved_target.get_class(), resolved_name] if is_instance_valid(resolved_target) else "<none>"
+        if is_instance_valid(collider) and collider.owner is Star:
             data.star_target = collider.owner
         elif resolved_target is Ball or resolved_target is Heart:
             data.ball_target = resolved_target
