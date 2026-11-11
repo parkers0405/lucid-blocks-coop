@@ -53,6 +53,7 @@ var item_total_prev: int = -1
 var pending_breaks: Array = []
 var pickup_ms: Array = []
 var mined: int = 0
+var spawned: Dictionary = {}
 var items0: int = 0
 const LOCK_FLAGS := ["chest_lock_active", "chest_movement_locked", "lease_preparing", "lease_frozen", "lease_busy", "guest_checkpoint_busy", "reconnect_pending", "client_restore_in_progress", "receiving_host_world", "pickup_inventory_lock", "durable_pickup_busy", "terrain_sync_busy"]
 
@@ -143,6 +144,23 @@ func _item_total() -> int:
                     total += item.count
     return total
 
+# Per item id counts across inventories (the conservation oracle compares ids, not just totals).
+func _item_tally() -> Dictionary:
+    var tally: Dictionary = {}
+    for inventory in [Ref.player_inventory, Ref.player_hotbar, Ref.player_equipment]:
+        if is_instance_valid(inventory):
+            for item in inventory.items:
+                if item != null:
+                    tally[item.id] = int(tally.get(item.id, 0)) + item.count
+    return tally
+
+func _drops_tally() -> Dictionary:
+    var tally: Dictionary = {}
+    for node in get_tree().root.get_children():
+        if node.get_script() != null and node.get_script().resource_path == "res://main/items/dropped_item/dropped_item.gd" and node.item != null:
+            tally[node.item.id] = int(tally.get(node.item.id, 0)) + node.item.count
+    return tally
+
 func _drops_left() -> int:
     var total: int = 0
     for node in get_tree().root.get_children():
@@ -176,6 +194,8 @@ func _physics_process(_delta: float) -> void:
         pending_breaks.pop_front()
     if item_total_prev >= 0 and total > item_total_prev and not pending_breaks.is_empty():
         pickup_ms.append(Time.get_ticks_msec() - int(pending_breaks.pop_front()))
+    if total != item_total_prev:
+        _event("items", {"total": total, "tally": _item_tally()})
     item_total_prev = total
     var spawner = Ref.entity_spawner
     var row := {"t": Time.get_ticks_msec(), "dt": gap, "in": 1 if bot_active else 0, "mi": 1 if (Input.is_action_pressed("up") or Input.is_action_pressed("down")) else 0, "mv": snappedf(step, 0.001),
@@ -229,8 +249,11 @@ func _spawn_drop(block_id: int, at: Vector3) -> void:
     state.count = 1
     var drop = load("res://main/items/dropped_item/dropped_item.tscn").instantiate()
     drop.position = at
+    # Native stack merging is racy (solo gained 29..31 of 30), so the conservation oracle spawns non-merging drops.
+    drop.can_merge = false
     get_tree().get_root().add_child(drop)
     drop.initialize(state)
+    spawned[block_id] = int(spawned.get(block_id, 0)) + 1
 
 func _wait_marker(from_role: String, name_value: String, seconds: float = 120.0) -> bool:
     return await _wait(func(): return FileAccess.file_exists(scenario.path_join(from_role + "_" + name_value + ".json")), "marker " + from_role + "_" + name_value, seconds)
@@ -344,7 +367,7 @@ func _finish_io() -> void:
         file.store_string(JSON.stringify({"disk": fault_queue.disk, "jobs": fault_queue.records.size(), "failed": fault_queue.failed, "log": fault_queue.records.slice(0, 400)}))
         file.close()
     var pickups := FileAccess.open(scenario.path_join(role + "_pickups.json"), FileAccess.WRITE)
-    pickups.store_string(JSON.stringify({"pickup_ms": pickup_ms, "mined": mined, "items": _item_total(), "items0": items0, "drops_left": _drops_left()}))
+    pickups.store_string(JSON.stringify({"pickup_ms": pickup_ms, "mined": mined, "items": _item_total(), "items0": items0, "drops_left": _drops_left(), "tally": _item_tally(), "drops_tally": _drops_tally(), "spawned": spawned}))
     pickups.close()
 
 func _world_ready() -> bool:
