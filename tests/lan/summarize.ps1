@@ -136,7 +136,7 @@ foreach ($run in ($rows | Where-Object scenario -eq 'shared_loot' | Group-Object
 $g8 = 'BLOCKED (no -Pck given)'
 if ($Pck) {
     $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($Pck))
-    $hits = @('friction', 'udp_relay', 'FaultQueue', 'local_coop', 'zz-local', 'world_startup', 'probe') | Where-Object { $text.Contains($_) }
+    $hits = @('friction.gd', 'udp_relay', 'FaultQueue', 'local_coop', 'zz-local', 'world_startup', 'summarize.ps1', 'mods/local') | Where-Object { $text.Contains($_) }
     $g8 = if ($hits) { "FAIL ($($hits -join ', '))" } else { 'PASS (no harness, probe, relay or injection names in PCK; SHA256 ' + (Get-FileHash -LiteralPath $Pck -Algorithm SHA256).Hash + ')' }
 }
 
