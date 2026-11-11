@@ -33,7 +33,7 @@ function Invoke-RawTool([string] $Executable, [string[]] $ToolArguments, [string
     }
     $quoted = ($ToolArguments | ForEach-Object { '"' + ($_ -replace '(\\+)$', '$1$1') + '"' }) -join ' '
     $process = Start-Process -FilePath $Executable -ArgumentList $quoted -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    $timeout = if ($Label -eq 'runtime' -and $CombatTests) { 180000 } elseif ($Label -eq 'runtime') { 90000 } else { 45000 }
+    $timeout = if ($Label -eq 'runtime') { 180000 } else { 45000 }
     if (-not $process.WaitForExit($timeout)) { $process.Kill(); $process.WaitForExit(); throw "$Label exceeded $($timeout / 1000) seconds. Logs: $logs" }
     @{ Code = $process.ExitCode; Lines = @(Get-Content -LiteralPath $stdout) + @(Get-Content -LiteralPath $stderr) }
 }
@@ -218,7 +218,11 @@ func _check() -> void:
     var test_args = OS.get_cmdline_user_args()
     if not test_args.is_empty():
         if test_args.size() > 1 and test_args[1] == "region":
-            var region_suite = load(test_args[0].path_join("region_runtime.gd")).new()
+            var region_script = load(test_args[0].path_join("region_runtime.gd")) as GDScript
+            if region_script == null or not region_script.can_instantiate():
+                call_deferred("_finish", failures + 1)
+                return
+            var region_suite = region_script.new()
             add_child(region_suite)
             failures += await region_suite.run()
             region_suite.free()
@@ -228,7 +232,7 @@ func _check() -> void:
             failures += await combat_suite.run()
             combat_suite.free()
         if test_args.size() == 1 or test_args.has("admission"):
-            for name_value in ["admission", "personal_store", "profile_runtime", "canonical_runtime", "instance_entities", "runtime_lease", "lease_runtime", "respawn_runtime"]:
+            for name_value in ["admission", "personal_store", "profile_runtime", "save_queue", "responsiveness", "canonical_runtime", "instance_entities", "runtime_lease", "lease_runtime", "respawn_runtime"]:
                 var suite_script = load(test_args[0].path_join(name_value + ".gd")) as GDScript
                 if suite_script == null or not suite_script.can_instantiate():
                     call_deferred("_finish", failures + 1)

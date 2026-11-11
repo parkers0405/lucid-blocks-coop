@@ -768,7 +768,7 @@ func _input(event: InputEvent) -> void :
     if disabled:
         return
 
-    if can_switch_hotbar and MouseHandler.fully_captured:
+    if can_switch_hotbar and MouseHandler.fully_captured and (Ref.coop_manager == null or not Ref.coop_manager._is_client_gameplay_locked()):
         var new_index: int = held_item_index
         for i in range(6):
             if event.is_action_pressed("hotbar_%d" % (i + 1), false):
@@ -785,7 +785,7 @@ func _input(event: InputEvent) -> void :
             hold_item(new_index)
 
     var local_movement_enabled: bool = movement_enabled and MouseHandler.fully_captured
-    if local_movement_enabled and is_instance_valid(held_item) and is_action_pressed_safe("drop_item") and Input.is_action_just_pressed("drop_item"):
+    if local_movement_enabled and (Ref.coop_manager == null or not Ref.coop_manager._is_client_gameplay_locked()) and is_instance_valid(held_item) and is_action_pressed_safe("drop_item") and Input.is_action_just_pressed("drop_item"):
         %DropItems.drop_and_remove_from_inventory( %Hotbar, held_item_index)
 
     if local_movement_enabled and event is InputEventKey:
@@ -1038,6 +1038,9 @@ func camera_process(delta: float) -> void :
 
 
 func attack_process(data: Dictionary) -> void :
+    if Ref.coop_manager != null and Ref.coop_manager._is_client_gameplay_locked():
+        %BreakBlocks.break_block_stop()
+        return
     var attack_pressed: bool = is_action_pressed_safe("attack")
     if not is_interacting():
         if attack_pressed and Input.is_action_just_pressed("attack"):
@@ -1096,6 +1099,9 @@ func attack_process(data: Dictionary) -> void :
 
 
 func interaction_process(data: Dictionary, delta: float) -> void :
+    if Ref.coop_manager != null and Ref.coop_manager._is_client_gameplay_locked():
+        %BreakBlocks.break_block_stop()
+        return
     if disabled:
         return
     var interact_pressed: bool = _get_coop_interact_pressed(is_action_pressed_safe("interact"), delta)

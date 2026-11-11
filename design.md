@@ -1,8 +1,8 @@
 # Two-player co-op compatibility update
 
 ## Pillars
-1. Both players can play independently, including different dimensions.
-2. Host-owned saves preserve each player's world and inventory without duplication.
+1. Both players can explore independently, including different dimensions, with uninterrupted ordinary movement and camera control.
+2. Host-owned saves preserve each player's world and inventory without duplication; routine saves stay outside the input path.
 3. Joining and leaving work through Steam or LAN without restarting the game.
 
 Goal/ambition: complete the existing two-player compatibility mod; the new-game retention tiers do not apply. Target: Windows Steam build26206996, executable5.2.0.0 (automatic installed update2026-10-26; prior target5.1). Upstream baseline 57140c7abe02a921defa4184d474fb3e0ef841eb.
@@ -18,3 +18,5 @@ Playtest questions: Can both players travel apart safely? Does every acknowledge
 Applied lessons: require strict runtime error/completion gates rather than exit0; pin current installed build before compatibility work; preserve original native behavior and use local script checkpoints; atomic inventory/object commits and explicit source ownership prevent duplication/private-world loss. Evidence routes: playtest.md, retro.md and ../guide.md.
 
 Current implementation hypotheses: latched ownership plus final checkpoint/install acknowledgement prevents moving-boundary losses; exact-UUID durable pickup receipts prevent reconnect replay; manager-owned chest transaction lifetime preserves acknowledged inventory after UI closure. These remain unproven until their named local fixtures and retained two-process scenario pass. Two-account Steam invite/reconnect evidence is unavailable; no release claim follows from local contracts alone.
+
+Gameplay quality acceptance: routine terrain saves and pickup transactions preserve movement/camera; Close/Escape dismisses chest panels immediately; gliding survives ownership preparation; reconnect restores approved state; background file work requires no player setup. Verify focused contracts and bounded local gameplay rather than adding a permanent soak/test framework.

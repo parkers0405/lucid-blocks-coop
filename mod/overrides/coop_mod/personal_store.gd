@@ -8,6 +8,9 @@ const MAX_RESPAWNS: int = 4096
 const MAX_RESPAWN_BYTES: int = 256 * 1024
 var files := Files.new()
 
+static func stack_limit(id: int, limits: Dictionary) -> int:
+    return int(limits.get(id, 0))
+
 static func valid_state(state: Dictionary) -> bool:
     if var_to_bytes(state).size() > 8388608:
         return false
@@ -220,10 +223,13 @@ func instance_respawns(path: String, instance: String) -> Dictionary:
     var record: Dictionary = ledger["instances"].get(instance, {})
     return {"ok": true, "present": record.has("respawn_positions"), "positions": record.get("respawn_positions", {}).duplicate(true)}
 
-func save_checkpoint(path: String, state: Dictionary, revision: int, instance: String, dimension: String, bundles: Array, allowed_scenes: Dictionary, respawn_update: Dictionary = {}) -> Dictionary:
+func save_checkpoint(path: String, state: Dictionary, revision: int, instance: String, dimension: String, bundles: Array, allowed_scenes: Dictionary, respawn_update: Dictionary = {}, skip_unchanged: bool = false, expected_lease: int = -1) -> Dictionary:
     var ledger: Dictionary = read_ledger(path)
     if ledger.is_empty() or not valid_state(state) or not Files.valid_component(instance) or not Files.valid_component(dimension) or bundles.size() > 512 or var_to_bytes(bundles).size() > 8388608:
         return {}
+    if expected_lease >= 0 and int(ledger.get("lease", {}).get("epoch", 0)) != expected_lease:
+        return {}
+    var original: PackedByteArray = var_to_bytes(ledger) if skip_unchanged else PackedByteArray()
     var key: String = _profile_key(path)
     var profile: Dictionary = ledger["profiles"].get(key, _new_profile())
     if profile["revision"] != revision:
@@ -266,6 +272,12 @@ func save_checkpoint(path: String, state: Dictionary, revision: int, instance: S
         observed[uuid] = true
     record["observed"][key] = observed
     ledger["instances"][instance] = record
+    var normalized: Dictionary = state.duplicate(true)
+    normalized.erase("_coop_revision")
+    var previous_state: Dictionary = profile["state"].duplicate(true)
+    previous_state.erase("_coop_revision")
+    if skip_unchanged and normalized == previous_state and var_to_bytes(ledger) == original:
+        return profile
     profile["state"] = state.duplicate(true)
     profile["revision"] += 1
     ledger["profiles"][key] = profile
@@ -301,7 +313,7 @@ func collect_drop(path: String, revision: int, request: String, instance: String
     if profile.is_empty():
         return {}
     if profile["receipts"].has(request):
-        return profile
+        return _pickup_result(profile, ledger["instances"].get(instance, {}), uuid)
     var record: Dictionary = ledger["instances"].get(instance, {})
     if profile["revision"] != revision or record.is_empty() or not record["nodes"].has(uuid):
         return {}
@@ -311,11 +323,13 @@ func collect_drop(path: String, revision: int, request: String, instance: String
     var node: Dictionary = bundle["save_data"][record["dimension"]]["node"][uuid]
     var source: PackedInt32Array = PackedInt32Array()
     var position: Vector3i = Vector3i.ZERO
+    var source_items: Array = []
     for entry in node.values():
         if entry is Dictionary and entry.get("capacity") == 1 and entry.get("items") is Array and entry["items"].size() == 2:
             if not source.is_empty() or not entry["items"][0] is PackedInt32Array or not entry["items"][1] is Vector3i:
                 return {}
             source = entry["items"][0].duplicate()
+            source_items = entry["items"]
             position = entry["items"][1]
     if source.size() != 3 or source[0] <= 0 or source[1] <= 0:
         return {}
@@ -323,7 +337,7 @@ func collect_drop(path: String, revision: int, request: String, instance: String
     if maximum <= 0 or source[1] > maximum:
         return {}
     var remaining: int = source[1]
-    # Fill matching stacks before using empty slots. Publish only if it all fits.
+    # Fill matching stacks before empty slots; leave overflow in the world.
     for fill_empty_slots in [false, true]:
         for name_value in ["Hotbar", "Inventory"]:
             var inventory: Dictionary = profile["state"].get("node", {}).get("player", {}).get(name_value, {})
@@ -343,16 +357,25 @@ func collect_drop(path: String, revision: int, request: String, instance: String
                 items[index] = updated
                 items[index + 1] = position
                 remaining -= amount
-    if remaining != 0:
+    if remaining == source[1]:
         return {}
-    record["nodes"].erase(uuid)
-    record["owners"].erase(uuid)
-    record["tombstones"][uuid] = true
+    if remaining > 0:
+        source[1] = remaining
+        source_items[0] = source
+    else:
+        record["nodes"].erase(uuid)
+        record["owners"].erase(uuid)
+        record["tombstones"][uuid] = true
     profile["revision"] += 1
     profile["receipts"].append(request)
     if profile["receipts"].size() > 32:
         profile["receipts"].pop_front()
-    return profile if _write_ledger(path, ledger) else {}
+    return _pickup_result(profile, record, uuid) if _write_ledger(path, ledger) else {}
+
+static func _pickup_result(profile: Dictionary, record: Dictionary, uuid: String) -> Dictionary:
+    var result: Dictionary = profile.duplicate(true)
+    result["_coop_pickup_bundle"] = record.get("nodes", {}).get(uuid, {}).duplicate(true)
+    return result
 
 # Save the inventory and chest together so a failed write cannot lose items.
 func transfer(path: String, revision: int, request: String, inventory_name: String, inventory_index: int, chest_index: int, amount: int, deposit: bool, stack_limit: Callable) -> Dictionary:

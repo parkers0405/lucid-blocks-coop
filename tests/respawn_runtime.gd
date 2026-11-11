@@ -82,9 +82,9 @@ func run() -> int:
     check(captured == {"positions": {a: true}, "chunks": [ca]}, "capture includes explicit resident host grant only")
     var host_path: String = manager._profile_path("host")
     var guest_path: String = manager._profile_path("guest")
-    var host: Dictionary = manager._commit_player_checkpoint("host", state(0, captured["positions"], captured["chunks"]), "pocket:alice", 3, [])
+    var host: Dictionary = (await manager._commit_player_checkpoint("host", state(0, captured["positions"], captured["chunks"]), "pocket:alice", 3, []))
     check(host.get("revision") == 1 and not host["state"].has("_coop_respawns"), "private map commits atomically and is stripped from player profile")
-    var guest: Dictionary = manager._commit_player_checkpoint("guest", state(0, {b: true}, [cb]), "pocket:alice", 3, [])
+    var guest: Dictionary = (await manager._commit_player_checkpoint("guest", state(0, {b: true}, [cb]), "pocket:alice", 3, []))
     check(guest.get("revision") == 1 and manager.personal_store.instance_respawns(host_path, "pocket__alice")["positions"] == {a: true, b: true}, "authenticated visitor metadata merges disjoint same-instance coverage")
     check(manager.sent.size() == 2 and manager.sent[1]["positions"] == {b: true} and manager.sent[1]["chunks"] == [cb], "live metadata publication is scoped to committing actor coverage")
     manager.lease_frozen = true
@@ -103,15 +103,15 @@ func run() -> int:
     check(manager._capture_private_respawns()["positions"].has(b), "first newly granted capture retains canonical partner respawn")
     manager.chunk_authority.lease_owners[manager.ChunkAuthority.chunk_key("pocket:alice", cb)] = 2
     manager.lease_frozen = false
-    host = manager._commit_player_checkpoint("host", state(1, {}, [ca]), "pocket:alice", 3, [])
+    host = (await manager._commit_player_checkpoint("host", state(1, {}, [ca]), "pocket:alice", 3, []))
     check(host.get("revision") == 2 and manager.personal_store.instance_respawns(host_path, "pocket__alice")["positions"] == {b: true} and Ref.world.respawn_positions == {b: true, c: true}, "owner deletion preserves visitor and unobserved live points")
     var before: PackedByteArray = manager.personal_store.files._read_bytes(Store.storage_path(host_path))
-    check(manager._commit_player_checkpoint("host", state(2, {c: true}, [cc]), "pocket:alice", 3, []).is_empty() and manager.personal_store.files._read_bytes(Store.storage_path(host_path)) == before, "default-host unknown chunk is not metadata deletion authority")
-    check(manager._commit_player_checkpoint("guest", state(1, {a: true}, [ca]), "pocket:alice", 3, []).is_empty(), "visitor cannot claim host leased chunk")
+    check((await manager._commit_player_checkpoint("host", state(2, {c: true}, [cc]), "pocket:alice", 3, [])).is_empty() and manager.personal_store.files._read_bytes(Store.storage_path(host_path)) == before, "default-host unknown chunk is not metadata deletion authority")
+    check((await manager._commit_player_checkpoint("guest", state(1, {a: true}, [ca]), "pocket:alice", 3, [])).is_empty(), "visitor cannot claim host leased chunk")
     manager.resident.erase(ca)
-    check(manager._commit_player_checkpoint("host", state(2, {}, [ca]), "pocket:alice", 3, []).is_empty(), "host grant without current residency cannot delete metadata")
+    check((await manager._commit_player_checkpoint("host", state(2, {}, [ca]), "pocket:alice", 3, [])).is_empty(), "host grant without current residency cannot delete metadata")
     manager.resident.append(ca)
-    guest = manager._commit_player_checkpoint("guest", state(1, {}, [cb]), "pocket:alice", 3, [])
+    guest = (await manager._commit_player_checkpoint("guest", state(1, {}, [cb]), "pocket:alice", 3, []))
     check(guest.get("revision") == 2 and manager.personal_store.instance_respawns(host_path, "pocket__alice")["present"] and manager.personal_store.instance_respawns(host_path, "pocket__alice")["positions"].is_empty(), "last covered deletion preserves intentional empty map")
     manager.admitted_player_keys[2] = "guest"
     manager.peer_states[2] = {"dimension": 3, "pocket_owner_key": "alice", "dimension_instance_key": "pocket:alice", "player_key": "guest", "active": true}
@@ -121,7 +121,7 @@ func run() -> int:
     character["_coop_lease_epoch"] = manager.chunk_authority.lease_epoch
     character["pocket__guest"] = {"respawn_positions": {c: true}}
     character["pocket__guest_world"] = {"pocket__guest_chunk_block": {}, "pocket__guest_chunk_water": {}, "pocket__guest_chunk_water_awake": {}, "pocket__guest_chunk_fire": {}}
-    manager._store_guest_persistent_state("guest", "Guest fixture", character)
+    await manager._store_guest_persistent_state("guest", "Guest fixture", character)
     check(not Ref.save_file_manager.loaded_file.data.has("pocket__guest_world") and SaveFile._get_data(Ref.save_file_manager.loaded_file.data, "pocket__guest/respawn_positions", null) == null and not manager.personal_store.read_profile(guest_path)["state"].has("_coop_respawns"), "character packet cannot publish namespace world metadata around covered checkpoint")
     var stale: Dictionary = {"pocket__alice": {"respawn_positions": {a: true}}, "pocket": {"respawn_positions": {b: true}}}
     var read: Dictionary = manager.read_private_respawns(stale, 3, "alice")
@@ -142,7 +142,7 @@ func run() -> int:
     var cache_before: Dictionary = Ref.save_file_manager.loaded_file.data.duplicate(true)
     var live_before: Dictionary = Ref.world.respawn_positions.duplicate(true)
     manager.personal_store = FailedStore.new()
-    check(manager._commit_player_checkpoint("host", state(2, {a: true}, [ca]), "pocket:alice", 3, []).is_empty() and Ref.save_file_manager.loaded_file.data == cache_before and Ref.world.respawn_positions == live_before, "failed metadata checkpoint changes neither active map nor save cache")
+    check((await manager._commit_player_checkpoint("host", state(2, {a: true}, [ca]), "pocket:alice", 3, [])).is_empty() and Ref.save_file_manager.loaded_file.data == cache_before and Ref.world.respawn_positions == live_before, "failed metadata checkpoint changes neither active map nor save cache")
     manager.personal_store = Store.new()
     manager._merge_world_patch_into_cache({"dimension": 3, "pocket_owner_key": "alice", "respawn_positions": {c: true}, "world_data": {}})
     check(Ref.save_file_manager.loaded_file.data == cache_before, "old unscoped private terrain patch cannot replace metadata")

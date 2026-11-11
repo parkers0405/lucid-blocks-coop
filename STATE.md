@@ -1,15 +1,21 @@
-# Lucid Blocks co-op — state
-Updated 2026-11-10. Solo-maintainer simplification complete; ready for code review with existing gameplay limits.
+# Lucid Blocks co-op state
+Updated2026-11-11. Gameplay responsiveness and recovery update; PR is ready to merge within documented local verification limits.
 
-- Branch fix/review-ready-compatibility. Original target unchanged: game5.2.0.0/build26206996, Godot4.6double/GodotSteam4.17.1, original native libraries.
-- Removed 1,307 net code lines, including320 unused production lines. Tests23->13files; routine commands5->2. No active gameplay feature or persistence/authentication protection removed.
-- Production cuts:15 definition-only manager helpers,2 alternate test-only store APIs, permanently false multi-region path. Local loading and fail-closed native guards remain.
-- One builder: scripts/build_mod.ps1; -Test runs local contracts, -CombatTests is separate optional rendering regression. Removed duplicate exporter and5diagnostic-only modes. Profiles, explicit result/error/exit gates, deadlines and atomic publication remain.
-- Tests use actual checkpoint/lease APIs. Overlapping primitive tests and repeated wire mismatch runs consolidated; channel/batching and metadata-boundary/corruption checks retained. Old world-process diagnostic launcher retired; historical evidence remains in logs/Git.
-- Strict final c9adda97c9a44642afe55a8a2c04a2aa PASS326assertions/0failures+67scripts, exit0, noERROR/SCRIPT ERROR. Nested admission-data26excluded from total. Expected negative-case warnings/ObjectDB warning remain visible.
-- Installer/build fixtures PASS23assertions, work/solo-installer-final.log. Initial sandbox atomic Replace failed; unchanged outside-sandbox run passed.
-- Initial API-migration baseline dca42208832a4b9c9734f5bb4d51e0c1 PASS388+67. First lean-run f6b23f4020b44953befdb7c74528c3a4 failed a duplicate fixture variable; corrected name and made fixture load failures terminate promptly. Final rerun above passed.
-- Candidate work/solo-final-output/lucid-blocks-coop.pck SHA B6131661D78BF84D88E27A48E278132EB810A05B4BC1635EF225AB4CEA425E03. dist remains stale; use source builds.
-- Independent review found no significant issue or supported feature loss. Original install/native DLL/personal saves and102unrelated.import edits untouched. No owned test runtime remains.
-- Deferred: expanded live exploration/private visits/chest/reconnect/restart/soak, real Steam/human tests and optional rendered combat rerun. Earlier two-process smoke passed8assertions but strict shutdown failed10errors/role, also in original/offline controls; unresolved, never whitelisted.
-- Next: open review PR when requested. No PR/merge/main push/install/release performed. Local contracts do not certify a release.
+- Branch: fix/review-ready-compatibility. Preserve102unrelated.import edits and status-only test line endings.
+- Scope: smooth two-player gameplay with compatibility/functionality retained. No PR creation, merge, main push, installation or release performed.
+- Routine terrain snapshots preserve movement/camera and newer edits. Travel/quit/reconnect retain durable barriers.
+- Pure file IO uses Godot built-in WorkerThreadPool/FIFO; no external worker, service, hosting or player setup.
+- Pickups lock inventory actions only, conserve overflow and defer during gliding. Unchanged held/equipment slots keep instances.
+- Leases use native residency queries, sticky ownership and cached node modes. Recovery reconciles durable epochs and canonical objects before new saves; stale continuations are rejected.
+- Loading-safe dimension following seeds the destination anchor before native first-visit spawning. Detached entity bodies do not query physics motion.
+- Chest21slots/quantity/Close fit341x256logical; dismissal releases movement immediately while retaining pending inventory acknowledgement.
+- Protocol6 requires matching peers; existing save formats remain compatible.
+- Packed contractsdeec58d2fdc2475d93293fcea4bd11c5 PASS361assertions+queue+68scripts, exit0/noERROR. PackageSHA256925F75C7F733919623492EF847A45B5762686162A555442F3AAA78A18F823EDC.
+- Installer8e3d3fba3a94483ea406b24ef7bb9a05 PASS23 synthetic assertions. Original install and personal saves untouched.
+- Chest render/click4f7ed7a24d8c4b56bbfb6dfbdf184278:29checks,0failures; source/visual review complete.
+- Actual plain-artifact LAN84d749fff9804ba68dd10005676df3b7:19functional assertions PASS, both exit0. Reconnect, independent native loading, Naraka travel, following and shutdown recovery complete; no mod script/RPC/physics-space errors or crash.
+- Strict LAN FAIL retained: host12/guest13errors =2/3offline Steam achievement calls+10native shutdown categories each. Exact native shutdown causes unresolved; see playtest.md.
+- Final six-second input sample361frames/0disabled outside handoff vs earlier baseline361/11; max43.178ms. No broad FPS guarantee.
+- Optional combat55functional assertions and visibility pass; strict8native shutdown errors remain. Baseline shader completion blocked. Expanded LAN native Steam/shutdown errors are tracked separately from gameplay assertions.
+- Real two-account Steam invites and subjective human playfeel remain untested by requested scope. Dated details/failures: playtest.md; architecture.md and gameplay-audit.md describe current behavior.
+- Next: maintainer PR review; feature branch publication only. No actual merge, release or installation.

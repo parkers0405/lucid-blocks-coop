@@ -51,7 +51,8 @@ func _ready() -> void :
     if not Ref.player_fuser.fusion_table_loaded:
         await Ref.player_fuser.fusion_table_done_loading
 
-    set_fusion_table(Ref.player_fuser.fusion_table, Ref.player_fuser.fusion_table_width)
+    # Native chunk workers index this array mutably; keep their copy unshared.
+    set_fusion_table(Ref.player_fuser.fusion_table.duplicate(), Ref.player_fuser.fusion_table_width)
     Ref.save_file_manager.settings_updated.connect(_on_settings_updated)
     Ref.player.get_node("%Curse").delusion_changed.connect(_on_delusion_updated)
     Ref.sky.sky_tint_updated.connect(_on_sky_tint_updated)

@@ -60,13 +60,17 @@ func run() -> int:
     check(store.collect_drop(spill_path, 1, "c".repeat(64), "spill", UUID, func(_id): return 64).is_empty() and store.files._read_bytes(Store.storage_path(path)) == original, "full inventory retains drop and bytes")
     full["node"]["player"]["Inventory"]["items"][0][1] = 63
     check(store.save_checkpoint(spill_path, full, 1, "spill", "naraka", [bundle], {DROP: true}).get("revision") == 2, "partially fitting inventory fixture committed")
-    original = store.files._read_bytes(Store.storage_path(path))
-    check(store.collect_drop(spill_path, 2, "c".repeat(64), "spill", UUID, func(_id): return 64).is_empty() and store.files._read_bytes(Store.storage_path(path)) == original, "partial fit cannot remove or partially credit drop")
+    var partial: Dictionary = store.collect_drop(spill_path, 2, "c".repeat(64), "spill", UUID, func(_id): return 64)
+    var remainder: Dictionary = partial.get("_coop_pickup_bundle", {})
+    var remainder_count: int = remainder["save_data"]["naraka"]["node"][UUID][""]["items"][0][1]
+    check(partial.get("revision") == 3 and partial["state"]["node"]["player"]["Inventory"]["items"][0][1] == 64 and remainder_count == 3, "partial pickup fills one slot and durably retains three items")
+    check(store.collect_drop(spill_path, 2, "c".repeat(64), "spill", UUID, func(_id): return 64).get("revision") == 3, "partial pickup retry returns existing result")
+    full = partial["state"].duplicate(true)
     full["node"]["player"]["Inventory"]["items"][2] = PackedInt32Array()
-    check(store.save_checkpoint(spill_path, full, 2, "spill", "naraka", [bundle], {DROP: true}).get("revision") == 3, "spill inventory fixture committed")
-    var split: Dictionary = store.collect_drop(spill_path, 3, "c".repeat(64), "spill", UUID, func(_id): return 64)
+    check(store.save_checkpoint(spill_path, full, 3, "spill", "naraka", [remainder], {DROP: true}).get("revision") == 4, "remainder and freed slot committed")
+    var split: Dictionary = store.collect_drop(spill_path, 4, "d".repeat(64), "spill", UUID, func(_id): return 64)
     var split_items: Array = split["state"]["node"]["player"]["Inventory"]["items"]
-    check(split_items[0][1] == 64 and split_items[2][1] == 3 and store.instance_bundles(path, "spill")["bundles"].is_empty(), "cross-slot spill conserves all four items and removes exact UUID")
+    check(split_items[0][1] == 64 and split_items[2][1] == 3 and store.instance_bundles(path, "spill")["bundles"].is_empty(), "second pickup conserves all four items and removes exact UUID")
     var corrupt: Dictionary = store.read_ledger(path)
     corrupt["lease"]["objects"]["broken"] = 8
     check(store.files._replace_file(Store.storage_path(path), var_to_bytes(corrupt)) and store.read_ledger(path).is_empty(), "corrupt durable lease fails closed")

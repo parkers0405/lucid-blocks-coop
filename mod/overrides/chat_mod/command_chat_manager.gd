@@ -42,6 +42,7 @@ var selected_suggestion_index: int = -1
 
 var COMMAND_REGISTRY: Dictionary = {
     "/help": {"desc": "Show list of commands", "args": []},
+    "/enderchest": {"desc": "Make an empty cache cube a personal chest (host only)", "args": []},
     "/tp": {"desc": "Teleport to player or coordinates", "args": ["<target>", "[destination]"]},
     "/gamemode": {"desc": "Change player game mode", "args": ["<creative|survival|spectator>"]},
     "/spawn": {"desc": "Spawn an entity at your location", "args": ["<entity>", "[count]"]},
@@ -257,6 +258,9 @@ func _refresh_chat_layout() -> void:
 
 
 func _can_open_chat() -> bool:
+    var coop = Ref.coop_manager
+    if is_instance_valid(coop) and (coop.reconnect_pending or coop.client_restore_in_progress or coop.receiving_host_world or is_instance_valid(coop.chest_panel)):
+        return false
     return is_instance_valid(Ref.main) \
         and is_instance_valid(Ref.world) \
         and Ref.main.loaded \

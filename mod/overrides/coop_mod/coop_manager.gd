@@ -8,13 +8,21 @@ const SessionIdentity = preload("res://coop_mod/session_identity.gd")
 var identity_store := SessionIdentity.new()
 var admitted_player_keys: Dictionary = {}
 var authenticated_local_key: String = ""
+var local_identity_key: String = ""
 var identity_challenges: Dictionary = {}
 const PersonalStore = preload("res://coop_mod/personal_store.gd")
 var personal_store := PersonalStore.new()
+const SaveQueue = preload("res://coop_mod/save_queue.gd")
+var save_queue := SaveQueue.new()
+var host_profile_busy: bool = false
+var host_profile_last_ok: bool = true
+var region_commit_busy: bool = false
 var profile_revision: int = 0
 var profile_commit_pending: bool = false
 var profile_commit_sent_at: int = 0
 var restored_host_profile_path: String = ""
+var restored_host_profile_generation: int = -1
+var restored_host_profile_file_id: int = 0
 var guest_world_loaded: bool = false
 var host_profile_timer: float = 0.0
 var chest_sessions: Dictionary = {}
@@ -25,6 +33,9 @@ var chest_active_token: String = ""
 var chest_close_requested: bool = false
 var chest_lock_active: bool = false
 var chest_was_disabled: bool = false
+var chest_movement_locked: bool = false
+var pending_peer_teleport: int = 0
+var pending_peer_instance: String = ""
 var chest_menu_process_mode: int = Node.PROCESS_MODE_INHERIT
 var chest_queued_pickups: Array = []
 var chest_deferred_death: String = ""
@@ -34,6 +45,7 @@ var terrain_epoch: String = ""
 var terrain_sync_timer: float = 0.0
 var terrain_sync_busy: bool = false
 var guest_checkpoint_busy: bool = false
+var guest_checkpoint_locks_player: bool = false
 var guest_checkpoint_was_disabled: bool = false
 var canonical_apply_busy: bool = false
 var pending_canonical_patches: Array = []
@@ -48,12 +60,18 @@ var lease_ack: Dictionary = {}
 var lease_phase: String = ""
 var lease_install_index: int = 0
 var lease_install_busy: bool = false
+var lease_pending_install_epoch: int = 0
+var lease_pending_previous_chunks: Dictionary = {}
 var lease_was_disabled: bool = false
 var lease_notice_timer: float = 0.0
 var lease_guest_chunks: Array = []
 var lease_guest_instance: String = ""
 var lease_guest_positions: Dictionary = {}
+var lease_residency_key: String = ""
+var lease_resident_chunks: Array = []
 var pickup_pending: Dictionary = {}
+var durable_pickup_busy: bool = false
+var lease_probe_busy: bool = false
 var pickup_checkpoint_allowed: bool = false
 var lease_started_at: int = 0
 var lease_origins: Dictionary = {}
@@ -94,7 +112,6 @@ func _bundle_runtime_owner(bundle: Dictionary, instance: String) -> int:
 func _freeze_lease_runtime() -> void:
     lease_started_at = Time.get_ticks_msec()
     lease_frozen = true
-    Ref.player.disabled = true
     Ref.world.simulate_enabled = false
     if is_instance_valid(Ref.entity_spawner):
         _set_lease_node_mode(Ref.entity_spawner, false)
@@ -108,10 +125,13 @@ func _resume_lease_runtime() -> void:
     if is_instance_valid(Ref.entity_spawner):
         _set_lease_node_mode(Ref.entity_spawner, true)
     if _can_sample_player():
-        Ref.player.disabled = lease_was_disabled or guest_checkpoint_busy or chest_lock_active or local_downed or reconnect_pending or client_restore_in_progress
+        Ref.player.disabled = lease_was_disabled or (guest_checkpoint_busy and guest_checkpoint_locks_player) or chest_movement_locked or local_downed or reconnect_pending or client_restore_in_progress
     _enforce_runtime_leases()
 
 func _set_lease_node_mode(node: Node, enabled: bool) -> void:
+    var child_hook: Callable = _on_lease_child_added.bind(node)
+    if not node.child_entered_tree.is_connected(child_hook):
+        node.child_entered_tree.connect(child_hook)
     if not enabled:
         if not node.has_meta("coop_lease_previous_mode"):
             node.set_meta("coop_lease_previous_mode", int(node.process_mode))
@@ -122,6 +142,9 @@ func _set_lease_node_mode(node: Node, enabled: bool) -> void:
     for child in node.get_children():
         _set_lease_node_mode(child, enabled)
 
+func _on_lease_child_added(child: Node, parent: Node) -> void:
+    _set_lease_node_mode(child, not parent.has_meta("coop_lease_previous_mode"))
+
 func _enforce_runtime_leases() -> void:
     if lease_preparing and not lease_frozen:
         return
@@ -129,7 +152,9 @@ func _enforce_runtime_leases() -> void:
         if not is_instance_valid(node) or node is Player or is_remote_player_proxy(node):
             continue
         var locally_owned: bool = owns_runtime_node(node)
-        _set_lease_node_mode(node, locally_owned)
+        if (not node.has_meta("coop_lease_enabled") or node.get_meta("coop_lease_enabled") != locally_owned):
+            _set_lease_node_mode(node, locally_owned)
+            node.set_meta("coop_lease_enabled", locally_owned)
         if not locally_owned:
             if not node.has_meta("coop_lease_previous_disabled"):
                 node.set_meta("coop_lease_previous_disabled", bool(node.disabled))
@@ -137,8 +162,9 @@ func _enforce_runtime_leases() -> void:
         elif node.has_meta("coop_lease_previous_disabled"):
             node.disabled = bool(node.get_meta("coop_lease_previous_disabled"))
             node.remove_meta("coop_lease_previous_disabled")
-        if node is Gel and is_instance_valid(node.softbody):
+        if node is Gel and is_instance_valid(node.softbody) and (not node.softbody.has_meta("coop_lease_enabled") or node.softbody.get_meta("coop_lease_enabled") != locally_owned):
             _set_lease_node_mode(node.softbody, locally_owned)
+            node.softbody.set_meta("coop_lease_enabled", locally_owned)
 
 func can_mutate_runtime_node(node: Node3D) -> bool:
     return not lease_preparing and (node != Ref.player or not chest_lock_active) and owns_runtime_node(node)
@@ -176,7 +202,7 @@ func apply_leased_entity_ignite(uuid: String, epoch: String) -> void:
 
 func _drain_lease_mutations() -> bool:
     lease_preparing = true
-    Ref.player.disabled = true
+    _stop_local_mutation_actions(false)
     var deadline: int = Time.get_ticks_msec() + 5000
     while Time.get_ticks_msec() < deadline:
         var pending: bool = false
@@ -191,30 +217,68 @@ func _drain_lease_mutations() -> bool:
 func _local_loaded_lease_chunks() -> Array:
     if not _can_sample_player():
         return []
-    var prefix: String = _resolve_dimension_namespace(int(Ref.world.current_dimension), get_active_pocket_owner_key()) + "_"
-    Ref.world.register_loaded_chunks()
-    var data: Dictionary = {}
-    Ref.world.save_data(data, prefix)
-    var chunks: Array = data.get(prefix + "world", {}).get(prefix + "chunk_block", {}).keys()
+    var center: Vector3i = _lease_chunk(Ref.player.global_position)
+    var radius: int = mini(int(Ref.world.instance_radius), int(ChunkAuthority.RADIUS))
+    var key: String = "%s|%s|%s|%s" % [Ref.world.get_instance_id(), get_active_dimension_instance_key(), center, radius]
+    if key == lease_residency_key and Ref.world.is_all_loaded():
+        return lease_resident_chunks
+    # Native save_data contains dirty chunks, not the loaded simulation bubble.
+    var extent: int = ceili(radius / 16.0) + 1
+    var chunks: Array = []
+    for y in range(-extent, extent + 1):
+        for z in range(-extent, extent + 1):
+            for x in range(-extent, extent + 1):
+                var chunk: Vector3i = center + Vector3i(x, y, z) * 16
+                if Ref.world.is_position_loaded(Vector3(chunk) + Vector3(8, 8, 8)):
+                    chunks.append(chunk)
     if chunks.size() > 8192:
         status_message = "Loaded chunk lease exceeds the safe handoff bound"
         _update_status_text()
         return []
+    if not chunks.is_empty() and Ref.world.is_all_loaded():
+        lease_residency_key = key
+        lease_resident_chunks = chunks
     return chunks
 
+
+func _record_host_residency() -> void:
+    if not multiplayer.is_server() or chunk_authority.lease_epoch == 0 or not _can_sample_player():
+        return
+    var resident: Dictionary = {}
+    var instance: String = get_active_dimension_instance_key()
+    for chunk in _local_loaded_lease_chunks():
+        var key: String = ChunkAuthority.chunk_key(instance, chunk)
+        resident[key] = true
+        # An absent grant already means host ownership; no peer handoff is needed.
+        if not chunk_authority.lease_owners.has(key):
+            chunk_authority.lease_owners[key] = 1
+    for key in chunk_authority.lease_owners.keys():
+        if chunk_authority.lease_owners[key] == 1 and not resident.has(key):
+            chunk_authority.lease_owners.erase(key)
+
 func _lease_proposal() -> Dictionary:
-    var chunks: Dictionary = {}
+    var chunks: Dictionary = chunk_authority.lease_owners.duplicate()
     var host: Dictionary = _capture_local_state()
     var guest: Dictionary = {}
     for peer in admitted_player_keys:
         guest = peer_states.get(peer, {})
     for entry in [{"instance": get_active_dimension_instance_key(), "chunks": _local_loaded_lease_chunks()}, {"instance": lease_guest_instance, "chunks": lease_guest_chunks}]:
         for chunk in entry["chunks"]:
-            chunks[ChunkAuthority.chunk_key(entry["instance"], chunk)] = ChunkAuthority.owner(chunk, entry["instance"], host, guest)
+            var key: String = ChunkAuthority.chunk_key(entry["instance"], chunk)
+            var desired: int = ChunkAuthority.owner(chunk, entry["instance"], host, guest)
+            if chunks.get(key, 1) == 2 and entry["instance"] == lease_guest_instance and lease_guest_chunks.has(chunk) and (host.get("dimension_instance_key") != entry["instance"] or (Vector3(chunk) + Vector3(8, 8, 8)).distance_to(host.get("position", Vector3.INF)) > ChunkAuthority.HOST_RADIUS):
+                desired = 2
+            chunks[key] = desired
     return chunks
 
+func _lease_owners_changed(proposal: Dictionary) -> bool:
+    for key in proposal:
+        if proposal[key] != chunk_authority.lease_owners.get(key, 1):
+            return true
+    return false
+
 func _lease_objects_changed(chunks: Dictionary) -> bool:
-    var ledger: Dictionary = personal_store.read_ledger(_profile_path(_get_local_player_key()))
+    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [_profile_path(_get_local_player_key())], {})
     var positions: Dictionary = lease_guest_positions.duplicate()
     for node in _get_live_tracked_entities() + _get_live_tracked_drops():
         if is_instance_valid(node) and owns_runtime_node(node):
@@ -236,7 +300,9 @@ func _tick_runtime_lease(delta: float) -> void:
     if lease_busy and Time.get_ticks_msec() - lease_started_at > 15000 and not multiplayer.is_server():
         _begin_reconnect_flow("Lease installation timed out; restoring canonical world")
         return
-    if not _has_live_peer() or not _can_sample_player() or lease_busy or chest_lock_active:
+    if not _has_live_peer() or not _is_local_session_player_active() or lease_busy or chest_lock_active:
+        return
+    if not multiplayer.is_server() and (not guest_persistent_ready or receiving_host_world or client_restore_in_progress or reconnect_pending):
         return
     lease_notice_timer += delta
     if lease_notice_timer < 0.5:
@@ -248,15 +314,23 @@ func _tick_runtime_lease(delta: float) -> void:
             if is_instance_valid(node) and owns_runtime_node(node):
                 positions[_get_sync_uuid(node)] = node.global_position
         request_runtime_lease.rpc_id(1, get_active_dimension_instance_key(), _local_loaded_lease_chunks(), positions)
-    elif not admitted_player_keys.is_empty() and not lease_guest_instance.is_empty():
+    elif not admitted_player_keys.is_empty() and not lease_guest_instance.is_empty() and not lease_probe_busy:
+        lease_probe_busy = true
+        var probe_generation: int = save_queue.generation
+        var probe_file = Ref.save_file_manager.loaded_file
+        var probe_instance: String = get_active_dimension_instance_key()
+        var probe_epoch: String = terrain_epoch
+        _record_host_residency()
         var proposal: Dictionary = _lease_proposal()
-        if proposal != chunk_authority.lease_owners or chunk_authority.lease_epoch == 0 or _lease_objects_changed(proposal):
+        var changed: bool = _lease_owners_changed(proposal) or chunk_authority.lease_epoch == 0 or await _lease_objects_changed(proposal)
+        lease_probe_busy = false
+        if changed and _same_save_context(probe_generation, probe_file) and _can_sample_player() and probe_instance == get_active_dimension_instance_key() and probe_epoch == terrain_epoch and not lease_busy and not durable_pickup_busy:
             _handoff_runtime_lease.call_deferred(proposal)
 
 @rpc("any_peer", "call_remote", "reliable")
 func request_runtime_lease(instance: String, chunks: Array, positions: Dictionary) -> void:
     var sender: int = multiplayer.get_remote_sender_id()
-    if not multiplayer.is_server() or not admitted_player_keys.has(sender) or peer_states.get(sender, {}).get("dimension_instance_key") != instance or chunks.size() > 8192 or positions.size() > 512:
+    if not multiplayer.is_server() or not admitted_player_keys.has(sender) or not peer_states.get(sender, {}).get("active", false) or peer_states.get(sender, {}).get("downed", false) or peer_states.get(sender, {}).get("dimension_instance_key") != instance or chunks.size() > 8192 or positions.size() > 512:
         return
     for chunk in chunks:
         if not chunk is Vector3i:
@@ -280,27 +354,29 @@ func _lease_ack_timeout_ms() -> int:
     return 10000
 
 func _handoff_runtime_lease(proposal: Dictionary) -> void:
-    if lease_busy or not _has_live_peer() or chest_lock_active:
+    if lease_busy or not _has_live_peer() or chest_lock_active or not chest_sessions.is_empty() or not _is_local_session_player_active():
         return
     lease_busy = true
     lease_token = SessionIdentity.random_id()
     var token: String = lease_token
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     lease_ack = {}
     lease_phase = "collect"
     lease_was_disabled = guest_checkpoint_was_disabled if guest_checkpoint_busy else Ref.player.disabled
     if not await _drain_lease_mutations():
-        if lease_token == token:
+        if lease_token == token and _same_save_context(generation, file):
             _resume_lease_runtime()
         return
-    if lease_token != token:
+    if lease_token != token or not _same_save_context(generation, file):
         return
     _freeze_lease_runtime()
     # Save the old owners' final state before changing any ownership.
     lease_checkpoint_allowed = true
     freeze_runtime_lease.rpc(token, terrain_epoch)
-    var local_ok: bool = await _await_local_world_checkpoint()
+    var local_ok: bool = await _await_local_world_checkpoint(0, true)
     var remote_ok: bool = await _wait_lease_ack(token)
-    if lease_token != token:
+    if lease_token != token or not _same_save_context(generation, file):
         return
     lease_checkpoint_allowed = false
     if not local_ok or not remote_ok:
@@ -309,7 +385,9 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
         _resume_lease_runtime()
         return
     var path: String = _profile_path(_get_local_player_key())
-    var ledger: Dictionary = personal_store.read_ledger(path)
+    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
+    if lease_token != token or not _same_save_context(generation, file):
+        return
     var objects: Dictionary = {}
     var transfers: Array = []
     var guest_key: String = str(admitted_player_keys.values()[0])
@@ -323,16 +401,23 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
             if record["owners"][uuid] != key:
                 transfers.append({"instance": instance, "uuid": uuid, "old": record["owners"][uuid], "new": key})
     var epoch: int = maxi(chunk_authority.lease_epoch, int(ledger.get("lease", {}).get("epoch", 0))) + 1
-    if not personal_store.commit_lease(path, epoch, proposal, objects, transfers):
+    var committed: bool = await _store_job(personal_store, "commit_lease", [path, epoch, proposal, objects, transfers], false)
+    if lease_token != token or not _same_save_context(generation, file):
+        return
+    if not committed:
         cancel_runtime_lease.rpc(token, terrain_epoch)
         _resume_lease_runtime()
         return
     var previous_chunks: Dictionary = chunk_authority.lease_owners.duplicate()
+    lease_pending_install_epoch = epoch
+    lease_pending_previous_chunks = previous_chunks
     terrain_epoch = auth_session_nonce + ":" + str(epoch)
     chunk_authority.install_lease(epoch, proposal, objects)
     # Both sides stay frozen until all terrain, objects and maps are installed.
-    var local_payload: Dictionary = _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), previous_chunks)
-    var remote_payload: Dictionary = _lease_install_payload(lease_guest_instance, lease_guest_chunks, previous_chunks)
+    var local_payload: Dictionary = await _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), previous_chunks)
+    var remote_payload: Dictionary = await _lease_install_payload(lease_guest_instance, lease_guest_chunks, previous_chunks, 2)
+    if lease_token != token or not _same_save_context(generation, file):
+        return
     if local_payload.is_empty() or remote_payload.is_empty():
         status_message = "Cannot construct bounded lease installation; gameplay remains frozen"
         _update_status_text()
@@ -342,12 +427,15 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
         if not await _install_lease_payload(part):
             local_ok = false
             break
-        if lease_token != token:
+        if lease_token != token or not _same_save_context(generation, file):
             return
+    if local_ok:
+        lease_pending_install_epoch = 0
+        lease_pending_previous_chunks.clear()
     remote_ok = local_ok
     if local_ok:
         for index in range(remote_payload["parts"].size()):
-            if lease_token != token:
+            if lease_token != token or not _same_save_context(generation, file):
                 return
             lease_phase = "install_" + str(index)
             lease_ack = {}
@@ -355,7 +443,7 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
             if not await _wait_lease_ack(token):
                 remote_ok = false
                 break
-    if lease_token != token:
+    if lease_token != token or not _same_save_context(generation, file):
         return
     if local_ok and remote_ok:
         resume_runtime_lease.rpc(token, terrain_epoch)
@@ -366,19 +454,29 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
 
 @rpc("authority", "call_remote", "reliable")
 func freeze_runtime_lease(token: String, epoch: String) -> void:
-    if multiplayer.is_server() or epoch != terrain_epoch or lease_busy or chest_lock_active:
+    if multiplayer.is_server() or epoch != terrain_epoch or lease_busy:
         return
+    if chest_lock_active or not _is_local_session_player_active():
+        acknowledge_runtime_lease.rpc_id(1, token, "collect", terrain_epoch, false)
+        return
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     lease_token = token
     lease_install_index = 0
     lease_busy = true
     lease_was_disabled = guest_checkpoint_was_disabled if guest_checkpoint_busy else Ref.player.disabled
-    if not await _drain_lease_mutations():
+    var drained: bool = await _drain_lease_mutations()
+    if token != lease_token or not _same_save_context(generation, file):
+        return
+    if not drained:
         acknowledge_runtime_lease.rpc_id(1, token, "collect", terrain_epoch, false)
         _resume_lease_runtime()
         return
     _freeze_lease_runtime()
     lease_checkpoint_allowed = true
-    var ok: bool = await _await_local_world_checkpoint()
+    var ok: bool = await _await_local_world_checkpoint(0, true)
+    if token != lease_token or not _same_save_context(generation, file):
+        return
     lease_checkpoint_allowed = false
     acknowledge_runtime_lease.rpc_id(1, token, "collect", terrain_epoch, ok)
 
@@ -405,10 +503,14 @@ func install_runtime_lease(token: String, epoch: String, revision: int, chunks: 
             return
     elif revision != chunk_authority.lease_epoch or chunks != chunk_authority.lease_owners or objects != chunk_authority.lease_objects or epoch != terrain_epoch:
         return
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     lease_install_busy = true
     lease_started_at = Time.get_ticks_msec()
     terrain_epoch = epoch
     var ok: bool = await _install_lease_payload(payload)
+    if token != lease_token or epoch != terrain_epoch or not _same_save_context(generation, file):
+        return
     if ok:
         lease_install_index += 1
     lease_install_busy = false
@@ -419,37 +521,47 @@ func resume_runtime_lease(token: String, epoch: String) -> void:
     if token == lease_token and epoch == terrain_epoch:
         _resume_lease_runtime()
 
-func _lease_install_payload(instance: String, resident: Array, previous_chunks: Dictionary) -> Dictionary:
+func _lease_install_payload(instance: String, resident: Array, previous_chunks: Dictionary, recipient: int = 1) -> Dictionary:
+    var token: String = lease_token
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     var parsed: Dictionary = _parse_dimension_instance_key(instance)
     if parsed.is_empty():
         return {}
     var dimension: int = parsed["dimension"]
     var owner: String = str(parsed.get("owner_key", ""))
-    var prefix: String = _resolve_dimension_namespace(dimension, owner) + "_"
-    var stored: Dictionary = region_checkpoint.read_regions(_get_checkpoint_chunks_directory(), prefix.trim_suffix("_"), _checkpoint_block_ids())
-    var nodes: Dictionary = personal_store.instance_bundles(_profile_path(_get_local_player_key()), _ledger_instance_key(instance))
-    if not stored.get("ok", false) or not nodes["ok"]:
+    var dimension_namespace: String = _resolve_dimension_namespace(dimension, owner)
+    var ledger_instance: String = _ledger_instance_key(instance)
+    if ledger_instance.is_empty() or not RegionCheckpoint.valid_component(dimension_namespace):
+        return {}
+    var prefix: String = dimension_namespace + "_"
+    var changed: Array = []
+    for chunk in resident:
+        var key: String = ChunkAuthority.chunk_key(instance, chunk)
+        if previous_chunks.get(key, 1) != chunk_authority.lease_owners.get(key, 1):
+            changed.append(chunk)
+    var stored: Dictionary = {"ok": true, "regions": {}}
+    if not changed.is_empty():
+        stored = await _store_job(region_checkpoint, "read_regions", [_get_checkpoint_chunks_directory(), prefix.trim_suffix("_"), _checkpoint_block_ids()], {})
+        if lease_token != token or not _same_save_context(generation, file):
+            return {}
+    if not stored.get("ok", false):
         return {}
     var root: Dictionary = {}
     for channel in RegionCheckpoint.CHANNELS:
         root[prefix + channel] = {}
         for region in stored["regions"].values():
             root[prefix + channel].merge(region[channel], true)
-    var ledger: Dictionary = personal_store.read_ledger(_profile_path(_get_local_player_key()))
-    var deleted: Array = ledger.get("instances", {}).get(_ledger_instance_key(instance), {}).get("tombstones", {}).keys()
-    var changed: Array = []
-    for chunk in resident:
-        var key: String = ChunkAuthority.chunk_key(instance, chunk)
-        if previous_chunks.get(key, 1) != chunk_authority.lease_owners.get(key, 1):
-            changed.append(chunk)
+    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [_profile_path(_get_local_player_key())], {})
+    if lease_token != token or not _same_save_context(generation, file) or ledger.is_empty():
+        return {}
+    var record: Dictionary = ledger.get("instances", {}).get(ledger_instance, {})
+    var deleted: Array = record.get("tombstones", {}).keys()
     var base: Dictionary = {"epoch": terrain_epoch, "dimension_instance_key": instance, "dimension": dimension, "pocket_owner_key": owner, "world_data": {}, "bundles": [], "deleted": []}
     var parts: Array = []
     if _is_private_instance_dimension(dimension):
-        var respawns: Dictionary = personal_store.instance_respawns(_profile_path(_get_local_player_key()), _ledger_instance_key(instance))
-        if not respawns.get("ok", false):
-            return {}
         var positions: Dictionary = {}
-        for position in respawns["positions"]:
+        for position in record.get("respawn_positions", {}):
             if resident.has(PersonalStore.respawn_chunk(position)):
                 positions[position] = true
         var update: Dictionary = {"positions": positions, "chunks": resident.duplicate()}
@@ -461,10 +573,12 @@ func _lease_install_payload(instance: String, resident: Array, previous_chunks: 
     for batch in ChunkAuthority.batches(changed):
         var part: Dictionary = base.duplicate(true)
         part["world_data"] = _filter_world_data_to_chunk_positions({prefix + "world": root}, prefix, batch)
-        parts.append(part)
+        var channels: Dictionary = part["world_data"].get(prefix + "world", {})
+        if channels.values().any(func(chunks): return not chunks.is_empty()):
+            parts.append(part)
     var relevant: Array = []
-    for bundle in nodes["bundles"]:
-        if resident.has(_lease_chunk(bundle["position"])) or is_instance_valid(_find_existing_entity_by_uuid(bundle["uuid"])) or is_instance_valid(_find_existing_drop_by_uuid(bundle["uuid"])):
+    for bundle in record.get("nodes", {}).values():
+        if _bundle_runtime_owner(bundle, instance) == recipient or resident.has(_lease_chunk(bundle["position"])) or is_instance_valid(_find_existing_entity_by_uuid(bundle["uuid"])) or is_instance_valid(_find_existing_drop_by_uuid(bundle["uuid"])):
             relevant.append(bundle)
     for batch in ChunkAuthority.batches(relevant):
         var part: Dictionary = base.duplicate(true)
@@ -481,10 +595,19 @@ func _lease_install_payload(instance: String, resident: Array, previous_chunks: 
             return {}
     return {"parts": parts}
 
+
 func _install_lease_payload(payload: Dictionary) -> bool:
     if payload.is_empty() or payload.get("dimension_instance_key") != get_active_dimension_instance_key() or not lease_frozen:
         return false
+    var token: String = lease_token
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
+    var world = Ref.world
+    var instance: String = get_active_dimension_instance_key()
+    var epoch: String = terrain_epoch
     if not await _apply_canonical_terrain(payload):
+        return false
+    if token != lease_token or not _same_save_context(generation, file) or world != Ref.world or instance != get_active_dimension_instance_key() or epoch != terrain_epoch or not lease_frozen:
         return false
     if canonical_apply_busy or not pending_canonical_patches.is_empty():
         return false
@@ -645,7 +768,7 @@ func _private_respawn_checkpoint(key: String, state: Dictionary, instance: Strin
         if _has_live_peer() or lease_busy or rank == 2:
             if chunk_authority.lease_owners.get(ChunkAuthority.chunk_key(instance, chunk), 0) != rank:
                 return {"ok": false}
-    var canonical: Dictionary = personal_store.instance_respawns(_profile_path(key), _ledger_instance_key(instance))
+    var canonical: Dictionary = await _store_job(personal_store, "instance_respawns", [_profile_path(key), _ledger_instance_key(instance)], {"ok": false})
     if not canonical["ok"]:
         return {"ok": false}
     if not canonical["present"]:
@@ -659,18 +782,21 @@ func _private_respawn_checkpoint(key: String, state: Dictionary, instance: Strin
             return {"ok": true, "update": {}}
     return {"ok": true, "update": update}
 
-func _commit_player_checkpoint(key: String, state: Dictionary, instance: String, dimension: int, bundles: Array) -> Dictionary:
+func _commit_player_checkpoint(key: String, state: Dictionary, instance: String, dimension: int, bundles: Array, skip_unchanged: bool = false) -> Dictionary:
+    var expected_lease: int = chunk_authority.lease_epoch if chunk_authority.lease_epoch > 0 and (_has_live_peer() or lease_busy) else -1
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
     if lease_frozen and not lease_checkpoint_allowed:
         return {}
     var path: String = _profile_path(key)
     if not SaveFile.DIMENSION_MAP.has(dimension):
         return {}
-    if personal_store.read_ledger(path).is_empty():
-        return {}
     var saved: Dictionary = state.duplicate(true)
     saved.erase("_coop_objects")
     saved.erase("_coop_respawns")
-    var respawns: Dictionary = _private_respawn_checkpoint(key, state, instance, dimension)
+    var respawns: Dictionary = await _private_respawn_checkpoint(key, state, instance, dimension)
+    if not _same_save_context(context_generation, context_file):
+        return {}
     if not respawns["ok"]:
         return {}
     var owned: Array = []
@@ -680,13 +806,13 @@ func _commit_player_checkpoint(key: String, state: Dictionary, instance: String,
             return {}
         if (not _has_live_peer() and not lease_busy) or _bundle_runtime_owner(bundle, instance) == rank:
             owned.append(bundle)
-    var result: Dictionary = personal_store.save_checkpoint(
-        path, saved, int(state.get("_coop_revision", -1)),
-        _ledger_instance_key(instance), SaveFile.DIMENSION_MAP[dimension],
-        owned, _preserved_scene_paths(), respawns["update"]
-    )
+    var result: Dictionary = await _store_job(personal_store, "save_checkpoint", [path, saved, int(state.get("_coop_revision", -1)), _ledger_instance_key(instance), SaveFile.DIMENSION_MAP[dimension], owned, _preserved_scene_paths(), respawns["update"], skip_unchanged, expected_lease], {})
+    if not _same_save_context(context_generation, context_file):
+        return {}
     if not result.is_empty() and not respawns["update"].is_empty():
-        var canonical: Dictionary = personal_store.instance_respawns(path, _ledger_instance_key(instance))
+        var canonical: Dictionary = await _store_job(personal_store, "instance_respawns", [path, _ledger_instance_key(instance)], {})
+        if not _same_save_context(context_generation, context_file) or not canonical.get("ok", false):
+            return {}
         var instance_namespace: String = _resolve_dimension_namespace(dimension, str(_parse_dimension_instance_key(instance).get("owner_key", "")))
         SaveFile._set_data(Ref.save_file_manager.loaded_file.data, instance_namespace + "/respawn_positions", canonical["positions"].duplicate(true))
         var positions: Dictionary = {}
@@ -840,7 +966,11 @@ func filter_local_checkpoint(data: Dictionary, prefix: String) -> Dictionary:
 
 
 func _tick_canonical_terrain(delta: float) -> void:
+    if suppress_local_game_quit_session_shutdown or receiving_host_world or client_restore_in_progress or reconnect_pending:
+        return
     if lease_busy or not _has_live_peer() or not _can_sample_player() or terrain_sync_busy or canonical_apply_busy or not pending_canonical_patches.is_empty():
+        return
+    if not Ref.world.is_all_loaded():
         return
     terrain_sync_timer += delta
     if terrain_sync_timer < 2.0:
@@ -855,12 +985,12 @@ func _tick_canonical_terrain(delta: float) -> void:
         var changed: Array = chunk_authority.changed(patch["dimension_instance_key"], root, prefix).slice(0, ChunkAuthority.MAX_CHUNKS)
         if not changed.is_empty():
             patch["world_data"] = _filter_world_data_to_chunk_positions(patch["world_data"], prefix, changed)
-            if _merge_world_patch_into_save(patch):
+            if (await _merge_world_patch_into_save(patch)):
                 patch["versions"] = chunk_authority.accept(patch["dimension_instance_key"], patch["world_data"][prefix + "world"], prefix)
                 patch["epoch"] = terrain_epoch
                 sync_canonical_terrain.rpc(patch)
     else:
-        await _await_local_world_checkpoint()
+        await _checkpoint_terrain_in_background()
     terrain_sync_busy = false
 
 
@@ -871,6 +1001,8 @@ func sync_canonical_terrain(patch: Dictionary) -> void:
     var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
     chunk_authority.seed(patch["dimension_instance_key"], patch.get("world_data", {}).get(prefix + "world", {}), prefix, patch.get("versions", {}))
     _merge_world_patch_into_cache(patch)
+    if patch.get("checkpoint_sender", 0) == multiplayer.get_unique_id() and not patch.get("checkpoint_rebase", false):
+        return
     if patch.get("dimension_instance_key") == get_active_dimension_instance_key():
         await _apply_canonical_terrain(patch)
 
@@ -890,6 +1022,39 @@ func _drain_canonical_queue() -> void:
         _apply_canonical_terrain.call_deferred(pending_canonical_patches.pop_front())
 
 
+func _checkpoint_terrain_in_background() -> bool:
+    if suppress_local_game_quit_session_shutdown or receiving_host_world or client_restore_in_progress or reconnect_pending:
+        return false
+    if not _can_transmit_pending_local_world_patch_to_host() or guest_checkpoint_busy:
+        return false
+    var world = Ref.world
+    var captured_instance: String = get_active_dimension_instance_key()
+    var epoch: String = terrain_epoch
+    world.register_loaded_chunks()
+    var patch: Dictionary = _capture_local_world_patch()
+    var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
+    var root: Dictionary = patch.get("world_data", {}).get(prefix + "world", {})
+    var chunks: Array = chunk_authority.changed(captured_instance, root, prefix)
+    if chunks.is_empty():
+        return true
+    guest_checkpoint_busy = true
+    var committed: bool = true
+    for batch in ChunkAuthority.batches(chunks):
+        if world != Ref.world or captured_instance != get_active_dimension_instance_key() or epoch != terrain_epoch:
+            committed = false
+            break
+        var proposal: Dictionary = patch.duplicate(true)
+        proposal["world_data"] = _filter_world_data_to_chunk_positions(patch["world_data"], prefix, batch)
+        proposal["versions"] = chunk_authority.revisions.duplicate()
+        if not await _send_checkpoint_patch_and_wait(proposal, 0):
+            committed = false
+            break
+    if world != Ref.world or captured_instance != get_active_dimension_instance_key() or epoch != terrain_epoch:
+        committed = false
+    guest_checkpoint_busy = false
+    return committed
+
+
 func _canonical_world():
     return Ref.world
 
@@ -903,56 +1068,80 @@ func _apply_canonical_terrain(patch: Dictionary) -> bool:
     canonical_apply_busy = true
     var world = _canonical_world()
     var instance: String = get_active_dimension_instance_key()
-    var applied: bool = false
-    var was_loading: bool = world.load_enabled
-    var was_simulating: bool = world.simulate_enabled
-    world.simulate_enabled = false
     var deadline: int = Time.get_ticks_msec() + 5000
     while not world.is_all_loaded() and Time.get_ticks_msec() < deadline:
         await get_tree().process_frame
-    if is_instance_valid(world) and world == _canonical_world() and world.is_all_loaded() and instance == get_active_dimension_instance_key() and patch.get("epoch") == terrain_epoch:
-        applied = true
-        world.load_enabled = false
-        var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
-        var root: Dictionary = patch["world_data"].get(prefix + "world", {})
+        if world != _canonical_world() or instance != get_active_dimension_instance_key() or patch.get("epoch") != terrain_epoch:
+            canonical_apply_busy = false
+            return false
+    if not world.is_all_loaded():
+        _queue_canonical_patch(patch)
+        canonical_apply_busy = false
+        return false
+    var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
+    var root: Dictionary = patch["world_data"].get(prefix + "world", {})
+    var budget_start: int = Time.get_ticks_usec()
+    for chunk in root.get(prefix + "chunk_block", {}):
         var region: Dictionary = {}
         for channel in RegionCheckpoint.CHANNELS:
-            region[channel] = root.get(prefix + channel, {})
+            region[channel] = {}
+            if root.get(prefix + channel, {}).has(chunk):
+                region[channel][chunk] = root[prefix + channel][chunk]
+        var was_loading: bool = world.load_enabled
+        world.load_enabled = false
         world.load_region(region)
-        for chunk in region["chunk_block"]:
-            if not world.is_position_loaded(Vector3(chunk)):
-                continue
-            var blocks: PackedInt32Array = region["chunk_block"][chunk]
-            var water: PackedByteArray = region["chunk_water"].get(chunk, PackedByteArray())
-            for index in range(blocks.size()):
-                var position := Vector3(chunk + Vector3i(index % 16, index / 256, (index / 16) % 16))
-                var current = world.get_block_type_at(position)
-                if current != null and current.id != blocks[index]:
-                    world.place_block_at(position, ItemMap.map(blocks[index]), false, false)
-                if water.size() == 4096 and world.get_water_level_at(position) != water[index]:
-                    world.place_water_at(position, water[index])
-        for chunk in region["chunk_fire"]:
-            if not world.is_position_loaded(Vector3(chunk)):
-                continue
-            var fire: PackedByteArray = region["chunk_fire"][chunk]
-            if fire.size() == 4096:
-                for index in range(fire.size()):
-                    var position := Vector3(chunk + Vector3i(index % 16, index / 256, (index / 16) % 16))
-                    if world.get_fire_at(position) != fire[index]:
-                        world.place_fire_at(position, fire[index])
-    elif patch.get("epoch") == terrain_epoch and instance == get_active_dimension_instance_key():
-        _queue_canonical_patch(patch)
-        status_message = "Waiting for terrain loading before reconciliation"
-        _update_status_text()
-    # Active-instance sampling requires loading; restore it after the synchronous apply.
-    if applied:
         world.load_enabled = was_loading
-    if is_instance_valid(world) and world == _canonical_world() and instance == get_active_dimension_instance_key() and patch.get("epoch") == terrain_epoch:
-        world.load_enabled = was_loading
-        world.simulate_enabled = was_simulating
+        if not world.is_position_loaded(Vector3(chunk)):
+            continue
+        var blocks: PackedInt32Array = region["chunk_block"][chunk]
+        var water: PackedByteArray = region["chunk_water"].get(chunk, PackedByteArray())
+        for index in range(blocks.size()):
+            var position := Vector3(chunk + Vector3i(index % 16, index / 256, (index / 16) % 16))
+            var current = world.get_block_type_at(position)
+            if current != null and current.id != blocks[index]:
+                world.place_block_at(position, ItemMap.map(blocks[index]), false, false)
+            if water.size() == 4096 and world.get_water_level_at(position) != water[index]:
+                world.place_water_at(position, water[index])
+            if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= 2000:
+                await get_tree().process_frame
+                if world != _canonical_world() or instance != get_active_dimension_instance_key() or patch.get("epoch") != terrain_epoch:
+                    canonical_apply_busy = false
+                    return false
+                budget_start = Time.get_ticks_usec()
+    for chunk in root.get(prefix + "chunk_fire", {}):
+        if not world.is_position_loaded(Vector3(chunk)):
+            continue
+        var fire: PackedByteArray = root[prefix + "chunk_fire"][chunk]
+        if fire.size() != 4096:
+            continue
+        for index in range(fire.size()):
+            var position := Vector3(chunk + Vector3i(index % 16, index / 256, (index / 16) % 16))
+            if world.get_fire_at(position) != fire[index]:
+                world.place_fire_at(position, fire[index])
+            if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= 2000:
+                await get_tree().process_frame
+                if world != _canonical_world() or instance != get_active_dimension_instance_key() or patch.get("epoch") != terrain_epoch:
+                    canonical_apply_busy = false
+                    return false
+                budget_start = Time.get_ticks_usec()
     canonical_apply_busy = false
     _drain_canonical_queue()
-    return applied
+    return true
+
+
+
+func _same_save_context(generation: int, file: Variant) -> bool:
+    return generation == save_queue.generation and Ref.save_file_manager != null and Ref.save_file_manager.loaded_file == file
+
+func _store_job(store: RefCounted, method: String, arguments: Array, fallback: Variant) -> Variant:
+    var result = await save_queue.run(get_tree(), Callable(store, method).bindv(arguments.duplicate(true)))
+    return fallback if result == null else result
+
+func _snapshot_stack_limits() -> Dictionary:
+    var limits: Dictionary = {}
+    for id in ItemMap.all_item_ids:
+        limits[id] = _chest_stack_limit(id)
+    return limits
 
 func _profile_path(key: String) -> String:
     if _get_checkpoint_chunks_directory().is_empty():
@@ -969,6 +1158,9 @@ func _apply_profile_inventories(state: Dictionary) -> void:
         if items.size() != inventory.capacity * 2:
             continue
         for index in range(inventory.capacity):
+            var current = inventory.items[index]
+            if _serialize_item_state(current) == items[index * 2] and (current == null or current.get_position() == items[index * 2 + 1]):
+                continue
             var item = _deserialize_item_state(items[index * 2])
             if item != null:
                 item.set_position(items[index * 2 + 1])
@@ -976,31 +1168,66 @@ func _apply_profile_inventories(state: Dictionary) -> void:
 
 
 func _restore_host_profile() -> void:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
     if not multiplayer.is_server() or not _can_sample_player():
         return
     if guest_world_loaded or reconnect_pending or client_restore_in_progress:
         return
     var path: String = _profile_path(_get_local_player_key())
-    if path == restored_host_profile_path:
+    var file_id: int = context_file.get_instance_id() if is_instance_valid(context_file) else 0
+    var same_file: bool = path == restored_host_profile_path and file_id == restored_host_profile_file_id
+    if same_file and restored_host_profile_generation == context_generation:
         return
-    var record: Dictionary = personal_store.read_profile(path)
+    var record: Dictionary = await _store_job(personal_store, "read_profile", [path], {})
+    if not _same_save_context(context_generation, context_file):
+        return
+    same_file = path == restored_host_profile_path and file_id == restored_host_profile_file_id
+    if same_file and restored_host_profile_generation == context_generation or path != _profile_path(_get_local_player_key()):
+        return
     if record.is_empty():
         Ref.player.disabled = true
         status_message = "Personal profile could not be read; saved data retained for recovery"
         _update_status_text()
         return
     profile_revision = record["revision"]
-    _apply_profile_inventories(record["state"])
+    if not same_file:
+        _apply_profile_inventories(record["state"])
     restored_host_profile_path = path
+    restored_host_profile_generation = context_generation
+    restored_host_profile_file_id = file_id
 
 
-func _persist_host_profile() -> bool:
-    if not multiplayer.is_server() or not _can_sample_player() or chest_lock_active:
+func _persist_host_profile(skip_unchanged: bool = false) -> bool:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
+    if not multiplayer.is_server() or not _can_sample_player() or chest_lock_active or suppress_local_game_quit_session_shutdown:
         return true
     if guest_world_loaded or reconnect_pending or client_restore_in_progress:
         return true
-    _restore_host_profile()
-    var record: Dictionary = _commit_player_checkpoint(_get_local_player_key(), _capture_local_persistent_state(), get_active_dimension_instance_key(), int(Ref.world.current_dimension), _capture_local_instance_nodes())
+    while durable_pickup_busy:
+        await get_tree().process_frame
+    if host_profile_busy:
+        while host_profile_busy:
+            await get_tree().process_frame
+        if skip_unchanged:
+            return host_profile_last_ok
+    host_profile_busy = true
+    _record_host_residency()
+    await _restore_host_profile()
+    if not _same_save_context(context_generation, context_file):
+        host_profile_busy = false
+        return false
+    if not _can_sample_player() or guest_world_loaded or reconnect_pending or client_restore_in_progress:
+        host_profile_busy = false
+        host_profile_last_ok = false
+        return false
+    var record: Dictionary = (await _commit_player_checkpoint(_get_local_player_key(), _capture_local_persistent_state(), get_active_dimension_instance_key(), int(Ref.world.current_dimension), _capture_local_instance_nodes(), skip_unchanged))
+    if not _same_save_context(context_generation, context_file):
+        host_profile_busy = false
+        return false
+    host_profile_busy = false
+    host_profile_last_ok = not record.is_empty()
     if record.is_empty():
         return false
     profile_revision = record["revision"]
@@ -1093,17 +1320,23 @@ func sync_chest_access(accesses: Dictionary) -> void:
 func open_personal_chest(cube: Node3D) -> void:
     if chest_lock_active or is_instance_valid(chest_panel) or InventorySlot.state != InventorySlot.IDLE:
         return
-    var deadline: int = Time.get_ticks_msec() + 5000
-    while profile_commit_pending and Time.get_ticks_msec() < deadline:
-        await get_tree().process_frame
-    if profile_commit_pending or not is_instance_valid(cube):
-        return
     chest_panel = preload("res://coop_mod/personal_chest.gd").new()
+    var opening_panel = chest_panel
+    var instance: String = get_active_dimension_instance_key()
     chest_pending_token = "opening"
     chest_request_sent_at = Time.get_ticks_msec()
     chest_close_requested = false
     add_child(chest_panel)
     chest_panel.start(self, cube)
+    var deadline: int = Time.get_ticks_msec() + 5000
+    while (profile_commit_pending or host_profile_busy or durable_pickup_busy) and Time.get_ticks_msec() < deadline and is_instance_valid(opening_panel):
+        await get_tree().process_frame
+    if profile_commit_pending or host_profile_busy or durable_pickup_busy or not is_instance_valid(opening_panel) or chest_close_requested or not is_instance_valid(cube) or instance != get_active_dimension_instance_key():
+        chest_pending_token = ""
+        if is_instance_valid(opening_panel):
+            opening_panel.queue_free()
+        close_personal_chest("")
+        return
     var state: Dictionary = _capture_local_persistent_state()
     if multiplayer.is_server():
         _open_chest_for_peer(1, _get_local_player_key(), get_active_dimension_instance_key(), Vector3i(cube.global_position), state)
@@ -1122,6 +1355,8 @@ func _valid_chest_session(peer: int, instance_key: String, position: Vector3i) -
 
 
 func _open_chest_for_peer(peer: int, key: String, instance_key: String, position: Vector3i, state: Dictionary) -> void:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
     if not _valid_chest_session(peer, instance_key, position):
         _reply_personal_chest(peer, {}, "")
         return
@@ -1130,7 +1365,9 @@ func _open_chest_for_peer(peer: int, key: String, instance_key: String, position
     if not bundles is Array or get_dimension_instance_key(dimension, str(state.get("_coop_owner", ""))) != instance_key:
         _reply_personal_chest(peer, {}, "")
         return
-    var record: Dictionary = _commit_player_checkpoint(key, state, instance_key, dimension, bundles)
+    var record: Dictionary = (await _commit_player_checkpoint(key, state, instance_key, dimension, bundles))
+    if not _same_save_context(context_generation, context_file):
+        return
     if record.is_empty():
         _reply_personal_chest(peer, {}, "")
         return
@@ -1149,7 +1386,7 @@ func request_personal_chest(instance_key: String, position: Vector3i, state: Dic
 func _reply_personal_chest(peer: int, record: Dictionary, token: String) -> void:
     if peer == 1:
         receive_personal_chest(record, token)
-    else:
+    elif admitted_player_keys.has(peer) and multiplayer.get_peers().has(peer):
         receive_personal_chest.rpc_id(peer, record, token)
 
 
@@ -1187,11 +1424,15 @@ func _chest_stack_limit(id: int) -> int:
 
 
 func _transfer_chest_for_peer(peer: int, token: String, revision: int, request: String, inventory_name: String, index: int, chest_index: int, amount: int, deposit: bool) -> void:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
     var session: Dictionary = chest_sessions.get(peer, {})
     if session.get("token") != token or not _valid_chest_session(peer, session.get("instance", ""), session.get("position", Vector3i.ZERO)):
         _reply_personal_chest(peer, {}, token)
         return
-    var record: Dictionary = personal_store.transfer(_profile_path(session["key"]), revision, request, inventory_name, index, chest_index, amount, deposit, _chest_stack_limit)
+    var record: Dictionary = await _store_job(personal_store, "transfer", [_profile_path(session["key"]), revision, request, inventory_name, index, chest_index, amount, deposit, PersonalStore.stack_limit.bind(_snapshot_stack_limits())], {})
+    if not _same_save_context(context_generation, context_file):
+        return
     _reply_personal_chest(peer, record, token)
 
 
@@ -1204,6 +1445,7 @@ func request_chest_transfer(token: String, revision: int, request: String, inven
 func close_personal_chest(token: String) -> void:
     chest_close_requested = true
     chest_panel = null
+    _release_chest_movement()
     if not chest_pending_token.is_empty():
         return
     if not _has_live_peer() or multiplayer.is_server():
@@ -1214,15 +1456,32 @@ func close_personal_chest(token: String) -> void:
     _release_chest_inventory_lock()
 
 
-func begin_chest_inventory_lock() -> void:
+func _stop_local_mutation_actions(stop_gliding: bool = true) -> void:
+    if not is_instance_valid(Ref.player):
+        return
+    Ref.player.get_node("%BreakBlocks").break_block_stop()
+    if Ref.player.is_interacting() and is_instance_valid(Ref.player.held_item):
+        if not stop_gliding and Ref.player.held_item is HeldGlider:
+            return
+        Ref.player.held_item.interact_end()
+
+func begin_chest_inventory_lock(lock_movement: bool = true) -> void:
     if chest_lock_active:
         return
     chest_lock_active = true
+    _stop_local_mutation_actions()
     chest_was_disabled = Ref.player.disabled
     chest_menu_process_mode = Ref.game_menu.process_mode
-    Ref.player.disabled = true
+    chest_movement_locked = lock_movement
+    if lock_movement:
+        Ref.player.disabled = true
     Ref.game_menu.process_mode = Node.PROCESS_MODE_DISABLED
 
+
+func _release_chest_movement() -> void:
+    if chest_movement_locked and is_instance_valid(Ref.player):
+        Ref.player.disabled = chest_was_disabled or reconnect_pending or client_restore_in_progress or local_downed or Ref.player.dead
+    chest_movement_locked = false
 
 func _release_chest_inventory_lock() -> void:
     if not chest_lock_active or not chest_pending_token.is_empty():
@@ -1271,7 +1530,7 @@ const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_PLAYERS: int = 2
 const MAX_CLIENTS: int = MAX_PLAYERS - 1
-const MOD_PROTOCOL_VERSION: int = 5
+const MOD_PROTOCOL_VERSION: int = 6
 const TARGET_GAME_VERSION: String = "5.2.0"
 const AUTH_TIMEOUT_SECONDS: float = 5.0
 const AUTH_MAX_BYTES: int = 2048
@@ -1451,6 +1710,7 @@ var pending_remote_block_changes: Dictionary = {}
 var pending_remote_water_changes: Dictionary = {}
 var pending_remote_fire_changes: Dictionary = {}
 var pending_remote_storage_changes: Dictionary = {}
+var pending_remote_scope: String = ""
 var remote_player_proxies: Dictionary = {}
 var spawn_anchor_index: int = 0
 var host_world_state_sequence: int = 0
@@ -1592,6 +1852,8 @@ func _assign_session_peer(peer: MultiplayerPeer) -> void:
     lease_frozen = false
     lease_preparing = false
     lease_token = ""
+    lease_pending_install_epoch = 0
+    lease_pending_previous_chunks.clear()
     lease_guest_instance = ""
     lease_guest_chunks.clear()
     terrain_sync_busy = false
@@ -2843,15 +3105,42 @@ func _teleport_to_peer(peer_id: int) -> void:
 
     if str(target_state.get("dimension_instance_key", "")) != get_active_dimension_instance_key():
         var target_key: String = str(target_state.get("dimension_instance_key", ""))
+        pending_peer_teleport = peer_id
+        pending_peer_instance = target_key
         if _open_dimension_instance_from_key(target_key):
             status_message = "Teleporting to %s's area" % _get_peer_display_name(peer_id, target_state)
             _update_status_text()
             return
+        pending_peer_teleport = 0
+        pending_peer_instance = ""
+        return
 
     _teleport_local_player_near(target_state.get("position", Ref.player.global_position))
     status_message = "Teleported to %s" % _get_peer_display_name(peer_id, target_state)
     _update_status_text()
 
+
+func _finish_pending_peer_teleport() -> void:
+    if pending_peer_teleport == 0 or not _can_sample_player() or lease_busy or suppress_local_game_quit_session_shutdown or client_restore_in_progress or reconnect_pending or receiving_host_world:
+        return
+    var target: Dictionary = peer_states.get(pending_peer_teleport, {})
+    if not multiplayer.get_peers().has(pending_peer_teleport):
+        pending_peer_teleport = 0
+        pending_peer_instance = ""
+        return
+    if not target.get("active", false):
+        return
+    if target.get("dimension_instance_key") != pending_peer_instance:
+        pending_peer_teleport = 0
+        pending_peer_instance = ""
+        return
+    if get_active_dimension_instance_key() != pending_peer_instance or not Ref.world.is_all_loaded():
+        return
+    _teleport_local_player_near(target["position"])
+    status_message = "Teleported to %s" % _get_peer_display_name(pending_peer_teleport, target)
+    pending_peer_teleport = 0
+    pending_peer_instance = ""
+    _update_status_text()
 
 func _teleport_to_selected_pause_menu_peer() -> void:
     var peer_id: int = _get_selected_pause_menu_peer_id()
@@ -3292,6 +3581,13 @@ func _input(event: InputEvent) -> void:
         return
     if not event.pressed or event.echo:
         return
+    if is_instance_valid(chest_panel):
+        if event.keycode == KEY_ESCAPE:
+            var closing_panel = chest_panel
+            close_personal_chest(chest_active_token)
+            closing_panel.queue_free()
+            get_viewport().set_input_as_handled()
+        return
 
     var focus_owner: Control = get_viewport().gui_get_focus_owner()
     var typing_in_field: bool = focus_owner is LineEdit or focus_owner is TextEdit
@@ -3444,6 +3740,8 @@ func _enforce_host_background_frame_rate() -> void:
 
 
 func _physics_process(delta: float) -> void:
+    save_queue.poll()
+    _finish_pending_peer_teleport()
     _tick_runtime_lease(delta)
     _enforce_coop_pause_override()
     _sync_pause_menu_coop_panel_visibility()
@@ -3466,13 +3764,13 @@ func _physics_process(delta: float) -> void:
 
     _tick_chest_transaction_timeout(Time.get_ticks_msec())
 
-    if profile_commit_pending and Time.get_ticks_msec() - profile_commit_sent_at > 5000:
+    if profile_commit_pending and Time.get_ticks_msec() - profile_commit_sent_at > int(HOST_TIMEOUT_SECONDS * 1000.0):
         profile_commit_pending = false
         _begin_reconnect_flow("Player profile save timed out; reconnecting safely")
     host_profile_timer += delta
-    if host_profile_timer >= PERSIST_INTERVAL:
+    if host_profile_timer >= PERSIST_INTERVAL and not host_profile_busy:
         host_profile_timer = 0.0
-        _persist_host_profile()
+        _persist_host_profile(true)
     _drain_canonical_queue()
     _tick_canonical_terrain(delta)
     if not _has_live_peer():
@@ -3716,6 +4014,9 @@ func join_session() -> void:
 
 
 func disconnect_session(announce: bool = true) -> void:
+    save_queue.invalidate()
+    pending_peer_teleport = 0
+    pending_peer_instance = ""
     _invalidate_local_chest()
     terrain_epoch = ""
     pending_canonical_patches.clear()
@@ -4429,15 +4730,21 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
     if not _queue_loaded_dimension_instance(target_dimension, pocket_owner_key):
         group_dimension_transfer_in_progress = false
         return
+    var target: Dictionary = peer_states.get(pending_peer_teleport, {})
+    var following_peer: bool = target.get("active", false) and target.get("dimension_instance_key") == target_instance_key and target.get("position") is Vector3
+    if following_peer:
+        var plain: String = SaveFile.DIMENSION_MAP[target_dimension]
+        Ref.save_file_manager.loaded_file_register.set_data("traveled_to_" + plain, true)
+        SaveFile._set_data(Ref.save_file_manager.loaded_file.data, plain + "/node/player/global_position", target["position"])
     suppress_local_game_quit_session_shutdown = true
     await Ref.main.teleport_to_dimension(target_dimension, false, false)
+    if not following_peer:
+        await _position_local_player_after_dimension_open(source_dimension, target_dimension)
     suppress_local_game_quit_session_shutdown = false
     if _has_live_peer():
         _broadcast_local_state_now()
         if not multiplayer.is_server() and _is_private_instance_dimension(target_dimension) and pocket_owner_key == local_player_key:
             _send_full_local_world_patch_to_host()
-
-    await _position_local_player_after_dimension_open(source_dimension, target_dimension)
 
 
 func _queue_loaded_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> bool:
@@ -5635,7 +5942,7 @@ func sync_host_direct_hit_on_remote_player(attacker: Entity, target, damage_posi
 func sync_local_attack_on_remote_player(attacker: Entity, target, damage_position: Vector3, damage: int, knockback_strength: float, fly_strength: float, fire_aspect: bool) -> bool:
     if not _has_live_peer() or multiplayer.is_server() or attacker == null or not is_instance_valid(attacker) or target == null or not is_instance_valid(target):
         return false
-    if _is_local_world_authority() or _is_client_gameplay_locked() or not is_remote_player_proxy(target):
+    if _is_client_gameplay_locked() or not can_mutate_runtime_node(attacker) or not is_remote_player_proxy(target):
         return false
 
     var target_peer_id: int = get_remote_player_proxy_peer_id(target)
@@ -5658,6 +5965,8 @@ func sync_local_attack_on_entity(attacker: Entity, target, damage_position: Vect
         return false
     if multiplayer.is_server():
         apply_leased_entity_attack.rpc(_get_sync_uuid(target), damage_position, damage, knockback_strength, fly_strength, fire_aspect, terrain_epoch)
+        if attacker.held_item != null and attacker.held_item.item is Tool:
+            attacker.decrease_held_item_durability(1)
         return true
 
     var target_uuid: String = _get_sync_uuid(target)
@@ -5713,7 +6022,13 @@ func intercept_durable_pickup(collector: Entity, dropped_item) -> bool:
 
 
 func _begin_durable_pickup(dropped_item) -> void:
-    if not is_instance_valid(dropped_item) or chest_lock_active or lease_busy or not _can_sample_player():
+    if not is_instance_valid(dropped_item) or chest_lock_active or lease_busy or not _can_sample_player() or Ref.player.held_item is HeldGlider and Ref.player.held_item.gliding:
+        if is_instance_valid(dropped_item):
+            dropped_item.set_meta("coop_pickup_pending_request", false)
+        return
+    while host_profile_busy or durable_pickup_busy:
+        await get_tree().process_frame
+    if not is_instance_valid(dropped_item) or dropped_item.is_queued_for_deletion() or chest_lock_active or not _can_sample_player() or lease_busy or Ref.player.held_item is HeldGlider and Ref.player.held_item.gliding:
         if is_instance_valid(dropped_item):
             dropped_item.set_meta("coop_pickup_pending_request", false)
         return
@@ -5721,14 +6036,14 @@ func _begin_durable_pickup(dropped_item) -> void:
     var request: String = SessionIdentity.random_id()
     var instance: String = get_active_dimension_instance_key()
     var epoch: String = terrain_epoch
-    begin_chest_inventory_lock()
+    begin_chest_inventory_lock(false)
     chest_pending_token = request
     chest_request_sent_at = Time.get_ticks_msec()
     pickup_pending[request] = {"uuid": uuid, "instance": instance, "epoch": epoch}
     pickup_checkpoint_allowed = true
     var ok: bool
     if multiplayer.is_server():
-        var saved: Dictionary = _commit_player_checkpoint(_get_local_player_key(), _capture_local_persistent_state(), instance, int(Ref.world.current_dimension), _capture_local_instance_nodes())
+        var saved: Dictionary = (await _commit_player_checkpoint(_get_local_player_key(), _capture_local_persistent_state(), instance, int(Ref.world.current_dimension), _capture_local_instance_nodes()))
         ok = not saved.is_empty()
         if ok:
             profile_revision = saved["revision"]
@@ -5739,33 +6054,64 @@ func _begin_durable_pickup(dropped_item) -> void:
         receive_durable_pickup(request, {}, epoch)
         return
     if multiplayer.is_server():
-        var record: Dictionary = _collect_durable_pickup(1, _get_local_player_key(), instance, uuid, request, profile_revision, epoch)
+        var record: Dictionary = (await _collect_durable_pickup(1, _get_local_player_key(), instance, uuid, request, profile_revision, epoch))
         receive_durable_pickup(request, record, epoch)
     else:
         request_pickup_drop.rpc_id(1, uuid, request, profile_revision, instance, epoch)
 
 
 func _collect_durable_pickup(peer: int, key: String, instance: String, uuid: String, request: String, revision: int, epoch: String) -> Dictionary:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
+    if durable_pickup_busy:
+        return {}
+    var target_drop = _find_existing_drop_by_uuid(uuid)
+    if peer != 1 and is_instance_valid(target_drop) and owns_runtime_node(target_drop):
+        if not await _persist_host_profile():
+            return {}
+        if not _same_save_context(context_generation, context_file):
+            return {}
     if request.length() != 64 or not request.is_valid_hex_number() or lease_frozen or lease_preparing or epoch != terrain_epoch or chest_sessions.has(peer):
         return {}
-    var receipt: String = ("pickup|" + key + "|" + instance + "|" + uuid).sha256_text()
+    var receipt: String = ("pickup|" + key + "|" + instance + "|" + uuid + "|" + request).sha256_text()
     var state: Dictionary = _capture_local_state() if peer == 1 else peer_states.get(peer, {})
     if not state.get("active", false) or state.get("downed", false) or state.get("dimension_instance_key") != instance:
         return {}
     var path: String = _profile_path(key)
-    var ledger: Dictionary = personal_store.read_ledger(path)
+    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
+    if not _same_save_context(context_generation, context_file):
+        return {}
     var nodes: Dictionary = ledger.get("instances", {}).get(_ledger_instance_key(instance), {}).get("nodes", {})
     var bundle: Dictionary = nodes.get(uuid, {})
     if bundle.is_empty():
-        var prior: Dictionary = personal_store.read_profile(path)
+        var prior: Dictionary = ledger.get("profiles", {}).get(key, {})
         return prior if prior.get("receipts", []).has(receipt) else {}
     if Vector3(state.get("position", Vector3.INF)).distance_to(bundle["position"]) > 8.0:
         return {}
-    var record: Dictionary = personal_store.collect_drop(path, revision, receipt, _ledger_instance_key(instance), uuid, _chest_stack_limit)
+    if epoch != terrain_epoch or lease_frozen or lease_preparing:
+        return {}
+    durable_pickup_busy = true
+    var previous_mode: int = Node.PROCESS_MODE_INHERIT
+    var previous_merge: bool = false
+    if is_instance_valid(target_drop):
+        previous_mode = target_drop.process_mode
+        previous_merge = target_drop.can_merge
+        target_drop.can_merge = false
+        target_drop.process_mode = Node.PROCESS_MODE_DISABLED
+    var record: Dictionary = await _store_job(personal_store, "collect_drop", [path, revision, receipt, _ledger_instance_key(instance), uuid, PersonalStore.stack_limit.bind(_snapshot_stack_limits())], {})
+    if is_instance_valid(target_drop) and not target_drop.is_queued_for_deletion():
+        target_drop.process_mode = previous_mode
+        target_drop.can_merge = previous_merge
+    if not _same_save_context(context_generation, context_file):
+        durable_pickup_busy = false
+        return {}
     if not record.is_empty() and instance == get_active_dimension_instance_key():
-        _remove_saved_entity_uuid(uuid)
+        _apply_pickup_remainder(uuid, record.get("_coop_pickup_bundle", {}))
         if _has_live_peer():
-            sync_remove_drop.rpc(uuid, terrain_epoch)
+            for remote in multiplayer.get_peers():
+                if remote != peer:
+                    sync_pickup_remainder.rpc_id(remote, instance, uuid, record.get("_coop_pickup_bundle", {}), epoch)
+    durable_pickup_busy = false
     return record
 
 
@@ -5778,7 +6124,8 @@ func receive_durable_pickup(request: String, record: Dictionary, epoch: String) 
     if not record.is_empty():
         profile_revision = record["revision"]
         _apply_profile_inventories(record["state"])
-        _remove_saved_entity_uuid(uuid)
+        if not multiplayer.is_server():
+            _apply_pickup_remainder(uuid, record.get("_coop_pickup_bundle", {}))
     else:
         var drop = _find_existing_drop_by_uuid(uuid)
         if is_instance_valid(drop):
@@ -5787,6 +6134,23 @@ func receive_durable_pickup(request: String, record: Dictionary, epoch: String) 
     chest_active_token = ""
     close_personal_chest("")
 
+
+func _apply_pickup_remainder(uuid: String, bundle: Dictionary) -> void:
+    if bundle.is_empty():
+        _remove_saved_entity_uuid(uuid)
+    else:
+        var drop = _find_existing_drop_by_uuid(uuid)
+        if is_instance_valid(drop):
+            drop.set_meta("coop_pickup_pending_request", false)
+        _upsert_saved_entity_bundle(bundle)
+
+@rpc("authority", "call_remote", "reliable")
+func sync_pickup_remainder(instance: String, uuid: String, bundle: Dictionary, epoch: String) -> void:
+    if multiplayer.is_server() or epoch != terrain_epoch or instance != get_active_dimension_instance_key():
+        return
+    if not bundle.is_empty() and (bundle.get("uuid") != uuid or not InstanceEntities.valid_bundle(bundle, SaveFile.DIMENSION_MAP[int(Ref.world.current_dimension)], _preserved_scene_paths())):
+        return
+    _apply_pickup_remainder(uuid, bundle)
 
 func play_local_host_drop_collect_animation(collector, dropped_item) -> bool:
     if not multiplayer.is_server() or not _has_live_peer():
@@ -6295,9 +6659,19 @@ func _autosave_host_world_if_needed() -> void:
     _run_host_autosave.call_deferred()
 
 
+func _ensure_remote_world_scope() -> void:
+    var scope: String = terrain_epoch + "|" + get_active_dimension_instance_key()
+    if pending_remote_scope != scope:
+        pending_remote_block_changes.clear()
+        pending_remote_water_changes.clear()
+        pending_remote_fire_changes.clear()
+        pending_remote_storage_changes.clear()
+        pending_remote_scope = scope
+
 func _flush_pending_remote_world_changes() -> void:
     if multiplayer.is_server() or not _has_live_peer() or not _can_sample_player() or not is_instance_valid(Ref.world):
         return
+    _ensure_remote_world_scope()
 
     for block_position in pending_remote_block_changes.keys().duplicate():
         if not Ref.world.is_position_loaded(block_position):
@@ -6458,6 +6832,8 @@ func _get_local_player_key() -> String:
         return authenticated_local_key
     if int(Steamworks.steam_id) > 0:
         return "steam_%d" % int(Steamworks.steam_id)
+    if not local_identity_key.is_empty():
+        return local_identity_key
     var path: String = "user://coop/local_identity.json"
     var record: Dictionary = identity_store.read_record(path)
     var stored = record.get("key", "")
@@ -6468,7 +6844,9 @@ func _get_local_player_key() -> String:
         key = "lan_" + SessionIdentity.random_id()
         if not identity_store.write_record(path, {"key": key}):
             return ""
-    return key if SessionIdentity.valid_lan_key(key) else ""
+    if SessionIdentity.valid_lan_key(key):
+        local_identity_key = key
+    return local_identity_key
 
 
 func _slugify_string(raw_text: String) -> String:
@@ -6760,7 +7138,7 @@ func _refresh_world_authority_mode() -> void:
     if not multiplayer.is_server() and last_local_world_authority and not has_world_authority:
         _flush_pending_local_world_patch_to_host(true)
     # Native dynamics predict locally; only canonical chunk owners may commit them.
-    Ref.world.simulate_enabled = ((multiplayer.is_server() and not guest_world_loaded) or (_has_live_peer() and guest_persistent_ready)) and not reconnect_pending and not client_restore_in_progress and not lease_frozen and not canonical_apply_busy and pending_canonical_patches.is_empty()
+    Ref.world.simulate_enabled = ((multiplayer.is_server() and not guest_world_loaded) or (_has_live_peer() and guest_persistent_ready)) and not reconnect_pending and not client_restore_in_progress and not lease_frozen
 
     if not multiplayer.is_server() and is_instance_valid(Ref.entity_spawner) and has_entity_authority != last_local_entity_authority:
         if has_entity_authority:
@@ -7017,7 +7395,7 @@ func _is_peer_state_same_instance(state: Dictionary, active_instance_key: String
 
 func _is_local_session_player_active() -> bool:
     var controlled_lock: bool = chest_lock_active or lease_preparing or lease_frozen
-    return _can_sample_player() and not Ref.player.dead and (not Ref.player.disabled or is_local_player_downed() or controlled_lock) and not is_local_player_fake_dead() and not reconnect_pending and not client_restore_in_progress and not receiving_host_world and Ref.player.is_inside_tree()
+    return _can_sample_player() and not suppress_local_game_quit_session_shutdown and not Ref.player.dead and (not Ref.player.disabled or is_local_player_downed() or controlled_lock) and not is_local_player_fake_dead() and not reconnect_pending and not client_restore_in_progress and not receiving_host_world and Ref.player.is_inside_tree()
 
 
 func _is_local_session_player_targetable() -> bool:
@@ -7742,6 +8120,7 @@ func notify_local_storage_inventory_changed(block_position: Vector3i, inventory:
 
 
 func _apply_storage_inventory_snapshot(block_position: Vector3i, serialized_items: Array) -> void:
+    _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world) or not Ref.world.is_position_loaded(block_position):
         pending_remote_storage_changes[block_position] = serialized_items.duplicate(true)
         return
@@ -7941,7 +8320,7 @@ func _capture_local_persistent_state() -> Dictionary:
 
 
 func _send_persistent_state_to_host(force_send: bool = false) -> void:
-    if multiplayer.is_server() or not _has_live_peer() or not _can_sample_player():
+    if multiplayer.is_server() or not _has_live_peer() or not _can_sample_player() or receiving_host_world or client_restore_in_progress or reconnect_pending:
         return
     if profile_commit_pending or (chest_lock_active and not pickup_checkpoint_allowed) or (lease_frozen and not lease_checkpoint_allowed):
         return
@@ -7982,6 +8361,9 @@ func _send_local_authoritative_entities_to_host(force_send: bool = false) -> voi
 
 
 func _store_guest_persistent_state(player_key: String, player_name: String, save_data: Dictionary) -> void:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
+    var sender: int = multiplayer.get_remote_sender_id()
     if not _can_share_loaded_world() or player_key == "" or save_data.is_empty():
         return
 
@@ -7994,15 +8376,18 @@ func _store_guest_persistent_state(player_key: String, player_name: String, save
     var bundles = save_data.get("_coop_objects")
     var record: Dictionary = {}
     if SaveFile.DIMENSION_MAP.has(dimension) and save_data.get("_coop_lease_epoch") == chunk_authority.lease_epoch and sender_state.get("dimension_instance_key") == instance and sender_state.get("dimension") == dimension and bundles is Array:
-        record = _commit_player_checkpoint(player_key, save_data, instance, dimension, bundles)
+        record = (await _commit_player_checkpoint(player_key, save_data, instance, dimension, bundles))
+        if not _same_save_context(context_generation, context_file):
+            return
+    if sender > 0 and (admitted_player_keys.get(sender, "") != player_key or not multiplayer.get_peers().has(sender)):
+        return
     if record.is_empty():
-        var failed_sender: int = multiplayer.get_remote_sender_id()
+        var failed_sender: int = sender
         if failed_sender > 0:
             profile_committed.rpc_id(failed_sender, profile_revision, false)
         return
     Ref.save_file_manager.loaded_file.set_data("coop/players/%s/name" % player_key, player_name, true)
     Ref.save_file_manager.loaded_file.set_data("coop/players/%s/save_data" % player_key, record["state"].duplicate_deep(), true)
-    var sender: int = multiplayer.get_remote_sender_id()
     if sender > 0:
         profile_committed.rpc_id(sender, record["revision"], true)
 
@@ -8010,7 +8395,7 @@ func _store_guest_persistent_state(player_key: String, player_name: String, save
 func _get_guest_persistent_state(player_key: String) -> Dictionary:
     if not _can_share_loaded_world() or not RegionCheckpoint.valid_component(player_key):
         return {}
-    var record: Dictionary = personal_store.read_profile(_profile_path(player_key))
+    var record: Dictionary = await _store_job(personal_store, "read_profile", [_profile_path(player_key)], {})
     if record.is_empty():
         return {"_coop_invalid": true}
     var state: Dictionary = record["state"].duplicate(true)
@@ -8059,6 +8444,7 @@ func _finish_guest_character_restore() -> void:
     chest_pending_token = ""
     chest_active_token = ""
     _release_chest_inventory_lock()
+    _broadcast_local_state_now()
     _send_persistent_state_to_host(true)
 
 
@@ -8654,25 +9040,44 @@ func _validate_guest_world_patch(sender_state: Dictionary, world_patch: Dictiona
 
 
 func _merge_world_patch_into_save(world_patch: Dictionary) -> bool:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
     var chunks_dir: String = _get_checkpoint_chunks_directory()
     if chunks_dir.is_empty():
         return false
+    var generation: int = save_queue.generation
+    while region_commit_busy:
+        await get_tree().process_frame
+    if generation != save_queue.generation:
+        return false
     var region_namespace: String = _resolve_dimension_namespace(world_patch["dimension"], world_patch["pocket_owner_key"])
-    var result: Dictionary = region_checkpoint.commit_patch(chunks_dir, region_namespace, region_namespace + "_", world_patch["world_data"], _checkpoint_block_ids())
+    var prefix: String = region_namespace + "_"
+    var root: Dictionary = world_patch["world_data"].get(prefix + "world", {})
+    if world_patch.has("versions") and not chunk_authority.current(world_patch["dimension_instance_key"], root, prefix, world_patch["versions"]):
+        return false
+    region_commit_busy = true
+    var result: Dictionary = await _store_job(region_checkpoint, "commit_patch", [chunks_dir, region_namespace, region_namespace + "_", world_patch["world_data"], _checkpoint_block_ids()], {"ok": false, "error": "session changed"})
+    if not _same_save_context(context_generation, context_file):
+        region_commit_busy = false
+        return false
+    region_commit_busy = false
     if not result["ok"]:
         status_message = "Region checkpoint failed: " + str(result.get("error", "unknown error"))
         _update_status_text()
         return false
+    chunk_authority.accept(world_patch["dimension_instance_key"], root, prefix)
     _merge_world_patch_into_cache(world_patch)
     return true
 
 
 func _send_region_checkpoint_result(peer_id: int, request_id: int, committed: bool) -> void:
-    guest_world_checkpoint_result.rpc_id(peer_id, request_id, committed)
+    if admitted_player_keys.has(peer_id) and multiplayer.get_peers().has(peer_id):
+        guest_world_checkpoint_result.rpc_id(peer_id, request_id, committed)
 
 
 func _send_canonical_patch(peer: int, patch: Dictionary) -> void:
-    sync_canonical_terrain.rpc_id(peer, patch)
+    if admitted_player_keys.has(peer) and multiplayer.get_peers().has(peer):
+        sync_canonical_terrain.rpc_id(peer, patch)
 
 
 func _send_canonical_rebase(peer: int, patch: Dictionary) -> void:
@@ -8695,6 +9100,7 @@ func _send_canonical_rebase(peer: int, patch: Dictionary) -> void:
     response["world_data"] = filtered
     response["versions"] = chunk_authority.revisions.duplicate()
     response["epoch"] = terrain_epoch
+    response["checkpoint_rebase"] = true
     _send_canonical_patch(peer, response)
 
 
@@ -8710,9 +9116,11 @@ func _checkpoint_and_reply(sender_id: int, world_patch: Dictionary) -> bool:
             if _leased_chunk_owner(chunk, world_patch["dimension_instance_key"]) != 2:
                 committed = false
         if committed:
-            committed = _merge_world_patch_into_save(world_patch)
+            committed = (await _merge_world_patch_into_save(world_patch))
         if committed:
             world_patch["versions"] = chunk_authority.accept(world_patch["dimension_instance_key"], root, prefix)
+            world_patch["checkpoint_sender"] = sender_id
+            world_patch["checkpoint_rebase"] = false
             _send_canonical_patch(sender_id, world_patch)
             if world_patch["dimension_instance_key"] == get_active_dimension_instance_key():
                 _apply_canonical_terrain.call_deferred(world_patch)
@@ -8735,42 +9143,70 @@ func _checkpoint_and_reply(sender_id: int, world_patch: Dictionary) -> bool:
 
 
 func _checkpoint_local_host_world() -> bool:
-    if not _persist_host_profile():
+    if not (await _persist_host_profile()):
         return false
     if not _can_sample_player():
         return true
     if Ref.world.region_checkpoint_load_failed:
         return false
-    Ref.world.register_loaded_chunks()
-    return _merge_world_patch_into_save(_capture_local_world_patch())
+    var world = Ref.world
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
+    var instance: String = get_active_dimension_instance_key()
+    var deadline: int = Time.get_ticks_msec() + 15000
+    while world.load_enabled and not world.is_all_loaded() and Time.get_ticks_msec() < deadline:
+        await get_tree().process_frame
+        if world != Ref.world or instance != get_active_dimension_instance_key() or not _same_save_context(generation, file):
+            return false
+    if world.load_enabled and not world.is_all_loaded():
+        return false
+    world.register_loaded_chunks()
+    return (await _merge_world_patch_into_save(_capture_local_world_patch()))
 
 
-func _await_local_world_checkpoint(host_flush_request_id: int = 0) -> bool:
+func _await_local_world_checkpoint(host_flush_request_id: int = 0, lease_barrier: bool = false) -> bool:
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
+    var deadline: int = Time.get_ticks_msec() + 15000
+    while lease_busy and not lease_barrier and Time.get_ticks_msec() < deadline:
+        await get_tree().process_frame
+        if not _same_save_context(generation, file):
+            return false
+    if lease_busy and not lease_barrier:
+        return false
     if multiplayer.is_server():
-        return _checkpoint_local_host_world()
+        return (await _checkpoint_local_host_world())
     if not _can_transmit_pending_local_world_patch_to_host():
         return host_flush_request_id == 0
+    var world = Ref.world
+    var instance: String = get_active_dimension_instance_key()
     var wait_deadline: int = Time.get_ticks_msec() + int(GUEST_WORLD_PATCH_FLUSH_TIMEOUT_SEC * 1000.0)
-    while (guest_checkpoint_busy or canonical_apply_busy or not pending_canonical_patches.is_empty()) and Time.get_ticks_msec() < wait_deadline:
+    while (guest_checkpoint_busy or canonical_apply_busy or not pending_canonical_patches.is_empty() or not world.is_all_loaded()) and Time.get_ticks_msec() < wait_deadline:
         await get_tree().process_frame
-    if guest_checkpoint_busy or canonical_apply_busy or not pending_canonical_patches.is_empty():
+        if world != Ref.world or instance != get_active_dimension_instance_key() or not _same_save_context(generation, file):
+            return false
+    if not _same_save_context(generation, file) or guest_checkpoint_busy or canonical_apply_busy or not pending_canonical_patches.is_empty() or not world.is_all_loaded():
         return false
     guest_checkpoint_busy = true
-    var world = Ref.world
     var player = Ref.player
-    var instance: String = get_active_dimension_instance_key()
     var previous_mode: int = world.process_mode
     var was_disabled: bool = player.disabled
     guest_checkpoint_was_disabled = was_disabled
+    guest_checkpoint_locks_player = not lease_frozen
     world.process_mode = Node.PROCESS_MODE_DISABLED
-    player.disabled = true
+    if not lease_frozen:
+        player.disabled = true
     var profile_ok: bool = await _await_profile_checkpoint()
-    world.register_loaded_chunks()
-    var patch: Dictionary = _capture_local_world_patch()
-    var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
-    var root: Dictionary = patch.get("world_data", {}).get(prefix + "world", {})
-    var chunks: Array = chunk_authority.changed(instance, root, prefix)
-    var committed: bool = profile_ok
+    var committed: bool = profile_ok and _same_save_context(generation, file) and world == Ref.world and instance == get_active_dimension_instance_key() and world.is_all_loaded() and not receiving_host_world and not client_restore_in_progress and not reconnect_pending
+    var patch: Dictionary = {}
+    var prefix: String = ""
+    var chunks: Array = []
+    if committed:
+        world.register_loaded_chunks()
+        patch = _capture_local_world_patch()
+        prefix = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
+        var root: Dictionary = patch.get("world_data", {}).get(prefix + "world", {})
+        chunks = chunk_authority.changed(instance, root, prefix)
     var batches: Array = ChunkAuthority.batches(chunks)
     if batches.is_empty() and host_flush_request_id > 0:
         batches.append([])
@@ -8786,9 +9222,12 @@ func _await_local_world_checkpoint(host_flush_request_id: int = 0) -> bool:
             break
     if is_instance_valid(world) and world == Ref.world and instance == get_active_dimension_instance_key():
         world.process_mode = previous_mode
-    if is_instance_valid(player):
-        player.disabled = was_disabled or lease_preparing or lease_frozen or reconnect_pending or client_restore_in_progress
+    if is_instance_valid(player) and player == Ref.player and _same_save_context(generation, file) and instance == get_active_dimension_instance_key():
+        player.disabled = was_disabled or reconnect_pending or client_restore_in_progress
     guest_checkpoint_busy = false
+    guest_checkpoint_locks_player = false
+    if world != Ref.world or instance != get_active_dimension_instance_key() or not _same_save_context(generation, file):
+        return false
     if committed:
         _clear_pending_local_world_patch_state()
     else:
@@ -8798,12 +9237,13 @@ func _await_local_world_checkpoint(host_flush_request_id: int = 0) -> bool:
 
 
 func _await_profile_checkpoint() -> bool:
-    var deadline: int = Time.get_ticks_msec() + 5000
+    var deadline: int = Time.get_ticks_msec() + int(HOST_TIMEOUT_SECONDS * 1000.0)
     while profile_commit_pending and Time.get_ticks_msec() < deadline:
         await get_tree().process_frame
     if profile_commit_pending or reconnect_pending or client_restore_in_progress:
         return false
     var previous_revision: int = profile_revision
+    deadline = Time.get_ticks_msec() + int(HOST_TIMEOUT_SECONDS * 1000.0)
     _send_persistent_state_to_host(true)
     while profile_commit_pending and Time.get_ticks_msec() < deadline:
         await get_tree().process_frame
@@ -10764,7 +11204,7 @@ func _save_config() -> void:
 
 func _on_peer_connected(id: int) -> void:
     if multiplayer.is_server():
-        _restore_host_profile()
+        (await _restore_host_profile())
     auth_pending.erase(id)
     status_message = "Peer %s connected" % id
     print("[lucid-blocks-coop] %s" % status_message)
@@ -10793,9 +11233,14 @@ func _on_peer_disconnected(id: int) -> void:
         markers.erase(id)
     _remove_remote_player_proxy(id)
     _remove_remote_break_outline(id)
+    var token: String = lease_token
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     var restored: bool = true
     if restore_host:
         restored = await _restore_disconnected_runtime_state()
+        if lease_token != token or not _same_save_context(generation, file):
+            return
     if restore_host and restored:
         _resume_lease_runtime()
     elif not restored:
@@ -10808,28 +11253,67 @@ func _on_peer_disconnected(id: int) -> void:
         _commit_local_real_death("Your partner disconnected")
 
 func _restore_disconnected_runtime_state() -> bool:
+    var token: String = lease_token
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     if not await _drain_lease_mutations():
         return false
+    if lease_token != token or not _same_save_context(generation, file):
+        return false
     _freeze_lease_runtime()
+    # The old handoff may have committed while disconnect invalidated its continuation.
+    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [_profile_path(_get_local_player_key())], {})
+    if lease_token != token or not _same_save_context(generation, file) or ledger.is_empty():
+        return false
+    var durable: Dictionary = ledger.get("lease", {})
+    var epoch: int = int(durable.get("epoch", 0))
+    if epoch < chunk_authority.lease_epoch:
+        return false
+    if epoch > chunk_authority.lease_epoch or lease_pending_install_epoch == epoch and epoch > 0:
+        var old_chunks: Dictionary = lease_pending_previous_chunks.duplicate() if lease_pending_install_epoch == epoch else chunk_authority.lease_owners.duplicate()
+        if epoch > chunk_authority.lease_epoch and not chunk_authority.install_lease(epoch, durable["chunks"], durable["objects"]):
+            return false
+        terrain_epoch = auth_session_nonce + ":" + str(epoch)
+        var committed_payload: Dictionary = await _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), old_chunks)
+        if lease_token != token or not _same_save_context(generation, file) or committed_payload.is_empty():
+            return false
+        for part in committed_payload["parts"]:
+            if not await _install_lease_payload(part):
+                return false
+            if lease_token != token or not _same_save_context(generation, file):
+                return false
+    lease_pending_install_epoch = 0
+    lease_pending_previous_chunks.clear()
     lease_checkpoint_allowed = true
-    var saved: bool = _checkpoint_local_host_world()
+    var saved: bool = await _checkpoint_local_host_world()
+    if lease_token != token or not _same_save_context(generation, file):
+        return false
     lease_checkpoint_allowed = false
     if not saved:
         return false
     var previous: Dictionary = chunk_authority.lease_owners.duplicate()
-    if not _reclaim_disconnected_runtime_lease():
+    if not await _reclaim_disconnected_runtime_lease():
         return false
-    var payload: Dictionary = _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), previous)
-    if payload.is_empty():
+    if lease_token != token or not _same_save_context(generation, file):
+        return false
+    var payload: Dictionary = await _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), previous)
+    if lease_token != token or not _same_save_context(generation, file) or payload.is_empty():
         return false
     for part in payload["parts"]:
         if not await _install_lease_payload(part):
             return false
+        if lease_token != token or not _same_save_context(generation, file):
+            return false
     return true
 
 func _reclaim_disconnected_runtime_lease() -> bool:
+    var token: String = lease_token
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     var path: String = _profile_path(_get_local_player_key())
-    var ledger: Dictionary = personal_store.read_ledger(path)
+    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
+    if lease_token != token or not _same_save_context(generation, file):
+        return false
     if ledger.is_empty():
         return false
     var transfers: Array = []
@@ -10844,7 +11328,9 @@ func _reclaim_disconnected_runtime_lease() -> bool:
     for key in chunks:
         chunks[key] = 1
     var epoch: int = maxi(chunk_authority.lease_epoch, int(ledger.get("lease", {}).get("epoch", 0))) + 1
-    if not personal_store.commit_lease(path, epoch, chunks, objects, transfers):
+    if not await _store_job(personal_store, "commit_lease", [path, epoch, chunks, objects, transfers], false):
+        return false
+    if lease_token != token or not _same_save_context(generation, file):
         return false
     chunk_authority.install_lease(epoch, chunks, objects)
     terrain_epoch = auth_session_nonce + ":" + str(epoch)
@@ -10953,9 +11439,10 @@ func _shutdown_host_session(reconnectable: bool, reason: String = "") -> bool:
     return true
 
 func _on_local_world_loaded() -> void:
+    lease_residency_key = ""
     if not receiving_host_world and not client_restore_in_progress and not reconnect_pending:
         guest_world_loaded = false
-    _restore_host_profile()
+    (await _restore_host_profile())
     _set_single_player_shutdown_world_pause_override(false)
     _install_player_death_hook()
     call_deferred("_install_game_menu_quit_hook")
@@ -11149,7 +11636,8 @@ func _set_reconnect_overlay_visible(visible: bool) -> void:
         if panel_visible:
             restore_capture_on_close = false
             toggle_panel(false)
-        reconnect_restore_capture_on_close = MouseHandler.captured
+        if not reconnect_overlay.visible:
+            reconnect_restore_capture_on_close = MouseHandler.captured
         MouseHandler.release()
     elif reconnect_restore_capture_on_close and not panel_visible:
         MouseHandler.capture()
@@ -11218,7 +11706,7 @@ func _apply_peer_persistent_player_to_snapshot(snapshot_save_data: Dictionary, p
     var player_key: String = str(admitted_player_keys.get(peer_id, ""))
     if player_key.is_empty():
         return
-    var guest_data: Dictionary = _get_guest_persistent_state(player_key)
+    var guest_data: Dictionary = (await _get_guest_persistent_state(player_key))
     SaveFile._set_data(snapshot_save_data, "node/player", guest_data.get("node", {}).get("player", {}).duplicate(true))
     var dimension_namespace: String = str(SaveFile.DIMENSION_MAP.get(target_dimension, ""))
     if not dimension_namespace.is_empty():
@@ -11227,6 +11715,9 @@ func _apply_peer_persistent_player_to_snapshot(snapshot_save_data: Dictionary, p
 
 
 func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, target_pocket_owner_key: String = "", follow_host_position: bool = false) -> void:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
+    var context_key: String = str(admitted_player_keys.get(peer_id, ""))
     if not _can_share_loaded_world():
         return
 
@@ -11273,7 +11764,9 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
         snapshot_save_data[snapshot_namespace + "_world"] = terrain
     if not _merge_instance_nodes_into_snapshot(snapshot_save_data, get_dimension_instance_key(actual_dimension, target_pocket_owner_key), actual_dimension, target_pocket_owner_key):
         return
-    _apply_peer_persistent_player_to_snapshot(snapshot_save_data, peer_id, actual_dimension)
+    (await _apply_peer_persistent_player_to_snapshot(snapshot_save_data, peer_id, actual_dimension))
+    if not _same_save_context(context_generation, context_file) or admitted_player_keys.get(peer_id, "") != context_key:
+        return
     var roster: Dictionary = {}
     var profiles: Dictionary = Ref.save_file_manager.loaded_file.get_data("coop/players", {}, true)
     for key in profiles:
@@ -11296,7 +11789,7 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
         host_world_snapshot_chunk.rpc_id(peer_id, chunk_index, save_buffer.slice(start, end))
     finish_host_world_snapshot.rpc_id(peer_id)
 
-    status_message = "Peer %s joined host world" % peer_id
+    status_message = "World sent to peer %s; waiting for readiness" % peer_id
     _update_status_text()
 
 
@@ -11340,6 +11833,7 @@ func _load_host_world_snapshot(register_data: Dictionary, save_data: Dictionary,
         _begin_reconnect_flow("Host snapshot contains an invalid runtime lease")
         return
     guest_world_loaded = true
+    guest_persistent_ready = false
     receiving_host_world = true
     client_restore_in_progress = true
     local_fake_death_pending = false
@@ -11367,7 +11861,10 @@ func _load_host_world_snapshot(register_data: Dictionary, save_data: Dictionary,
 
     Ref.save_file_manager.loaded_file_register = register
     Ref.save_file_manager.loaded_file = save_file
-    Ref.audio_manager.stop_song(Ref.main.main_menu_music)
+    for player in Ref.audio_manager.music_players:
+        if is_instance_valid(player) and player.stream == Ref.main.main_menu_music:
+            Ref.audio_manager.stop_song(Ref.main.main_menu_music)
+            break
     Ref.save_file_manager.load_file(register, false)
 
     await Ref.main.enter_game()
@@ -11835,6 +12332,15 @@ var _property_cache: Dictionary = {}
 func _object_has_property(target: Object, property_name: String) -> bool:
     if target == null:
         return false
+    if target is AnimationTree and property_name.begins_with("parameters/"):
+        var graph: int = target.tree_root.get_instance_id() if target.tree_root != null else 0
+        var parameters: Dictionary = target.get_meta("coop_parameter_cache", {})
+        if parameters.get("graph", -1) != graph:
+            parameters = {"graph": graph}
+        if not parameters.has(property_name):
+            parameters[property_name] = property_name in target
+            target.set_meta("coop_parameter_cache", parameters)
+        return bool(parameters[property_name])
     var class_name_key: String = target.get_class()
     if target.get_script() != null:
         class_name_key = str(target.get_script().resource_path)
@@ -13332,6 +13838,7 @@ func _play_client_entity_hit_feedback(target, _attacker, _damage_position: Vecto
 
 
 func _apply_network_place(block_position: Vector3i, block_id: int) -> void:
+    _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world):
         return
     if not Ref.world.is_position_loaded(block_position):
@@ -13349,6 +13856,7 @@ func _apply_loaded_network_place(block_position: Vector3i, block_id: int) -> voi
 
 
 func _apply_network_break(block_position: Vector3i) -> void:
+    _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world):
         return
     if not Ref.world.is_position_loaded(block_position):
@@ -13393,6 +13901,7 @@ func _apply_network_block_changes(changes: Array) -> void:
 
 
 func _apply_network_water_cells(changes: Array) -> void:
+    _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world):
         return
     var applied_change: bool = false
@@ -13413,6 +13922,7 @@ func _apply_network_water_cells(changes: Array) -> void:
 
 
 func _apply_network_fire_cell(block_position: Vector3i, fire_level: int) -> void:
+    _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world):
         return
     if not Ref.world.is_position_loaded(block_position):
@@ -13425,6 +13935,7 @@ func _apply_network_fire_cell(block_position: Vector3i, fire_level: int) -> void
 
 
 func _apply_network_fire_cells(changes: Array) -> void:
+    _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world):
         return
     var applied_change: bool = false
@@ -13963,8 +14474,10 @@ func request_pickup_drop(item_uuid: String, request: String, revision: int, inst
     var sender: int = multiplayer.get_remote_sender_id()
     if not multiplayer.is_server() or not admitted_player_keys.has(sender):
         return
-    var record: Dictionary = _collect_durable_pickup(sender, admitted_player_keys[sender], instance, item_uuid, request, revision, epoch)
-    receive_durable_pickup.rpc_id(sender, request, record, epoch)
+    var key: String = admitted_player_keys[sender]
+    var record: Dictionary = await _collect_durable_pickup(sender, key, instance, item_uuid, request, revision, epoch)
+    if admitted_player_keys.get(sender, "") == key and multiplayer.get_peers().has(sender):
+        receive_durable_pickup.rpc_id(sender, request, record, epoch)
 
 @rpc("any_peer", "call_remote", "reliable")
 func submit_guest_persistent_state(player_key: String, player_name: String, save_data: Dictionary) -> void:
@@ -14028,7 +14541,9 @@ func request_guest_persistent_state(player_key: String, player_name: String) -> 
     if sender_id <= 0:
         return
 
-    var guest_data: Dictionary = _get_guest_persistent_state(player_key)
+    var guest_data: Dictionary = (await _get_guest_persistent_state(player_key))
+    if admitted_player_keys.get(sender_id, "") != player_key or not multiplayer.get_peers().has(sender_id):
+        return
     if guest_data.is_empty():
         Ref.save_file_manager.loaded_file.set_data("coop/players/%s/name" % player_key, player_name, true)
     receive_guest_persistent_state.rpc_id(sender_id, guest_data)
@@ -14089,7 +14604,7 @@ func request_host_world_snapshot() -> void:
 
     if not admitted_player_keys.has(sender_id):
         return
-    var state: Dictionary = _get_guest_persistent_state(admitted_player_keys[sender_id])
+    var state: Dictionary = (await _get_guest_persistent_state(admitted_player_keys[sender_id]))
     if state.get("_coop_invalid", false):
         (multiplayer as SceneMultiplayer).disconnect_peer(sender_id)
         return
@@ -14126,7 +14641,11 @@ func begin_host_world_snapshot(register_json: String, chunk_count: int, host_pos
         return
 
     if epoch != terrain_epoch:
-        return
+        # A new connection knows the session nonce but not its committed lease revision.
+        var revision: String = epoch.trim_prefix(terrain_epoch + ":")
+        if guest_persistent_ready or chunk_authority.lease_epoch != 0 or terrain_epoch.length() != 32 or not epoch.begins_with(terrain_epoch + ":") or not revision.is_valid_int() or revision.to_int() <= 0 or revision.length() > 18:
+            return
+        terrain_epoch = epoch
     chunk_authority.revisions = versions.duplicate()
     _mark_host_contact()
 
@@ -14787,7 +15306,7 @@ func server_snapshot_reliable(snapshot_sequence: int, snapshot: Array) -> void:
     server_snapshot(snapshot_sequence, snapshot)
 
 func _execute_help_command() -> void:
-    status_message = "Commands: /give /tp /visit /gamemode /spawn /spawnlist /spawnmenu /time /weather /host /join /avatar /char-select"
+    status_message = "Commands: /give /tp /visit /enderchest /gamemode /spawn /spawnlist /spawnmenu /time /weather /host /join /avatar /char-select"
     _update_status_text()
 
 

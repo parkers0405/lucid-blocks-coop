@@ -1,6 +1,12 @@
 extends Node
 const DROP: String = "res://main/items/dropped_item/dropped_item.tscn"
 const UUID: String = "33333333-3333-4333-8333-333333333333"
+class TravelEntity extends Entity:
+    func _ready() -> void:
+        pass
+    func is_session_position_loaded(_position: Vector3) -> bool:
+        return true
+
 class Manager extends "res://coop_mod/coop_manager.gd":
     var fixture_root: String
     var live: bool = true
@@ -8,6 +14,8 @@ class Manager extends "res://coop_mod/coop_manager.gd":
         pass
     func _physics_process(_delta: float) -> void:
         pass
+    func _is_local_session_player_active() -> bool:
+        return true
     func _has_live_peer() -> bool:
         return live
     func _can_sample_player() -> bool:
@@ -50,14 +58,25 @@ class CheckpointResumeManager extends Manager:
 class ReclaimManager extends Manager:
     var checkpoint_saw_old_barrier: bool = false
     var fail_apply: bool = false
+    var replace_token: bool = false
+    var expected_uuid: String = ""
+    var checkpoint_has_committed_bundle: bool = false
     func get_active_dimension_instance_key() -> String:
         return "dimension:" + str(int(Ref.world.current_dimension))
     func _local_loaded_lease_chunks() -> Array:
         return [Vector3i.ZERO]
     func _checkpoint_local_host_world() -> bool:
         checkpoint_saw_old_barrier = lease_frozen and lease_checkpoint_allowed
+        if not expected_uuid.is_empty():
+            var saved: Dictionary = Ref.save_file_manager.loaded_file.get_data("node/" + expected_uuid, {})
+            for entry in saved.values():
+                if entry is Dictionary and entry.get("capacity") == 1:
+                    checkpoint_has_committed_bundle = entry["items"][0][1] == 6
         return true
     func _apply_canonical_terrain(_patch: Dictionary) -> bool:
+        if replace_token:
+            await get_tree().process_frame
+            lease_token = "replacement"
         return not fail_apply
 var checks: int = 0
 var failures: int = 0
@@ -88,11 +107,32 @@ func trace_orphan_inventories(stage: String) -> void:
     print("LEASE_ORPHAN_INVENTORY ", stage, " count=", count, " script=", script_path)
 func run() -> int:
     trace_orphan_inventories("before_drop_fixture")
+    var viewport := SubViewport.new()
+    viewport.own_world_3d = true
+    viewport.process_mode = Node.PROCESS_MODE_ALWAYS
+    add_child(viewport)
+    var body: Entity = load("res://main/entity/entity.tscn").instantiate()
+    body.set_script(TravelEntity)
+    var enabler = body.get_node("%VisibleOnScreenEnabler3D")
+    enabler.enable_node_path = NodePath("")
+    enabler.process_mode = Node.PROCESS_MODE_DISABLED
+    body.process_mode = Node.PROCESS_MODE_ALWAYS
+    viewport.add_child(body)
+    body.set_physics_process(false)
+    body.set_process(false)
+    var space: RID = PhysicsServer3D.body_get_space(body.get_rid())
+    check(space.is_valid() and body.is_future_position_loaded(0.0), "attached physics body can move in its loaded area")
+    PhysicsServer3D.body_set_space(body.get_rid(), RID())
+    check(not body.is_future_position_loaded(0.0), "detached travel body cannot attempt motion even while terrain remains loaded")
+    PhysicsServer3D.body_set_space(body.get_rid(), space)
+    body.free()
+    viewport.free()
     var checkpoint_manager := CheckpointResumeManager.new()
     add_child(checkpoint_manager)
     var originally_disabled: bool = Ref.player.disabled
     for initially_disabled in [false, true]:
         checkpoint_manager.guest_checkpoint_busy = true
+        checkpoint_manager.guest_checkpoint_locks_player = true
         checkpoint_manager.guest_checkpoint_was_disabled = initially_disabled
         Ref.player.disabled = true
         await checkpoint_manager._handoff_runtime_lease({})
@@ -111,6 +151,7 @@ func run() -> int:
     var key: String = manager.ChunkAuthority.chunk_key("dimension:2", Vector3i.ZERO)
     check(manager.chunk_authority.install_lease(1, {key: 2}, {"dimension:2|" + UUID: 2}), "runtime fixture installs granted guest owner")
     check(not manager.owns_runtime_node(actor) and not manager.can_mutate_runtime_node(actor), "host replica cannot process or mutate guest UUID")
+    check(manager.personal_store.commit_lease(manager._profile_path("host"), 1, {key: 2}, {}, []), "fixture durable lease agrees with runtime epoch")
     manager.peer_states[2] = {"active": true, "downed": false, "dimension_instance_key": "dimension:2"}
     manager.admitted_player_keys[2] = "guest"
     manager.terrain_epoch = "session:1"
@@ -118,9 +159,9 @@ func run() -> int:
     manager.lease_frozen = true
     check(not manager._valid_runtime_sender(2, "session:1"), "frozen runtime rejects mutation RPC")
     var state: Dictionary = {"_coop_revision": 0, "node": {"player": {}}}
-    check(manager._commit_player_checkpoint("host", state, "dimension:2", 2, []).is_empty(), "install phase cannot tombstone missing UUID via profile checkpoint")
+    check((await manager._commit_player_checkpoint("host", state, "dimension:2", 2, [])).is_empty(), "install phase cannot tombstone missing UUID via profile checkpoint")
     manager.lease_checkpoint_allowed = true
-    check(manager._commit_player_checkpoint("host", state, "dimension:2", 2, []).get("revision") == 1, "explicit old-lease barrier checkpoint remains allowed while frozen")
+    check((await manager._commit_player_checkpoint("host", state, "dimension:2", 2, [])).get("revision") == 1, "explicit old-lease barrier checkpoint remains allowed while frozen")
     manager.lease_checkpoint_allowed = false
     manager.lease_token = "current_token"
     manager.lease_phase = "install_1"
@@ -187,7 +228,7 @@ func run() -> int:
     replacement.free()
     Ref.save_file_manager.loaded_file = prior_file
     manager.free()
-    check_presence_capture()
+    await check_presence_capture()
     await check_disconnected_reclaim()
     trace_orphan_inventories("after_reclaim_fixture")
     print("LEASE_RUNTIME_RESULT ", checks, " checks ", failures, " failures")
@@ -220,7 +261,7 @@ func check_presence_capture() -> void:
     var path: String = presence._profile_path("host")
     presence.personal_store.save_checkpoint(path, empty, 0, presence._ledger_instance_key(instance), plain, [bundle], {DROP: true})
     presence.terrain_epoch = "presence_fixture"
-    var picked: Dictionary = presence._collect_durable_pickup(1, "host", instance, UUID, "a".repeat(64), 1, presence.terrain_epoch)
+    var picked: Dictionary = (await presence._collect_durable_pickup(1, "host", instance, UUID, "a".repeat(64), 1, presence.terrain_epoch))
     check(picked.get("revision") == 2 and picked["state"]["node"]["player"]["Inventory"]["items"][0][1] == 4, "real locked capture admits durable host pickup")
     presence._release_chest_inventory_lock()
     Ref.player.disabled = true
@@ -232,6 +273,9 @@ func check_presence_capture() -> void:
     presence.reconnect_pending = true
     check(not presence._capture_local_state()["active"] and not presence._is_local_session_player_active(), "reconnect cannot be made active by a controlled lock")
     presence.reconnect_pending = false
+    presence.suppress_local_game_quit_session_shutdown = true
+    check(not presence._is_local_session_player_active(), "native dimension loading cannot start another lease even after player initialization")
+    presence.suppress_local_game_quit_session_shutdown = false
     presence.lease_frozen = false
     presence.local_downed = true
     check(presence._capture_local_state()["active"] and presence._capture_local_state()["downed"] and not presence._valid_chest_session(1, instance, position), "downed revival presence remains visible but cannot transact")
@@ -272,13 +316,17 @@ func check_disconnected_reclaim() -> void:
     reclaim._merge_save_data_into_loaded_file(bundle["save_data"])
     reclaim.personal_store.save_checkpoint(path, empty, 0, reclaim._ledger_instance_key(instance), plain, [bundle], {DROP: true})
     reclaim.personal_store.collect_drop(path, 1, "b".repeat(64), reclaim._ledger_instance_key(instance), UUID, func(_id): return 64)
+    reclaim.personal_store.commit_lease(path, 1, {key: 2}, {instance + "|" + UUID: 2}, [])
     reclaim.chunk_authority.install_lease(1, {key: 2}, {instance + "|" + UUID: 2})
     reclaim.lease_busy = true
     reclaim.lease_was_disabled = previous_disabled
     check(await reclaim._restore_disconnected_runtime_state() and reclaim.checkpoint_saw_old_barrier, "disconnect checkpoints old lease then installs canonical reclaim")
-    check(reclaim.lease_frozen and stale.is_queued_for_deletion() and not reclaim.owns_runtime_node(stale), "durably deleted stale replica stays frozen and is removed before resume")
+    check(reclaim.lease_frozen and (not is_instance_valid(stale) or stale.is_queued_for_deletion()), "durably deleted stale replica stays frozen and is removed before resume")
     await get_tree().process_frame
     check(not is_instance_valid(stale) and reclaim.personal_store.instance_bundles(path, reclaim._ledger_instance_key(instance))["bundles"].is_empty(), "reclaim cannot resurrect collected UUID or generate duplicate loot")
+    check((await reclaim._lease_install_payload("pocket:../alice", [], {})).is_empty(), "object-only handoff rejects invalid instance namespace")
+    var compact: Dictionary = await reclaim._lease_install_payload(instance, [Vector3i.ZERO], {key: 2})
+    check(compact.get("parts", []).size() == 1 and compact["parts"][0]["deleted"].has(UUID), "empty terrain does not add a handoff round trip or hide tombstones")
     reclaim._resume_lease_runtime()
     var uuid_live: String = "44444444-4444-4444-8444-444444444444"
     var older = load(DROP).instantiate()
@@ -298,9 +346,14 @@ func check_disconnected_reclaim() -> void:
     reclaim._merge_save_data_into_loaded_file(reclaim._capture_entity_save_bundle(older, uuid_live)["save_data"])
     var profile: Dictionary = reclaim.personal_store.read_profile(path)
     reclaim.personal_store.save_checkpoint(path, profile["state"], profile["revision"], reclaim._ledger_instance_key(instance), plain, [newer], {DROP: true})
+    reclaim.personal_store.commit_lease(path, 3, {key: 2}, {instance + "|" + uuid_live: 2}, [])
+    # The map committed, but its durable objects have not been installed yet.
+    reclaim.lease_pending_previous_chunks = reclaim.chunk_authority.lease_owners.duplicate()
+    reclaim.lease_pending_install_epoch = 3
     reclaim.chunk_authority.install_lease(3, {key: 2}, {instance + "|" + uuid_live: 2})
+    reclaim.expected_uuid = uuid_live
     reclaim.lease_busy = true
-    check(await reclaim._restore_disconnected_runtime_state() and older.is_queued_for_deletion(), "reclaim installs newer canonical live bundle instead of resuming stale copy")
+    check(await reclaim._restore_disconnected_runtime_state() and reclaim.checkpoint_has_committed_bundle and (not is_instance_valid(older) or older.is_queued_for_deletion()), "reclaim installs newer canonical live bundle instead of resuming stale copy")
     await get_tree().process_frame
     var restored: Dictionary = Ref.save_file_manager.loaded_file.get_data("node/" + uuid_live, {})
     var restored_count: int = 0
@@ -308,8 +361,17 @@ func check_disconnected_reclaim() -> void:
         if entry is Dictionary and entry.get("capacity") == 1:
             restored_count = entry["items"][0][1]
     check(not is_instance_valid(older) and restored_count == 6 and restored.get("file_path") == DROP, "new canonical item count and UUID survive old replica deletion")
+    var offscreen: Dictionary = await reclaim._lease_install_payload(instance, [], reclaim.chunk_authority.lease_owners.duplicate())
+    var retained: bool = false
+    for part in offscreen.get("parts", []):
+        for entry in part.get("bundles", []):
+            retained = retained or entry["uuid"] == uuid_live
+    check(retained, "offscreen owned objects enter canonical save cache even without a chunk transfer")
     reclaim.fail_apply = true
     check(not await reclaim._restore_disconnected_runtime_state() and reclaim.lease_frozen, "failed reclaim installation cannot release gameplay")
+    reclaim.fail_apply = false
+    reclaim.replace_token = true
+    check(not await reclaim._install_lease_payload({"dimension_instance_key": instance, "deleted": [uuid_live]}) and not Ref.save_file_manager.loaded_file.get_data("node/" + uuid_live, {}).is_empty(), "replaced lease cannot delete objects after a yielded terrain installation")
     for node in Ref.preserve_node_manager.node_to_uuid_map.keys():
         if is_instance_valid(node) and Ref.preserve_node_manager.node_to_uuid_map[node] in [UUID, uuid_live]:
             node.free()

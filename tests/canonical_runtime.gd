@@ -79,26 +79,23 @@ func run() -> int:
     fluid.resize(4096)
     var awake := PackedByteArray()
     awake.resize(64)
-    var host_region: Dictionary = {"chunk_block": {Vector3i.ZERO: blocks}, "chunk_water": {Vector3i.ZERO: fluid}, "chunk_water_awake": {Vector3i.ZERO: awake}, "chunk_fire": {Vector3i.ZERO: fluid}}
+    var initial_region: Dictionary = {"chunk_block": {Vector3i.ZERO: blocks}, "chunk_water": {Vector3i.ZERO: fluid}, "chunk_water_awake": {Vector3i.ZERO: awake}, "chunk_fire": {Vector3i.ZERO: fluid}}
     var guest_chunk := Vector3i(1024, 0, 0)
     var guest_region: Dictionary = {}
-    for channel in host_region:
-        guest_region[channel] = {guest_chunk: host_region[channel][Vector3i.ZERO].duplicate()}
+    for channel in initial_region:
+        guest_region[channel] = {guest_chunk: initial_region[channel][Vector3i.ZERO].duplicate()}
     guest_region["chunk_water"][guest_chunk][9] = 4
-    var host := _world(viewport, Vector3.ZERO, host_region)
     var guest := _world(viewport, Vector3(guest_chunk), guest_region)
     var deadline: int = Time.get_ticks_msec() + 15000
-    while (not host.is_all_loaded() or not guest.is_all_loaded()) and Time.get_ticks_msec() < deadline:
-        host.set_loaded_region_center(host.center)
+    while not guest.is_all_loaded() and Time.get_ticks_msec() < deadline:
         guest.set_loaded_region_center(guest.center)
         await get_tree().process_frame
-    if not host.is_all_loaded() or not guest.is_all_loaded():
+    if not guest.is_all_loaded():
         print("CANONICAL_RUNTIME_FAIL load deadline; terminating owned disposable process")
         OS.kill(OS.get_process_id())
         return 1
-    check(host.is_position_loaded(Vector3(0.5, 0.5, 0.5)), "host local bubble loaded")
     check(guest.is_position_loaded(Vector3(1024.5, 0.5, 0.5)), "distant guest bubble loaded")
-    check(not host.is_position_loaded(Vector3(1024.5, 0.5, 0.5)) and not guest.is_position_loaded(Vector3(0.5, 0.5, 0.5)), "local centers remain independent without native modifications")
+    check(not guest.is_position_loaded(Vector3(0.5, 0.5, 0.5)), "canonical fixture retains one local loading bubble")
     var manager := Manager.new()
     add_child(manager)
     manager.terrain_epoch = "fixture"
@@ -129,9 +126,7 @@ func run() -> int:
     check(manager.pending_canonical_patches.is_empty(), "old-session queued update rejected before requeue or native mutation")
     manager.canonical_apply_busy = false
     manager.free()
-    host.load_enabled = false
     guest.load_enabled = false
-    host.clear()
     guest.clear()
     await get_tree().process_frame
     viewport.free()

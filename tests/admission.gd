@@ -198,6 +198,12 @@ func run() -> int:
     var proposed_root: Dictionary = {"test_chunk_block": {Vector3i.ZERO: PackedInt32Array([1])}}
     _assert(guest.chunk_authority.current("naraka", proposed_root, "test_", guest.chunk_authority.revisions), "first post-reconnect checkpoint uses seeded revision")
     guest.receiving_host_world = false
+    host.begin_host_world_snapshot.rpc_id(guest.multiplayer.get_unique_id(), "{}", 1, Vector3.ZERO, {revision_key: 8}, host.terrain_epoch + ":3", false)
+    _assert(await _wait_until(func(): return guest.receiving_host_world and guest.terrain_epoch == host.terrain_epoch + ":3"), "new connection accepts current host lease epoch within authenticated session")
+    guest.receiving_host_world = false
+    host.begin_host_world_snapshot.rpc_id(guest.multiplayer.get_unique_id(), "{}", 1, Vector3.ZERO, {}, "other-session:4", false)
+    await _wait_until(func(): return false, 50)
+    _assert(not guest.receiving_host_world and guest.terrain_epoch == host.terrain_epoch + ":3", "snapshot from a different session cannot replace admitted epoch")
     var third_transport := ENetMultiplayerPeer.new()
     third_transport.create_client("127.0.0.1", host.multiplayer.multiplayer_peer.get_host().get_local_port())
     var third := _peer("Third", third_transport)

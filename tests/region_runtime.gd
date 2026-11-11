@@ -34,7 +34,7 @@ class ManagerFixture extends "res://coop_mod/coop_manager.gd":
         pass
     func _checkpoint_local_instance_nodes() -> bool:
         return true
-    func _persist_host_profile() -> bool:
+    func _persist_host_profile(_skip_unchanged: bool = false) -> bool:
         return true
     func _can_sample_player() -> bool:
         return true
@@ -100,7 +100,7 @@ func run() -> int:
     manager.terrain_epoch = "region_fixture:1"
     check(manager.chunk_authority.install_lease(1, {manager.ChunkAuthority.chunk_key("pocket:alice", chunk): 2}, {}), "guest checkpoint uses explicitly granted old lease")
     patch["epoch"] = manager.terrain_epoch
-    check(manager._checkpoint_and_reply(2, patch), "host checkpoint commit")
+    check(await manager._checkpoint_and_reply(2, patch), "host checkpoint commit")
     check(manager.replies == [true], "success ACK after commit")
     check(not manager.pending_guest_world_patch_flush_acks.has(9), "successful durable flush cleared")
     var manifest: String = manager.fixture_root.path_join("coop/pocket__alice/manifest.json")
@@ -108,7 +108,7 @@ func run() -> int:
     patch["versions"] = manager.chunk_authority.revisions.duplicate()
     manager.region_checkpoint = FailStore.new()
     manager.pending_guest_world_patch_flush_acks[9] = {2: "pocket:alice"}
-    check(not manager._checkpoint_and_reply(2, patch), "failed manifest publish")
+    check(not await manager._checkpoint_and_reply(2, patch), "failed manifest publish")
     check(manager.replies == [true, false], "failed write never success ACK")
     check(manager.pending_guest_world_patch_flush_acks.has(9), "failed flush remains pending")
     check(manager.failed_guest_world_patch_flushes.has(9), "host observes failed flush")
@@ -150,7 +150,7 @@ func run() -> int:
     check(owner_world.queue_dimension_instance(3, "bob"), "valid destination queued")
     check(owner_world._get_dimension_save_namespace() == "pocket__alice", "queued destination does not rename outgoing world")
     manager.region_checkpoint = load("res://coop_mod/region_checkpoint.gd").new()
-    check(manager._checkpoint_local_host_world(), "source checkpoint succeeds before switch")
+    check((await manager._checkpoint_local_host_world()), "source checkpoint succeeds before switch")
     check(not manager.region_checkpoint.has_checkpoint(manager.fixture_root, "pocket__bob"), "outgoing save never writes destination namespace")
     check(owner_world.apply_pending_dimension_instance(source_register), "incoming load consumes destination owner")
     check(owner_world._get_dimension_save_namespace() == "pocket__bob", "incoming namespace changes only after source save")
@@ -226,7 +226,7 @@ func run() -> int:
     check(Ref.world.pending_dimension_instance == queued_before, "failed preflight preserves outgoing instance")
     var prior_world = Ref.world
     Ref.world = legacy_world
-    check(not manager._checkpoint_local_host_world(), "failed migration blocks host disposal checkpoint")
+    check(not (await manager._checkpoint_local_host_world()), "failed migration blocks host disposal checkpoint")
     Ref.world = prior_world
     legacy_world.region_checkpoint_store = load("res://coop_mod/region_checkpoint.gd").new()
     legacy_file.data.merge(pure.legacy("naraka", selected_id))

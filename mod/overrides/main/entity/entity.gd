@@ -397,7 +397,7 @@ func _on_equipment_inventory_item_slot_changed(_inventory: Inventory, _index: in
 
 
 func _physics_process(delta: float) -> void :
-    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
+    if not self is Player and Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
         return
     if disabled:
         return
@@ -795,6 +795,9 @@ func preserve_load(file: SaveFile, uuid: String) -> void :
 
 
 func decrease_held_item_durability(amount: int) -> void :
+    # Passive equipment timers pause while a durable inventory result is pending.
+    if self is Player and Ref.coop_manager != null and Ref.coop_manager.chest_lock_active:
+        return
     if held_item == null:
         return
     held_item_inventory.decrease_item_durability(held_item_index, amount)
@@ -879,10 +882,9 @@ func allow_swarm() -> void :
 
 
 func is_future_position_loaded(delta: float) -> bool:
-    var future_position: Vector3 = global_position + velocity * delta
-    if Ref.world.is_position_loaded(future_position):
-        return true
-    return _can_use_session_load_proxy() and Ref.coop_manager.is_position_near_same_instance_player(future_position, process_distance)
+    if not is_inside_tree() or is_queued_for_deletion() or not PhysicsServer3D.body_get_space(get_rid()).is_valid():
+        return false
+    return is_session_position_loaded(global_position + velocity * delta)
 
 
 func distance_process_check() -> void :
