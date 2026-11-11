@@ -26,7 +26,7 @@ function Invoke-Run([hashtable] $Arguments) {
 }
 $scenarios = $Cells | ForEach-Object { ($_ -split ':')[0] } | Select-Object -Unique
 if (-not $SkipControls) {
-    foreach ($control in @('original', 'offline')) { Invoke-Run @{ WorldControl = $control } }
+    foreach ($control in @('original', 'offline')) { foreach ($enters in @(2, 3)) { Invoke-Run @{ WorldControl = $control; ControlEnters = $enters } } }
 }
 foreach ($scenario in $(if ($SkipSolo) { @() } else { $scenarios })) {
     for ($i = 0; $i -lt $Repeats; $i++) { Invoke-Run @{ Scenario = $scenario; Solo = $true; TimeoutSeconds = 400 } }
