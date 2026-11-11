@@ -85,10 +85,13 @@ try {
         Start-Sleep -Milliseconds 1500
     }
     foreach ($role in $roles) {
-        $runtime = Join-Path $run $role
+        # The game loads mods and native libraries relative to its exe, so the runtime lives beside the fixed exe; only profile/temp data is per run.
+        $runtime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../work/friction/bin/$role"))
+        $data = Join-Path $run $role
+        if (Test-Path -LiteralPath (Join-Path $runtime 'mods')) { Remove-Item -LiteralPath (Join-Path $runtime 'mods') -Recurse -Force }
         [IO.Directory]::CreateDirectory((Join-Path $runtime 'mods')) | Out-Null
-        [IO.Directory]::CreateDirectory((Join-Path $runtime 'profile')) | Out-Null
-        [IO.Directory]::CreateDirectory((Join-Path $runtime 'temp')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $data 'profile')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $data 'temp')) | Out-Null
         [IO.File]::WriteAllText((Join-Path $runtime '.coop-test-runtime'), 'disposable')
         if ($WorldControl -ne 'original') {
             Copy-Item -LiteralPath $pack -Destination (Join-Path $runtime 'mods/lucid-blocks-coop.pck')
@@ -105,8 +108,11 @@ try {
             Copy-Item -LiteralPath (Join-Path $runtime $entry[0]) -Destination (Join-Path $folder $entry[0].Replace('template_release', 'template_debug'))
         }
         Copy-Item -LiteralPath (Join-Path $runtime 'steam_api64.dll') -Destination (Join-Path $runtime 'addons/godotsteam/win64/steam_api64.dll')
+        # Fixed per-role exe path reused across runs so Windows Firewall allow rules keep matching; refreshed only when the editor changes.
         $runtimeEditor = Join-Path $runtime 'local-coop-godot.exe'
-        Copy-Item -LiteralPath $editor -Destination $runtimeEditor
+        if (-not (Test-Path -LiteralPath $runtimeEditor) -or (Get-FileHash -LiteralPath $runtimeEditor).Hash -ne (Get-FileHash -LiteralPath $editor).Hash) {
+            Copy-Item -LiteralPath $editor -Destination $runtimeEditor -Force
+        }
         $info = [Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $runtimeEditor
         $info.WorkingDirectory = $runtime
@@ -114,8 +120,8 @@ try {
         $info.CreateNoWindow = $true
         $info.RedirectStandardOutput = $true
         $info.RedirectStandardError = $true
-        $info.Environment['APPDATA'] = Join-Path $runtime 'profile'
-        $info.Environment['TEMP'] = Join-Path $runtime 'temp'
+        $info.Environment['APPDATA'] = Join-Path $data 'profile'
+        $info.Environment['TEMP'] = Join-Path $data 'temp'
         $info.Environment['TMP'] = $info.Environment['TEMP']
         foreach ($argument in @('--headless', '--max-fps', '60', '--path', $runtime, '--main-pack', $game, '--', $role, $run, $(if ($role -eq 'guest' -and $useRelay) { "$relayPort" } else { "$port" }))) { $info.ArgumentList.Add($argument) }
         $process = [Diagnostics.Process]::Start($info)
@@ -124,7 +130,7 @@ try {
             StandardOutput = $process.StandardOutput.ReadToEndAsync()
             StandardError = $process.StandardError.ReadToEndAsync()
         }
-        [IO.File]::WriteAllText((Join-Path $runtime 'owned-pid.txt'), "$($process.Id)")
+        [IO.File]::WriteAllText((Join-Path $data 'owned-pid.txt'), "$($process.Id)")
         Write-Output "LOCAL_COOP_STARTED $role $($process.Id)"
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
