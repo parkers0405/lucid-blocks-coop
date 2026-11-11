@@ -20,6 +20,10 @@ param(
     [int] $Trips = 2
 )
 $ErrorActionPreference = 'Stop'
+# Only one host+guest pair at a time: a named mutex held for the whole run; stray test processes from a killed runner are removed first.
+$gate = [Threading.Mutex]::new($false, 'Global\lucid-blocks-coop-friction')
+if (-not $gate.WaitOne(0)) { throw 'Another friction run is active; refusing to start a second pair.' }
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'local-coop-godot.exe' -or ($_.Name -like 'godot*.exe' -and $_.CommandLine -match 'udp_relay\.gd') } | ForEach-Object { Write-Output "LOCAL_COOP_STRAY_KILLED $($_.ProcessId) $($_.Name)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $game = (Resolve-Path -LiteralPath $GameExe).Path
 $editor = (Resolve-Path -LiteralPath $Godot).Path
 $gdreTool = (Resolve-Path -LiteralPath $Gdre).Path
@@ -135,11 +139,11 @@ try {
 finally {
     if ($relay) {
         [IO.File]::WriteAllText($relayStop, 'stop')
-        if (-not $relay.WaitForExit(5000)) { $relay.Kill() }
+        if (-not $relay.WaitForExit(5000)) { $relay.Kill($true) }
     }
     foreach ($role in $processes.Keys) {
         $entry = $processes[$role]
-        if (-not $entry.Process.HasExited) { $entry.Process.Kill(); $entry.Process.WaitForExit() }
+        if (-not $entry.Process.HasExited) { $entry.Process.Kill($true); $entry.Process.WaitForExit() }
         [IO.File]::WriteAllText((Join-Path $run "$role.stdout.log"), $entry.StandardOutput.GetAwaiter().GetResult())
         [IO.File]::WriteAllText((Join-Path $run "$role.stderr.log"), $entry.StandardError.GetAwaiter().GetResult())
     }
@@ -158,6 +162,7 @@ foreach ($role in $roles) {
     $summary[$role] = @{ exit = $processes[$role].Process.ExitCode; completed = $complete; errors = @($errors | ForEach-Object { $_.Value.Trim() }); checks = $data.checks; failures = $data.failures; valid = $validResult }
     if ($processes[$role].Process.ExitCode -ne 0 -or $errors.Count -gt 0 -or -not $validResult) { $failed = $true }
 }
+$gate.ReleaseMutex()
 $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $run 'run-summary.json') -Encoding UTF8
 if ($Scenario -ne 'smoke' -or $Solo) { Write-Output "FRICTION_RUN $run failed=$failed"; return }
 if ($failed) { throw "Local co-op strict validation failed: $run" }
