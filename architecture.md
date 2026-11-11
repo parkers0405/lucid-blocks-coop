@@ -22,16 +22,18 @@ Production paths below are relative to `mod/overrides/`.
 | Bootstrap | `main/autoload/ref.gd` | Scene references, one manager, guarded native capability loading. |
 | Session orchestration | `coop_mod/coop_manager.gd` | Transport, nonce/grant admission, sender identity map, reconnect, terrain epoch, snapshots, travel barriers, chest interaction sessions. |
 | Durable identities | `coop_mod/session_identity.gd` | Random LAN identity/token; host token-digest mapping; bounded record reads and verified replacement. Steam key uses transport-derived ID. |
-| File execution | `coop_mod/save_queue.gd` | Built-in WorkerThreadPool executes immutable pure file operations in FIFO order. Generation and save-file guards reject obsolete results. No external worker/service/configuration. |
+| File execution | `coop_mod/save_queue.gd` | Built-in WorkerThreadPool executes immutable pure file operations; durable transactions precede queued routine work, preserving durable FIFO. Started jobs return results even after disconnect for same-save reconciliation; obsolete queued session work is logged and discarded, while queued local checkpoints are retained. No external worker/service/configuration. |
 | Personal ledger | `coop_mod/personal_store.gd` | One shared binary ledger containing player profiles,21chest slots, revisions/receipts and full-instance UUID records/owners/tombstones; atomic inventory/object checkpoints and inventory/chest transfers. |
 | Canonical chunks | `coop_mod/chunk_authority.gd` | Owner selection, channel fingerprints/revisions, stale-version checks and16-chunk batches. Manager authenticates/persists accepted updates. |
 | Local world | `main/world/world.gd` | Local player-centered native loading, predictive dynamics, checkpoint filtering, active generator/dimension/private namespace. |
 | Region storage | `coop_mod/region_checkpoint.gd` | Block/water/awake/fire validation, coordinates/IDs, immutable payload generations, checksums, manifest replacement and retained migration sources. |
-| Personal chest UI | `coop_mod/personal_chest.gd` |21slots, explicit Store/Take quantity actions, inventory actions locked during transactions; movement retained for pickups and immediately restored on dismissal, acknowledged inventory application. |
+| Personal chest UI | `coop_mod/personal_chest.gd` |21slots, explicit Store/Take quantity actions; modal inventory protection is separate from pickup protection. Pickups retain movement, mining, attacks and hotbar selection; conflicting drop/item-use inputs defer until ACK. Sparse inventory application preserves concurrent tool wear and broken tools. |
 | Access blocks | `main/world/living_block/cache_cube/cache_cube.gd` | Ordinary cube behavior; designation routes to personal UI, independent of contents. |
 | Preserved nodes/entities | `main/save_file/preserve_node_manager.gd`, existing entity overrides | Game node serialization/materialization; manager owns instance and authority routing. Canonical handoff includes offscreen owned bundles before snapshots resume. |
 
 Reuse existing helpers; do not introduce a parallel store, alternate inventory engine or unrelated manager refactor.
+
+Routine personal checkpoints run every5seconds. Unchanged-ledger comparison uses dictionary equality rather than reserializing the ledger. Active snapshot, rebase, migration and respawn-adoption reads use the file queue; handoffs request only needed chunks from the region worker. Synchronous engine loading callbacks drain the queue before direct metadata reads. Those loading-only reads and small chest-access JSON reads remain main-thread IO; this is not a universal zero-IO claim.
 
 ## Identity, reconnect and trust
 
@@ -54,6 +56,8 @@ Current `chunk_authority.owner` favors host within128units in the same instance,
 Current canonical tick is2seconds: host captures changed owned chunks; guest checkpoints owned chunks. Canonical application queues/merges pending updates while busy. `_apply_canonical_terrain` waits for loading under5second deadline, rechecks world/instance/epoch and applies original region/block APIs in bounded slices. Dynamics continue between slices. Routine capture skips loading/restoration; explicit checkpoint barriers leave native loading enabled until it settles, with bounded waits and context checks. Overlap predictions can visibly diverge until reconciliation; this is not lockstep.
 
 Live handoff contract: freeze affected authoritative mutation, commit final old-owner revision, publish/rebase new owner, then resume. Preserve queued work across acknowledgement failure; delayed former-owner writes cannot overwrite new state. Focused runtime regressions cover commit interruption, stale installers and object recovery; the two-process scenario checks independent exploration and terrain persistence. Human reunion playfeel remains unmeasured.
+
+Do not start a handoff while terrain is streaming. If streaming restarts during awaited handoff work, abort and resume rather than waiting15seconds while frozen. Durable checkpoints reserve their turn before draining an existing background checkpoint, preventing routine work from repeatedly taking the barrier slot. A background save does not own the player-lock restoration state.
 
 ## Dimensions, Apotheosis and saved nodes
 

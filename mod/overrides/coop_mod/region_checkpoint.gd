@@ -148,7 +148,7 @@ func has_checkpoint(chunks_dir: String, region_namespace: String) -> bool:
     return valid_component(region_namespace) and FileAccess.file_exists(chunks_dir.path_join("coop").path_join(region_namespace).path_join("manifest.json"))
 
 
-func read_regions(chunks_dir: String, region_namespace: String, block_ids: Dictionary) -> Dictionary:
+func read_regions(chunks_dir: String, region_namespace: String, block_ids: Dictionary, requested: Variant = null) -> Dictionary:
     if not valid_component(region_namespace):
         return _failure("Invalid region namespace")
     var manifest: Dictionary = _read_manifest(chunks_dir.path_join("coop").path_join(region_namespace))
@@ -161,12 +161,23 @@ func read_regions(chunks_dir: String, region_namespace: String, block_ids: Dicti
                 names[name_value] = true
     for name_value in manifest["regions"]:
         names[name_value] = true
+    var selected: Dictionary = {}
+    if requested != null:
+        for chunk in requested:
+            selected[region_coordinate(chunk)] = true
     var regions: Dictionary = {}
     for name_value in names:
         var coordinate: Vector3i = _coordinate_from_name(name_value)
+        if requested != null and not selected.has(coordinate):
+            continue
         var region: Dictionary = _read_region(chunks_dir, region_namespace, coordinate, manifest["regions"], block_ids)
         if not region["ok"]:
             return region
+        if requested != null:
+            for channel in CHANNELS:
+                for chunk in region["data"][channel].keys():
+                    if not requested.has(chunk):
+                        region["data"][channel].erase(chunk)
         regions[coordinate] = region["data"]
     return {"ok": true, "regions": regions}
 

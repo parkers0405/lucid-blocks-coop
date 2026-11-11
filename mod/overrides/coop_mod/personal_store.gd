@@ -229,7 +229,7 @@ func save_checkpoint(path: String, state: Dictionary, revision: int, instance: S
         return {}
     if expected_lease >= 0 and int(ledger.get("lease", {}).get("epoch", 0)) != expected_lease:
         return {}
-    var original: PackedByteArray = var_to_bytes(ledger) if skip_unchanged else PackedByteArray()
+    var original: Dictionary = ledger.duplicate(true) if skip_unchanged else {}
     var key: String = _profile_key(path)
     var profile: Dictionary = ledger["profiles"].get(key, _new_profile())
     if profile["revision"] != revision:
@@ -276,7 +276,7 @@ func save_checkpoint(path: String, state: Dictionary, revision: int, instance: S
     normalized.erase("_coop_revision")
     var previous_state: Dictionary = profile["state"].duplicate(true)
     previous_state.erase("_coop_revision")
-    if skip_unchanged and normalized == previous_state and var_to_bytes(ledger) == original:
+    if skip_unchanged and normalized == previous_state and ledger == original:
         return profile
     profile["state"] = state.duplicate(true)
     profile["revision"] += 1

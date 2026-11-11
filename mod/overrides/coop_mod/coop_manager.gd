@@ -45,6 +45,9 @@ var terrain_epoch: String = ""
 var terrain_sync_timer: float = 0.0
 var terrain_sync_busy: bool = false
 var guest_checkpoint_busy: bool = false
+var background_checkpoint_busy: bool = false
+var background_checkpoint_cancelled: bool = false
+var durable_checkpoint_waiters: int = 0
 var guest_checkpoint_locks_player: bool = false
 var guest_checkpoint_was_disabled: bool = false
 var canonical_apply_busy: bool = false
@@ -71,6 +74,11 @@ var lease_residency_key: String = ""
 var lease_resident_chunks: Array = []
 var pickup_pending: Dictionary = {}
 var durable_pickup_busy: bool = false
+var pickup_claims: Dictionary = {}
+var pickup_inventory_lock: bool = false
+var pickup_inventory_baseline: Dictionary = {}
+var known_profile_keys: Dictionary = {}
+var known_profile_directory: String = ""
 var lease_probe_busy: bool = false
 var pickup_checkpoint_allowed: bool = false
 var lease_started_at: int = 0
@@ -167,7 +175,7 @@ func _enforce_runtime_leases() -> void:
             node.softbody.set_meta("coop_lease_enabled", locally_owned)
 
 func can_mutate_runtime_node(node: Node3D) -> bool:
-    return not lease_preparing and (node != Ref.player or not chest_lock_active) and owns_runtime_node(node)
+    return not lease_preparing and (node != Ref.player or not chest_lock_active or pickup_inventory_lock) and owns_runtime_node(node)
 
 func _valid_runtime_sender(sender: int, epoch: String) -> bool:
     var state: Dictionary = peer_states.get(sender, {})
@@ -257,7 +265,7 @@ func _record_host_residency() -> void:
             chunk_authority.lease_owners.erase(key)
 
 func _lease_proposal() -> Dictionary:
-    var chunks: Dictionary = chunk_authority.lease_owners.duplicate()
+    var chunks: Dictionary = {}
     var host: Dictionary = _capture_local_state()
     var guest: Dictionary = {}
     for peer in admitted_player_keys:
@@ -266,12 +274,15 @@ func _lease_proposal() -> Dictionary:
         for chunk in entry["chunks"]:
             var key: String = ChunkAuthority.chunk_key(entry["instance"], chunk)
             var desired: int = ChunkAuthority.owner(chunk, entry["instance"], host, guest)
-            if chunks.get(key, 1) == 2 and entry["instance"] == lease_guest_instance and lease_guest_chunks.has(chunk) and (host.get("dimension_instance_key") != entry["instance"] or (Vector3(chunk) + Vector3(8, 8, 8)).distance_to(host.get("position", Vector3.INF)) > ChunkAuthority.HOST_RADIUS):
+            if chunk_authority.lease_owners.get(key, 1) == 2 and entry["instance"] == lease_guest_instance and lease_guest_chunks.has(chunk) and (host.get("dimension_instance_key") != entry["instance"] or (Vector3(chunk) + Vector3(8, 8, 8)).distance_to(host.get("position", Vector3.INF)) > ChunkAuthority.HOST_RADIUS):
                 desired = 2
             chunks[key] = desired
     return chunks
 
 func _lease_owners_changed(proposal: Dictionary) -> bool:
+    for key in chunk_authority.lease_owners:
+        if chunk_authority.lease_owners[key] == 2 and not proposal.has(key):
+            return true
     for key in proposal:
         if proposal[key] != chunk_authority.lease_owners.get(key, 1):
             return true
@@ -353,8 +364,11 @@ func _wait_lease_ack(token: String) -> bool:
 func _lease_ack_timeout_ms() -> int:
     return 10000
 
+func _disabled_before_checkpoint() -> bool:
+    return guest_checkpoint_was_disabled if guest_checkpoint_locks_player else Ref.player.disabled
+
 func _handoff_runtime_lease(proposal: Dictionary) -> void:
-    if lease_busy or not _has_live_peer() or chest_lock_active or not chest_sessions.is_empty() or not _is_local_session_player_active():
+    if lease_busy or not _has_live_peer() or chest_lock_active or not chest_sessions.is_empty() or not _is_local_session_player_active() or not Ref.world.is_all_loaded():
         return
     lease_busy = true
     lease_token = SessionIdentity.random_id()
@@ -363,7 +377,7 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     var file = Ref.save_file_manager.loaded_file
     lease_ack = {}
     lease_phase = "collect"
-    lease_was_disabled = guest_checkpoint_was_disabled if guest_checkpoint_busy else Ref.player.disabled
+    lease_was_disabled = _disabled_before_checkpoint()
     if not await _drain_lease_mutations():
         if lease_token == token and _same_save_context(generation, file):
             _resume_lease_runtime()
@@ -375,6 +389,11 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     lease_checkpoint_allowed = true
     freeze_runtime_lease.rpc(token, terrain_epoch)
     var local_ok: bool = await _await_local_world_checkpoint(0, true)
+    if not local_ok and lease_token == token and _same_save_context(generation, file):
+        if _has_live_peer():
+            cancel_runtime_lease.rpc(token, terrain_epoch)
+        _resume_lease_runtime()
+        return
     var remote_ok: bool = await _wait_lease_ack(token)
     if lease_token != token or not _same_save_context(generation, file):
         return
@@ -456,7 +475,7 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
 func freeze_runtime_lease(token: String, epoch: String) -> void:
     if multiplayer.is_server() or epoch != terrain_epoch or lease_busy:
         return
-    if chest_lock_active or not _is_local_session_player_active():
+    if chest_lock_active or not _is_local_session_player_active() or not Ref.world.is_all_loaded():
         acknowledge_runtime_lease.rpc_id(1, token, "collect", terrain_epoch, false)
         return
     var generation: int = save_queue.generation
@@ -464,7 +483,7 @@ func freeze_runtime_lease(token: String, epoch: String) -> void:
     lease_token = token
     lease_install_index = 0
     lease_busy = true
-    lease_was_disabled = guest_checkpoint_was_disabled if guest_checkpoint_busy else Ref.player.disabled
+    lease_was_disabled = _disabled_before_checkpoint()
     var drained: bool = await _drain_lease_mutations()
     if token != lease_token or not _same_save_context(generation, file):
         return
@@ -542,7 +561,7 @@ func _lease_install_payload(instance: String, resident: Array, previous_chunks: 
             changed.append(chunk)
     var stored: Dictionary = {"ok": true, "regions": {}}
     if not changed.is_empty():
-        stored = await _store_job(region_checkpoint, "read_regions", [_get_checkpoint_chunks_directory(), prefix.trim_suffix("_"), _checkpoint_block_ids()], {})
+        stored = await _store_job(region_checkpoint, "read_regions", [_get_checkpoint_chunks_directory(), prefix.trim_suffix("_"), _checkpoint_block_ids(), changed], {})
         if lease_token != token or not _same_save_context(generation, file):
             return {}
     if not stored.get("ok", false):
@@ -725,18 +744,23 @@ func _capture_private_respawns() -> Dictionary:
             positions[position] = true
     return {"positions": positions, "chunks": chunks}
 
-func read_private_respawns(data: Dictionary, dimension: int, owner: String, source_owner: String = "__current__") -> Dictionary:
+func read_private_respawns(data: Dictionary, dimension: int, owner: String, source_owner: String = "__current__", prepared_ledger: Variant = null) -> Dictionary:
     if not SaveFile.DIMENSION_MAP.has(dimension) or not _is_private_instance_dimension(dimension) or (not owner.is_empty() and not RegionCheckpoint.valid_component(owner)):
         return {"ok": false, "present": false, "positions": {}}
     if multiplayer.is_server() and not guest_world_loaded:
-        var canonical: Dictionary = personal_store.instance_respawns(_profile_path(_get_local_player_key()), _ledger_instance_key(get_dimension_instance_key(dimension, owner)))
+        if prepared_ledger == null:
+            save_queue.flush()
+        var loaded_ledger: Dictionary = personal_store.read_ledger(_profile_path(_get_local_player_key())) if prepared_ledger == null else prepared_ledger
+        prepared_ledger = loaded_ledger
+        var record: Dictionary = loaded_ledger.get("instances", {}).get(_ledger_instance_key(get_dimension_instance_key(dimension, owner)), {})
+        var canonical: Dictionary = {"ok": not loaded_ledger.is_empty(), "present": record.has("respawn_positions"), "positions": record.get("respawn_positions", {}).duplicate(true)}
         if not canonical["ok"] or canonical["present"]:
             return canonical
     var plain: String = SaveFile.DIMENSION_MAP[dimension]
     var instance_namespace: String = _resolve_dimension_namespace(dimension, owner)
     var paths: Array = [instance_namespace + "/respawn_positions", plain + "/" + instance_namespace + "/respawn_positions"]
     var previous: String = _get_loaded_register_pocket_owner_key() if source_owner == "__current__" else source_owner
-    if instance_namespace != plain and _can_adopt_plain_private_nodes(data, dimension, owner, previous):
+    if instance_namespace != plain and _can_adopt_plain_private_nodes(data, dimension, owner, previous, prepared_ledger):
         paths.append(plain + "/respawn_positions")
     for path in paths:
         var value: Variant = data
@@ -755,6 +779,8 @@ func read_private_respawns(data: Dictionary, dimension: int, owner: String, sour
     return {"ok": true, "present": false, "positions": {}}
 
 func _private_respawn_checkpoint(key: String, state: Dictionary, instance: String, dimension: int) -> Dictionary:
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     if not state.has("_coop_respawns"):
         return {"ok": true, "update": {}}
     var update = state["_coop_respawns"]
@@ -769,11 +795,14 @@ func _private_respawn_checkpoint(key: String, state: Dictionary, instance: Strin
             if chunk_authority.lease_owners.get(ChunkAuthority.chunk_key(instance, chunk), 0) != rank:
                 return {"ok": false}
     var canonical: Dictionary = await _store_job(personal_store, "instance_respawns", [_profile_path(key), _ledger_instance_key(instance)], {"ok": false})
-    if not canonical["ok"]:
+    if not _same_save_context(generation, file) or not canonical["ok"]:
         return {"ok": false}
     if not canonical["present"]:
         var parsed: Dictionary = _parse_dimension_instance_key(instance)
-        var legacy: Dictionary = read_private_respawns(Ref.save_file_manager.loaded_file.data, dimension, str(parsed.get("owner_key", "")))
+        var prepared: Dictionary = await _store_job(personal_store, "read_ledger", [_profile_path(key)], {})
+        if not _same_save_context(generation, file):
+            return {"ok": false}
+        var legacy: Dictionary = read_private_respawns(file.data, dimension, str(parsed.get("owner_key", "")), "__current__", prepared)
         if not legacy["ok"]:
             return {"ok": false}
         if legacy["present"]:
@@ -859,19 +888,20 @@ func sync_private_respawns(instance: String, positions: Dictionary, chunks: Arra
     _apply_private_respawns(instance, positions, chunks)
 
 
-func _merge_instance_nodes_into_snapshot(data: Dictionary, instance: String, dimension: int, private_owner: String, source_owner: String = "__current__") -> bool:
+func _merge_instance_nodes_into_snapshot(data: Dictionary, instance: String, dimension: int, private_owner: String, source_owner: String = "__current__", prepared_ledger: Variant = null) -> bool:
     var path: String = _profile_path(_get_local_player_key())
-    var result: Dictionary = personal_store.instance_bundles(path, _ledger_instance_key(instance))
-    if not result["ok"]:
+    if prepared_ledger == null:
+        save_queue.flush()
+    var ledger: Dictionary = personal_store.read_ledger(path) if prepared_ledger == null else prepared_ledger
+    if ledger.is_empty():
         status_message = "Cannot read preserved instance objects; load cancelled"
         _update_status_text()
         return false
     var plain: String = SaveFile.DIMENSION_MAP[dimension]
-    var ledger: Dictionary = personal_store.read_ledger(path)
     var has_canonical: bool = ledger["instances"].has(_ledger_instance_key(instance))
     var respawns: Dictionary = {}
     if _is_private_instance_dimension(dimension):
-        respawns = read_private_respawns(data, dimension, private_owner, source_owner)
+        respawns = read_private_respawns(data, dimension, private_owner, source_owner, ledger)
         if not respawns["ok"]:
             return false
     if _is_private_instance_dimension(dimension) and not has_canonical:
@@ -884,7 +914,7 @@ func _merge_instance_nodes_into_snapshot(data: Dictionary, instance: String, dim
         var plain_nodes: Dictionary = SaveFile._get_data(data, plain + "/node", {})
         var has_plain_objects: bool = plain_nodes.keys().any(func(uuid): return uuid != "player")
         var previous_owner: String = _get_loaded_register_pocket_owner_key() if source_owner == "__current__" else source_owner
-        var proven_plain_owner: bool = _can_adopt_plain_private_nodes(data, dimension, private_owner, previous_owner)
+        var proven_plain_owner: bool = _can_adopt_plain_private_nodes(data, dimension, private_owner, previous_owner, ledger)
         if has_plain_objects and not proven_plain_owner:
             status_message = "Private instance ownership is ambiguous; legacy objects retained for recovery"
             _update_status_text()
@@ -902,7 +932,7 @@ func _merge_instance_nodes_into_snapshot(data: Dictionary, instance: String, dim
         SaveFile._set_data(data, plain + "/node", {"player": player_data})
         SaveFile._set_data(data, plain + "/world/chunk_to_uuid_map", {})
     var chunk_map: Dictionary = SaveFile._get_data(data, plain + "/world/chunk_to_uuid_map", {}).duplicate(true)
-    for bundle in result["bundles"]:
+    for bundle in ledger["instances"].get(_ledger_instance_key(instance), {}).get("nodes", {}).values():
         if not InstanceEntities.valid_bundle(bundle, plain, _preserved_scene_paths()):
             return false
         var uuid: String = bundle["uuid"]
@@ -917,14 +947,16 @@ func _merge_instance_nodes_into_snapshot(data: Dictionary, instance: String, dim
     SaveFile._set_data(data, plain + "/world/chunk_to_uuid_map", chunk_map)
     return true
 
-func _can_adopt_plain_private_nodes(data: Dictionary, dimension: int, owner: String, previous_owner: String) -> bool:
+func _can_adopt_plain_private_nodes(data: Dictionary, dimension: int, owner: String, previous_owner: String, prepared_ledger: Variant = null) -> bool:
     if owner != _get_local_player_key() or not _is_private_instance_dimension(dimension):
         return false
     if previous_owner == owner:
         return true
     if not previous_owner.is_empty() or _has_live_peer():
         return false
-    var ledger: Dictionary = personal_store.read_ledger(_profile_path(owner))
+    if prepared_ledger == null:
+        save_queue.flush()
+    var ledger: Dictionary = personal_store.read_ledger(_profile_path(owner)) if prepared_ledger == null else prepared_ledger
     if ledger.is_empty():
         return false
     var plain: String = SaveFile.DIMENSION_MAP[dimension]
@@ -1025,7 +1057,7 @@ func _drain_canonical_queue() -> void:
 func _checkpoint_terrain_in_background() -> bool:
     if suppress_local_game_quit_session_shutdown or receiving_host_world or client_restore_in_progress or reconnect_pending:
         return false
-    if not _can_transmit_pending_local_world_patch_to_host() or guest_checkpoint_busy:
+    if not _can_transmit_pending_local_world_patch_to_host() or guest_checkpoint_busy or background_checkpoint_busy or durable_checkpoint_waiters > 0:
         return false
     var world = Ref.world
     var captured_instance: String = get_active_dimension_instance_key()
@@ -1037,10 +1069,11 @@ func _checkpoint_terrain_in_background() -> bool:
     var chunks: Array = chunk_authority.changed(captured_instance, root, prefix)
     if chunks.is_empty():
         return true
-    guest_checkpoint_busy = true
+    background_checkpoint_busy = true
+    background_checkpoint_cancelled = false
     var committed: bool = true
     for batch in ChunkAuthority.batches(chunks):
-        if world != Ref.world or captured_instance != get_active_dimension_instance_key() or epoch != terrain_epoch:
+        if background_checkpoint_cancelled or world != Ref.world or captured_instance != get_active_dimension_instance_key() or epoch != terrain_epoch:
             committed = false
             break
         var proposal: Dictionary = patch.duplicate(true)
@@ -1049,9 +1082,9 @@ func _checkpoint_terrain_in_background() -> bool:
         if not await _send_checkpoint_patch_and_wait(proposal, 0):
             committed = false
             break
-    if world != Ref.world or captured_instance != get_active_dimension_instance_key() or epoch != terrain_epoch:
+    if background_checkpoint_cancelled or world != Ref.world or captured_instance != get_active_dimension_instance_key() or epoch != terrain_epoch:
         committed = false
-    guest_checkpoint_busy = false
+    background_checkpoint_busy = false
     return committed
 
 
@@ -1134,7 +1167,12 @@ func _same_save_context(generation: int, file: Variant) -> bool:
     return generation == save_queue.generation and Ref.save_file_manager != null and Ref.save_file_manager.loaded_file == file
 
 func _store_job(store: RefCounted, method: String, arguments: Array, fallback: Variant) -> Variant:
-    var result = await save_queue.run(get_tree(), Callable(store, method).bindv(arguments.duplicate(true)))
+    var own_checkpoint: bool = method == "save_checkpoint" and arguments[0] == _profile_path(_get_local_player_key())
+    var priority: bool = method in ["collect_drop", "transfer", "commit_lease"]
+    var result = await save_queue.run(get_tree(), Callable(store, method).bindv(arguments.duplicate(true)), own_checkpoint, priority)
+    if store == personal_store and method == "read_ledger" and result is Dictionary and not result.is_empty():
+        known_profile_directory = str(arguments[0]).get_base_dir()
+        known_profile_keys = result.get("profiles", {}).duplicate()
     return fallback if result == null else result
 
 func _snapshot_stack_limits() -> Dictionary:
@@ -1149,7 +1187,7 @@ func _profile_path(key: String) -> String:
     return _get_checkpoint_chunks_directory().get_base_dir().path_join("coop/players/" + key + ".bin") if RegionCheckpoint.valid_component(key) else ""
 
 
-func _apply_profile_inventories(state: Dictionary) -> void:
+func _apply_profile_inventories(state: Dictionary, baseline: Dictionary = {}) -> void:
     for inventory in [Ref.player_inventory, Ref.player_hotbar, Ref.player_equipment, Ref.player_fusion_source, Ref.player_fusion_result]:
         if not is_instance_valid(inventory):
             continue
@@ -1157,8 +1195,14 @@ func _apply_profile_inventories(state: Dictionary) -> void:
         var items: Array = saved.get("items", [])
         if items.size() != inventory.capacity * 2:
             continue
+        var before: Array = baseline.get("node", {}).get("player", {}).get(str(inventory.name), {}).get("items", [])
         for index in range(inventory.capacity):
+            if before.size() == items.size() and before[index * 2] == items[index * 2] and before[index * 2 + 1] == items[index * 2 + 1]:
+                continue
             var current = inventory.items[index]
+            if before.size() == items.size() and current != null and before[index * 2].size() == 3 and items[index * 2].size() == 3 and current.id == before[index * 2][0] and current.id == items[index * 2][0] and current.get_position() == before[index * 2 + 1] and current.get_position() == items[index * 2 + 1]:
+                inventory.change_amount(index, items[index * 2][1] - before[index * 2][1])
+                continue
             if _serialize_item_state(current) == items[index * 2] and (current == null or current.get_position() == items[index * 2 + 1]):
                 continue
             var item = _deserialize_item_state(items[index * 2])
@@ -1179,7 +1223,8 @@ func _restore_host_profile() -> void:
     var same_file: bool = path == restored_host_profile_path and file_id == restored_host_profile_file_id
     if same_file and restored_host_profile_generation == context_generation:
         return
-    var record: Dictionary = await _store_job(personal_store, "read_profile", [path], {})
+    var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
+    var record: Dictionary = {} if ledger.is_empty() else ledger["profiles"].get(_get_local_player_key(), PersonalStore._new_profile())
     if not _same_save_context(context_generation, context_file):
         return
     same_file = path == restored_host_profile_path and file_id == restored_host_profile_file_id
@@ -1236,7 +1281,7 @@ func _persist_host_profile(skip_unchanged: bool = false) -> bool:
 func _known_private_owner(key: String) -> bool:
     if not RegionCheckpoint.valid_component(key):
         return false
-    return key == _get_local_player_key() or admitted_player_keys.values().has(key) or personal_store.profile_exists(_profile_path(key))
+    return key == _get_local_player_key() or admitted_player_keys.values().has(key) or (known_profile_directory == _profile_path(key).get_base_dir() and known_profile_keys.has(key))
 
 
 func _chest_access_key(instance_key: String, position: Vector3i) -> String:
@@ -1432,6 +1477,11 @@ func _transfer_chest_for_peer(peer: int, token: String, revision: int, request: 
         return
     var record: Dictionary = await _store_job(personal_store, "transfer", [_profile_path(session["key"]), revision, request, inventory_name, index, chest_index, amount, deposit, PersonalStore.stack_limit.bind(_snapshot_stack_limits())], {})
     if not _same_save_context(context_generation, context_file):
+        if peer == 1 and Ref.save_file_manager.loaded_file == context_file and not record.is_empty():
+            profile_revision = record["revision"]
+            _apply_profile_inventories(record["state"])
+            chest_pending_token = ""
+            _release_chest_inventory_lock()
         return
     _reply_personal_chest(peer, record, token)
 
@@ -1469,7 +1519,9 @@ func begin_chest_inventory_lock(lock_movement: bool = true) -> void:
     if chest_lock_active:
         return
     chest_lock_active = true
-    _stop_local_mutation_actions()
+    pickup_inventory_lock = not lock_movement
+    if lock_movement:
+        _stop_local_mutation_actions()
     chest_was_disabled = Ref.player.disabled
     chest_menu_process_mode = Ref.game_menu.process_mode
     chest_movement_locked = lock_movement
@@ -1487,6 +1539,7 @@ func _release_chest_inventory_lock() -> void:
     if not chest_lock_active or not chest_pending_token.is_empty():
         return
     chest_lock_active = false
+    pickup_inventory_lock = false
     if is_instance_valid(Ref.player):
         Ref.player.disabled = chest_was_disabled or lease_preparing or lease_frozen or reconnect_pending or local_downed or Ref.player.dead
     if is_instance_valid(Ref.game_menu):
@@ -1545,7 +1598,7 @@ const ENTITY_DR_HEARTBEAT_SEC: float = 0.25
 const ENTITY_WORLD_STATE_MAX_INTERVAL_SEC: float = 1.25
 const ENTITY_VISUAL_STATE_INTERVAL: float = 0.15
 const CLIENT_ENTITY_SYNC_GRACE_SEC: float = 0.5
-const PERSIST_INTERVAL: float = 1.0
+const PERSIST_INTERVAL: float = 5.0
 const AUTOSAVE_INTERVAL: float = 15.0 * 60.0
 const HOST_TIMEOUT_SECONDS: float = 30.0
 const AUTO_RECONNECT_INTERVAL: float = 2.0
@@ -3582,11 +3635,6 @@ func _input(event: InputEvent) -> void:
     if not event.pressed or event.echo:
         return
     if is_instance_valid(chest_panel):
-        if event.keycode == KEY_ESCAPE:
-            var closing_panel = chest_panel
-            close_personal_chest(chest_active_token)
-            closing_panel.queue_free()
-            get_viewport().set_input_as_handled()
         return
 
     var focus_owner: Control = get_viewport().gui_get_focus_owner()
@@ -4727,7 +4775,7 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
             return
             
     # Load locally!
-    if not _queue_loaded_dimension_instance(target_dimension, pocket_owner_key):
+    if not await _queue_loaded_dimension_instance(target_dimension, pocket_owner_key):
         group_dimension_transfer_in_progress = false
         return
     var target: Dictionary = peer_states.get(pending_peer_teleport, {})
@@ -4741,6 +4789,9 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
     if not following_peer:
         await _position_local_player_after_dimension_open(source_dimension, target_dimension)
     suppress_local_game_quit_session_shutdown = false
+    if pending_peer_teleport == 0 and status_message.begins_with("Teleporting"):
+        status_message = "Arrived"
+        _update_status_text()
     if _has_live_peer():
         _broadcast_local_state_now()
         if not multiplayer.is_server() and _is_private_instance_dimension(target_dimension) and pocket_owner_key == local_player_key:
@@ -4748,7 +4799,7 @@ func _open_dimension_instance_async(target_dimension: int, target_pocket_owner_k
 
 
 func _queue_loaded_dimension_instance(target_dimension: int, target_pocket_owner_key: String = "") -> bool:
-    if not _prepare_target_legacy_checkpoint(target_dimension, target_pocket_owner_key):
+    if not await _prepare_target_legacy_checkpoint(target_dimension, target_pocket_owner_key):
         return false
     # Main saves and clears the outgoing world before either loader consumes this owner.
     return Ref.world.queue_dimension_instance(target_dimension, target_pocket_owner_key)
@@ -4758,13 +4809,16 @@ func _prepare_target_legacy_checkpoint(target_dimension: int, owner: String) -> 
     if not SaveFile.DIMENSION_MAP.has(target_dimension) or Ref.save_file_manager.loaded_file == null:
         return false
     var target_namespace: String = _resolve_dimension_namespace(target_dimension, owner)
-    var save_data: Dictionary = Ref.save_file_manager.loaded_file.data
-    var can_adopt_plain_save: bool = _can_adopt_plain_private_nodes(save_data, target_dimension, owner, _get_loaded_register_pocket_owner_key())
-    var result: Dictionary = region_checkpoint.migrate_legacy(
-        _get_checkpoint_chunks_directory(), target_namespace,
-        SaveFile.DIMENSION_MAP[target_dimension], save_data,
-        _checkpoint_block_ids(), can_adopt_plain_save
-    )
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
+    var save_data: Dictionary = file.data.duplicate(true)
+    var prepared: Dictionary = await _store_job(personal_store, "read_ledger", [_profile_path(_get_local_player_key())], {})
+    if not _same_save_context(generation, file):
+        return false
+    var can_adopt_plain_save: bool = _can_adopt_plain_private_nodes(save_data, target_dimension, owner, _get_loaded_register_pocket_owner_key(), prepared)
+    var result: Dictionary = await _store_job(region_checkpoint, "migrate_legacy", [_get_checkpoint_chunks_directory(), target_namespace, SaveFile.DIMENSION_MAP[target_dimension], save_data, _checkpoint_block_ids(), can_adopt_plain_save], {"ok": false})
+    if not _same_save_context(generation, file):
+        return false
     if not result["ok"]:
         status_message = "Legacy region migration failed; dimension transfer cancelled"
         _update_status_text()
@@ -5788,7 +5842,7 @@ func _find_peer_state_by_query(query: String) -> Dictionary:
 
 
 func _is_client_gameplay_locked() -> bool:
-    return lease_frozen or lease_preparing or chest_lock_active or (not multiplayer.is_server() and (reconnect_pending or client_restore_in_progress or receiving_host_world or not guest_persistent_ready or is_local_player_fake_dead() or is_local_player_downed()))
+    return lease_frozen or lease_preparing or (chest_lock_active and not pickup_inventory_lock) or (not multiplayer.is_server() and (reconnect_pending or client_restore_in_progress or receiving_host_world or not guest_persistent_ready or is_local_player_fake_dead() or is_local_player_downed()))
 
 
 func sync_local_block_place(block_position: Vector3i, block_id: int, inventory, inventory_index: int) -> bool:
@@ -6022,13 +6076,19 @@ func intercept_durable_pickup(collector: Entity, dropped_item) -> bool:
 
 
 func _begin_durable_pickup(dropped_item) -> void:
-    if not is_instance_valid(dropped_item) or chest_lock_active or lease_busy or not _can_sample_player() or Ref.player.held_item is HeldGlider and Ref.player.held_item.gliding:
+    if not is_instance_valid(dropped_item) or (chest_lock_active and not pickup_inventory_lock) or lease_busy or not _can_sample_player() or Ref.player.is_interacting() or Ref.player.held_item is HeldGlider and Ref.player.held_item.gliding:
         if is_instance_valid(dropped_item):
             dropped_item.set_meta("coop_pickup_pending_request", false)
         return
-    while host_profile_busy or durable_pickup_busy:
+    var pickup_generation: int = save_queue.generation
+    var pickup_file = Ref.save_file_manager.loaded_file
+    while host_profile_busy or durable_pickup_busy or chest_lock_active:
         await get_tree().process_frame
-    if not is_instance_valid(dropped_item) or dropped_item.is_queued_for_deletion() or chest_lock_active or not _can_sample_player() or lease_busy or Ref.player.held_item is HeldGlider and Ref.player.held_item.gliding:
+        if not _same_save_context(pickup_generation, pickup_file):
+            if is_instance_valid(dropped_item):
+                dropped_item.set_meta("coop_pickup_pending_request", false)
+            return
+    if not is_instance_valid(dropped_item) or dropped_item.is_queued_for_deletion() or chest_lock_active or not _can_sample_player() or lease_busy or Ref.player.is_interacting() or Ref.player.held_item is HeldGlider and Ref.player.held_item.gliding:
         if is_instance_valid(dropped_item):
             dropped_item.set_meta("coop_pickup_pending_request", false)
         return
@@ -6040,10 +6100,11 @@ func _begin_durable_pickup(dropped_item) -> void:
     chest_pending_token = request
     chest_request_sent_at = Time.get_ticks_msec()
     pickup_pending[request] = {"uuid": uuid, "instance": instance, "epoch": epoch}
+    pickup_inventory_baseline = _capture_local_persistent_state()
     pickup_checkpoint_allowed = true
     var ok: bool
     if multiplayer.is_server():
-        var saved: Dictionary = (await _commit_player_checkpoint(_get_local_player_key(), _capture_local_persistent_state(), instance, int(Ref.world.current_dimension), _capture_local_instance_nodes()))
+        var saved: Dictionary = (await _commit_player_checkpoint(_get_local_player_key(), pickup_inventory_baseline, instance, int(Ref.world.current_dimension), _capture_local_instance_nodes()))
         ok = not saved.is_empty()
         if ok:
             profile_revision = saved["revision"]
@@ -6061,16 +6122,29 @@ func _begin_durable_pickup(dropped_item) -> void:
 
 
 func _collect_durable_pickup(peer: int, key: String, instance: String, uuid: String, request: String, revision: int, epoch: String) -> Dictionary:
-    var context_generation: int = save_queue.generation
-    var context_file = Ref.save_file_manager.loaded_file
-    if durable_pickup_busy:
+    if pickup_claims.has(uuid):
         return {}
+    pickup_claims[uuid] = true
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
     var target_drop = _find_existing_drop_by_uuid(uuid)
     if peer != 1 and is_instance_valid(target_drop) and owns_runtime_node(target_drop):
-        if not await _persist_host_profile():
+        if not await _persist_host_profile() or not _same_save_context(generation, file):
+            pickup_claims.erase(uuid)
             return {}
-        if not _same_save_context(context_generation, context_file):
-            return {}
+    if durable_pickup_busy:
+        pickup_claims.erase(uuid)
+        return {}
+    durable_pickup_busy = true
+    var record: Dictionary = await _collect_claimed_pickup(peer, key, instance, uuid, request, revision, epoch)
+    durable_pickup_busy = false
+    pickup_claims.erase(uuid)
+    return record
+
+func _collect_claimed_pickup(peer: int, key: String, instance: String, uuid: String, request: String, revision: int, epoch: String) -> Dictionary:
+    var context_generation: int = save_queue.generation
+    var context_file = Ref.save_file_manager.loaded_file
+    var target_drop = _find_existing_drop_by_uuid(uuid)
     if request.length() != 64 or not request.is_valid_hex_number() or lease_frozen or lease_preparing or epoch != terrain_epoch or chest_sessions.has(peer):
         return {}
     var receipt: String = ("pickup|" + key + "|" + instance + "|" + uuid + "|" + request).sha256_text()
@@ -6090,7 +6164,6 @@ func _collect_durable_pickup(peer: int, key: String, instance: String, uuid: Str
         return {}
     if epoch != terrain_epoch or lease_frozen or lease_preparing:
         return {}
-    durable_pickup_busy = true
     var previous_mode: int = Node.PROCESS_MODE_INHERIT
     var previous_merge: bool = false
     if is_instance_valid(target_drop):
@@ -6102,17 +6175,17 @@ func _collect_durable_pickup(peer: int, key: String, instance: String, uuid: Str
     if is_instance_valid(target_drop) and not target_drop.is_queued_for_deletion():
         target_drop.process_mode = previous_mode
         target_drop.can_merge = previous_merge
-    if not _same_save_context(context_generation, context_file):
-        durable_pickup_busy = false
-        return {}
-    if not record.is_empty() and instance == get_active_dimension_instance_key():
+    var current_file: bool = Ref.save_file_manager.loaded_file == context_file
+    if not record.is_empty() and current_file and instance == get_active_dimension_instance_key():
         _apply_pickup_remainder(uuid, record.get("_coop_pickup_bundle", {}))
-        if _has_live_peer():
+        if peer == 1 and not _same_save_context(context_generation, context_file):
+            profile_revision = record["revision"]
+            _apply_profile_inventories(record["state"], pickup_inventory_baseline)
+        if _same_save_context(context_generation, context_file) and _has_live_peer():
             for remote in multiplayer.get_peers():
                 if remote != peer:
                     sync_pickup_remainder.rpc_id(remote, instance, uuid, record.get("_coop_pickup_bundle", {}), epoch)
-    durable_pickup_busy = false
-    return record
+    return record if _same_save_context(context_generation, context_file) else {}
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -6123,13 +6196,14 @@ func receive_durable_pickup(request: String, record: Dictionary, epoch: String) 
     pickup_pending.erase(request)
     if not record.is_empty():
         profile_revision = record["revision"]
-        _apply_profile_inventories(record["state"])
+        _apply_profile_inventories(record["state"], pickup_inventory_baseline)
         if not multiplayer.is_server():
             _apply_pickup_remainder(uuid, record.get("_coop_pickup_bundle", {}))
     else:
         var drop = _find_existing_drop_by_uuid(uuid)
         if is_instance_valid(drop):
             drop.set_meta("coop_pickup_pending_request", false)
+    pickup_inventory_baseline = {}
     chest_pending_token = ""
     chest_active_token = ""
     close_personal_chest("")
@@ -6901,7 +6975,7 @@ func _migrate_legacy_pocket_save_to_owner_if_needed(target_dimension: int, targe
         return false
     if _has_live_peer() and not multiplayer.is_server():
         return false
-    return _prepare_target_legacy_checkpoint(target_dimension, target_pocket_owner_key)
+    return await _prepare_target_legacy_checkpoint(target_dimension, target_pocket_owner_key)
 
 func _migrate_loaded_legacy_pocket_to_local_owner_if_needed() -> void:
     if Ref.save_file_manager == null or Ref.save_file_manager.loaded_file == null or Ref.save_file_manager.loaded_file_register == null:
@@ -6917,7 +6991,7 @@ func _migrate_loaded_legacy_pocket_to_local_owner_if_needed() -> void:
     if local_player_key == "":
         return
 
-    if not _migrate_legacy_pocket_save_to_owner_if_needed(int(LucidBlocksWorld.Dimension.POCKET), local_player_key):
+    if not await _migrate_legacy_pocket_save_to_owner_if_needed(int(LucidBlocksWorld.Dimension.POCKET), local_player_key):
         return
     Ref.save_file_manager.loaded_file_register.set_data("pocket_owner_key", local_player_key, true)
     if _has_live_peer():
@@ -8328,6 +8402,8 @@ func _send_persistent_state_to_host(force_send: bool = false) -> void:
         return
 
     var state: Dictionary = _capture_local_persistent_state()
+    if pickup_checkpoint_allowed:
+        pickup_inventory_baseline = state.duplicate(true)
     if state.is_empty():
         return
 
@@ -9083,7 +9159,12 @@ func _send_canonical_patch(peer: int, patch: Dictionary) -> void:
 func _send_canonical_rebase(peer: int, patch: Dictionary) -> void:
     var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
     var requested: Array = patch.get("world_data", {}).get(prefix + "world", {}).get(prefix + "chunk_block", {}).keys()
-    var stored: Dictionary = region_checkpoint.read_regions(_get_checkpoint_chunks_directory(), prefix.trim_suffix("_"), _checkpoint_block_ids())
+    var rebase_generation: int = save_queue.generation
+    var rebase_file = Ref.save_file_manager.loaded_file
+    var rebase_epoch: String = terrain_epoch
+    var stored: Dictionary = await _store_job(region_checkpoint, "read_regions", [_get_checkpoint_chunks_directory(), prefix.trim_suffix("_"), _checkpoint_block_ids(), requested], {})
+    if not _same_save_context(rebase_generation, rebase_file) or rebase_epoch != terrain_epoch:
+        return
     if not stored.get("ok", false):
         return
     var data: Dictionary = {}
@@ -9153,6 +9234,8 @@ func _checkpoint_local_host_world() -> bool:
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
     var instance: String = get_active_dimension_instance_key()
+    if lease_checkpoint_allowed and lease_frozen and not world.is_all_loaded():
+        return false
     var deadline: int = Time.get_ticks_msec() + 15000
     while world.load_enabled and not world.is_all_loaded() and Time.get_ticks_msec() < deadline:
         await get_tree().process_frame
@@ -9165,6 +9248,12 @@ func _checkpoint_local_host_world() -> bool:
 
 
 func _await_local_world_checkpoint(host_flush_request_id: int = 0, lease_barrier: bool = false) -> bool:
+    durable_checkpoint_waiters += 1
+    var result: bool = await _run_local_world_checkpoint(host_flush_request_id, lease_barrier)
+    durable_checkpoint_waiters -= 1
+    return result
+
+func _run_local_world_checkpoint(host_flush_request_id: int, lease_barrier: bool) -> bool:
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
     var deadline: int = Time.get_ticks_msec() + 15000
@@ -9180,6 +9269,16 @@ func _await_local_world_checkpoint(host_flush_request_id: int = 0, lease_barrier
         return host_flush_request_id == 0
     var world = Ref.world
     var instance: String = get_active_dimension_instance_key()
+    if lease_barrier and not world.is_all_loaded():
+        return false
+    background_checkpoint_cancelled = true
+    var background_deadline: int = Time.get_ticks_msec() + 15000
+    while background_checkpoint_busy and Time.get_ticks_msec() < background_deadline:
+        await get_tree().process_frame
+        if world != Ref.world or instance != get_active_dimension_instance_key() or not _same_save_context(generation, file):
+            return false
+    if background_checkpoint_busy or lease_barrier and not world.is_all_loaded():
+        return false
     var wait_deadline: int = Time.get_ticks_msec() + int(GUEST_WORLD_PATCH_FLUSH_TIMEOUT_SEC * 1000.0)
     while (guest_checkpoint_busy or canonical_apply_busy or not pending_canonical_patches.is_empty() or not world.is_all_loaded()) and Time.get_ticks_msec() < wait_deadline:
         await get_tree().process_frame
@@ -11446,7 +11545,7 @@ func _on_local_world_loaded() -> void:
     _set_single_player_shutdown_world_pause_override(false)
     _install_player_death_hook()
     call_deferred("_install_game_menu_quit_hook")
-    _migrate_loaded_legacy_pocket_to_local_owner_if_needed()
+    await _migrate_loaded_legacy_pocket_to_local_owner_if_needed()
     call_deferred("_ensure_pause_menu_coop_ui")
     if not host_rehost_pending:
         return
@@ -11735,7 +11834,9 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
 
     var register_json: String = JSON.stringify(JSON.from_native(register_data))
     var access_path: String = _get_checkpoint_chunks_directory().get_base_dir().path_join("coop/chest_access.json")
-    var accesses: Dictionary = identity_store.read_record(access_path)
+    var accesses: Dictionary = await _store_job(identity_store, "read_record", [access_path], {"invalid": true})
+    if not _same_save_context(context_generation, context_file) or admitted_player_keys.get(peer_id, "") != context_key:
+        return
     if not accesses.has("invalid") and not accesses.is_empty():
         Ref.save_file_manager.loaded_file.set_data("coop/chest_access", accesses, true)
     var snapshot_save_data: Dictionary = Ref.save_file_manager.loaded_file.data.duplicate_deep()
@@ -11750,7 +11851,9 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
         snapshot_save_data[snapshot_namespace + "_world"] = _merge_patch_dictionary(snapshot_save_data.get(snapshot_namespace + "_world", {}), live.get(snapshot_namespace + "_world", {}))
         SaveFile._set_data(snapshot_save_data, "%s/respawn_positions" % snapshot_namespace, Ref.world.respawn_positions.duplicate(true))
     else:
-        var stored: Dictionary = region_checkpoint.read_regions(_get_checkpoint_chunks_directory(), snapshot_namespace, _checkpoint_block_ids())
+        var stored: Dictionary = await _store_job(region_checkpoint, "read_regions", [_get_checkpoint_chunks_directory(), snapshot_namespace, _checkpoint_block_ids()], {})
+        if not _same_save_context(context_generation, context_file) or admitted_player_keys.get(peer_id, "") != context_key:
+            return
         if not stored["ok"]:
             status_message = "Cannot read destination region checkpoint"
             _update_status_text()
@@ -11762,7 +11865,10 @@ func _send_world_snapshot_to_peer(peer_id: int, target_dimension: int = -1, targ
             for channel in RegionCheckpoint.CHANNELS:
                 terrain[snapshot_namespace + "_" + channel].merge(region[channel], true)
         snapshot_save_data[snapshot_namespace + "_world"] = terrain
-    if not _merge_instance_nodes_into_snapshot(snapshot_save_data, get_dimension_instance_key(actual_dimension, target_pocket_owner_key), actual_dimension, target_pocket_owner_key):
+    var prepared: Dictionary = await _store_job(personal_store, "read_ledger", [_profile_path(_get_local_player_key())], {})
+    if not _same_save_context(context_generation, context_file) or admitted_player_keys.get(peer_id, "") != context_key:
+        return
+    if not _merge_instance_nodes_into_snapshot(snapshot_save_data, get_dimension_instance_key(actual_dimension, target_pocket_owner_key), actual_dimension, target_pocket_owner_key, "__current__", prepared):
         return
     (await _apply_peer_persistent_player_to_snapshot(snapshot_save_data, peer_id, actual_dimension))
     if not _same_save_context(context_generation, context_file) or admitted_player_keys.get(peer_id, "") != context_key:

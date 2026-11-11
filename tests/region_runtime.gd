@@ -85,6 +85,14 @@ func run() -> int:
         manager.free()
         pure.free()
         return failures
+    var bounded_root: String = manager.fixture_root.path_join("filtered")
+    var bounded_region: Dictionary = pure.chunk(selected_id)
+    var bounded_chunk: Vector3i = bounded_region["chunk_block"].keys()[0]
+    check(manager.region_checkpoint.commit_regions(bounded_root, "naraka", {preload("res://coop_mod/region_checkpoint.gd").region_coordinate(bounded_chunk): bounded_region}, manager.ids).get("ok", false), "filtered read fixture committed")
+    var bounded_read: Dictionary = await manager._store_job(manager.region_checkpoint, "read_regions", [bounded_root, "naraka", manager.ids, [bounded_chunk]], {})
+    check(bounded_read.get("ok", false) and bounded_read["regions"].size() == 1 and bounded_read["regions"].values()[0]["chunk_block"].keys() == [bounded_chunk], "worker returns only requested checkpoint chunks")
+    var empty_read: Dictionary = await manager._store_job(manager.region_checkpoint, "read_regions", [bounded_root, "naraka", manager.ids, []], {})
+    check(empty_read.get("ok", false) and empty_read["regions"].is_empty(), "empty chunk selection does not request whole namespace")
     var data: Dictionary = pure.chunk(selected_id)
     var patch: Dictionary = {"dimension": 3, "pocket_owner_key": "alice", "dimension_instance_key": "pocket:alice", "world_data": {"pocket__alice_world": {}}, "checkpoint_request_id": 1, "host_flush_request_id": 9}
     for channel in data:
@@ -222,7 +230,7 @@ func run() -> int:
     check(legacy_file.data == before_failed and not legacy_world.region_checkpoint_store.has_checkpoint(legacy_world.fixture_root, "pocket__dave"), "failed migration preserves originals and cannot save blank world")
     manager.region_checkpoint = FailStore.new()
     var queued_before: Dictionary = Ref.world.pending_dimension_instance.duplicate(true)
-    check(not manager._queue_loaded_dimension_instance(3, "dave"), "migration preflight refuses transition before disposal")
+    check(not await manager._queue_loaded_dimension_instance(3, "dave"), "migration preflight refuses transition before disposal")
     check(Ref.world.pending_dimension_instance == queued_before, "failed preflight preserves outgoing instance")
     var prior_world = Ref.world
     Ref.world = legacy_world

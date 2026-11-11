@@ -2,7 +2,7 @@
 
 Compatibility update and completion of [parkers0405/lucid-blocks-coop](https://github.com/parkers0405/lucid-blocks-coop). Original co-op implementation by parkers0405 and upstream contributors; this fork preserves their history and attribution.
 
-**Status: gameplay responsiveness update ready for PR review and merge.** Target: Steam build **26206996**, game **5.2.0.0**, Godot **4.6 double** with GodotSteam **4.17.1**. See [playtest.md](playtest.md) for dated verification and limits. The inherited `dist` artifacts are stale; build from source rather than installing them. No new build has been installed or released.
+**Status: NOT READY; review fixes and verification in progress.** Target: Steam build **26206996**, game **5.2.0.0**, Godot **4.6 double** with GodotSteam **4.17.1**. See [playtest.md](playtest.md) for dated verification and limits. The inherited `dist` artifacts are stale; build from source rather than installing them. No new build has been installed or released.
 
 Scope: two-player Steam/LAN co-op, independent exploration and dimensions, persistent personal Apotheosis with visits, the known-issue fixes below, and personal ender-chest storage. New player models, skins, dedicated servers, and larger player counts are excluded. See [tasks.md](tasks.md) and [playtest.md](playtest.md) for actual progress and evidence.
 
@@ -12,7 +12,7 @@ No new license is assigned to inherited code or assets. Existing attribution and
 
 Identity is bound to an authenticated Steam transport ID or a host-issued LAN reconnect credential. Names and peer numbers do not identify a saved character. Profiles, chest contents and preserved world objects share an atomic host ledger; region terrain uses separate verified checkpoints. Preserve the complete save folder, including its co-op sidecars, when backing it up.
 
-Routine terrain saves and built-in background file transactions preserve movement/camera. Pickup transactions lock inventory actions only, conserve partial stacks and wait until an active glide ends. No external worker, hosting service or extra player configuration is required. Both peers must use this protocol6 update.
+Routine terrain saves and built-in background file transactions preserve movement/camera. Pickups retain mining, melee attacks and hotbar selection; conflicting drop/item-use inputs wait for acknowledgement. Sparse pickup updates preserve ongoing tool wear, conserve partial stacks and wait until an active glide or item interaction ends. Routine personal checkpoints run every5seconds; durable inventory transactions take priority over queued routine work. No external worker, hosting service or extra player configuration is required. Both peers must use this protocol6 update.
 
 The host can designate an empty ordinary cache cube with `/enderchest`. It opens a personal21-slot chest with explicit quantity-based Store/Take actions. Contents belong to the authenticated character and survive destruction of the access block. Ordinary cubes and hoppers retain their normal behavior.
 

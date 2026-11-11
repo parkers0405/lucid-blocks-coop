@@ -7,23 +7,34 @@ class Job extends RefCounted:
     var result: Variant = null
     var done: bool = false
     var generation: int
+    var started: bool = false
+    var keep: bool = false
+    var priority: bool = false
 
 var pending: Array[Job] = []
 var active: Job
 var task: int = -1
 var generation: int = 0
 
-func run(tree: SceneTree, operation: Callable) -> Variant:
+func run(tree: SceneTree, operation: Callable, keep: bool = false, priority: bool = false) -> Variant:
     assert(operation.get_object() is RefCounted and not operation.get_object() is Node)
     var job := Job.new()
     job.operation = operation
     job.target = operation.get_object()
     job.generation = generation
-    pending.append(job)
+    job.keep = keep
+    job.priority = priority
+    var index: int = 0
+    if priority:
+        while index < pending.size() and pending[index].priority:
+            index += 1
+        pending.insert(index, job)
+    else:
+        pending.append(job)
     while not job.done:
         poll()
         await tree.process_frame
-    return job.result if job.generation == generation else null
+    return job.result if job.started or job.generation == generation else null
 
 func poll() -> void:
     if task >= 0:
@@ -35,9 +46,11 @@ func poll() -> void:
         task = -1
     while not pending.is_empty():
         active = pending.pop_front()
-        if active.generation != generation:
+        if active.generation != generation and not active.keep:
+            print("[lucid-blocks-coop] discarded queued file job from disconnected session: ", active.operation.get_method())
             active.done = true
             continue
+        active.started = true
         task = WorkerThreadPool.add_task(_execute.bind(active))
         break
 
@@ -46,3 +59,13 @@ func _execute(job: Job) -> void:
 
 func invalidate() -> void:
     generation += 1
+
+# Synchronous engine load callbacks cannot yield; drain before opening the same files.
+func flush() -> void:
+    while task >= 0 or not pending.is_empty():
+        poll()
+        if task >= 0:
+            WorkerThreadPool.wait_for_task_completion(task)
+            active.done = true
+            active = null
+            task = -1

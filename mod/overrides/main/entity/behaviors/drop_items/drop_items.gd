@@ -16,7 +16,7 @@ func _ready() -> void:
 func drop_and_remove_from_inventory(inventory: Inventory, index: int) -> void:
     if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(entity):
         return
-    if entity.disabled or not enabled:
+    if entity.disabled or not enabled or (entity == Ref.player and Ref.coop_manager != null and Ref.coop_manager.chest_lock_active):
         return
     if Ref.coop_manager != null and Ref.coop_manager.is_client_synced_entity(entity):
         return

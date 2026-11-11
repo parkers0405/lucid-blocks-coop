@@ -460,6 +460,8 @@ func _checkpoint_chunks_directory() -> String:
 
 
 func _load_dimension_regions(chunk_directory: String, file: SaveFile) -> bool:
+    if Ref.coop_manager != null and self == Ref.world:
+        Ref.coop_manager.save_queue.flush()
     var register = Ref.save_file_manager.loaded_file_register
     var previous_owner: String = str(register.get_data("pocket_owner_key", "", true))
     var previous_pending: Dictionary = pending_dimension_instance.duplicate(true)

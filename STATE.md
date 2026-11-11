@@ -1,5 +1,5 @@
 # Lucid Blocks co-op state
-Updated2026-11-11. Gameplay responsiveness and recovery update; PR is ready to merge within documented local verification limits.
+Updated2026-11-11. Review follow-up in progress. NOT READY: confirmed pickup locks, asynchronous pickup races and checkpoint/persistence issues require fixes and current verification. 2026-11-11 rerun: contracts PASS (run bb6a00f126f448ffabe46433077ef01a), LAN 19 assertions PASS, but handoff lock (~230 ms sample) and offline Steam error count above control fail; handoff gates G2,G5-G8 unmeasured. See playtest.md.
 
 - Branch: fix/review-ready-compatibility. Preserve102unrelated.import edits and status-only test line endings.
 - Scope: smooth two-player gameplay with compatibility/functionality retained. No PR creation, merge, main push, installation or release performed.
@@ -18,4 +18,4 @@ Updated2026-11-11. Gameplay responsiveness and recovery update; PR is ready to m
 - Final six-second input sample361frames/0disabled outside handoff vs earlier baseline361/11; max43.178ms. No broad FPS guarantee.
 - Optional combat55functional assertions and visibility pass; strict8native shutdown errors remain. Baseline shader completion blocked. Expanded LAN native Steam/shutdown errors are tracked separately from gameplay assertions.
 - Real two-account Steam invites and subjective human playfeel remain untested by requested scope. Dated details/failures: playtest.md; architecture.md and gameplay-audit.md describe current behavior.
-- Next: maintainer PR review; feature branch publication only. No actual merge, release or installation.
+- Next: correct confirmed review findings, run affected contracts and exact-artifact LAN verification, then reassess readiness. Prior passing assertions are historical evidence. No actual merge, release or installation.

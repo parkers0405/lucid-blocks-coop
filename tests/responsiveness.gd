@@ -97,6 +97,19 @@ class Loading extends Barrier:
         drains += 1
         return false
 
+class LeaseCheckpoint extends "res://coop_mod/coop_manager.gd":
+    var save_yielded: bool = false
+    func _ready() -> void:
+        pass
+    func _physics_process(_delta: float) -> void:
+        pass
+    func _can_sample_player() -> bool:
+        return true
+    func _persist_host_profile(_skip: bool = false) -> bool:
+        await get_tree().process_frame
+        save_yielded = true
+        return true
+
 var finished: bool = false
 var checks: int = 0
 var failures: int = 0
@@ -144,6 +157,11 @@ func run() -> int:
         skipped_restores = skipped_restores and not await manager._checkpoint_terrain_in_background()
         manager.set(state_flag, false)
     check(skipped_restores and manager.submitted_block == -1, "routine checkpoint skips restoration without reading native terrain")
+    manager.guest_checkpoint_was_disabled = true
+    manager.background_checkpoint_busy = true
+    Ref.player.disabled = false
+    check(not manager._disabled_before_checkpoint(), "routine checkpoint cannot restore a stale disabled state during handoff")
+    manager.background_checkpoint_busy = false
     manager.terrain_epoch = "fixture:1"
     var disabled: bool = Ref.player.disabled
     var mode: int = Ref.world.process_mode
@@ -151,6 +169,7 @@ func run() -> int:
     checkpoint(manager)
     await get_tree().process_frame
     check(not Ref.player.disabled and Ref.world.process_mode == mode, "delayed checkpoint keeps player and world processing enabled")
+    check(not manager.guest_checkpoint_busy, "routine save does not occupy the durable barrier lock")
     manager.live_block = 8
     while not finished:
         await get_tree().process_frame
@@ -212,9 +231,13 @@ func run() -> int:
     pickup.host_profile_busy = false
     await get_tree().process_frame
     await get_tree().process_frame
-    check(pickup.captures == 1 and not second.get_meta("coop_pickup_pending_request"), "pickups waiting on the same save reserve inventory one at a time")
+    check(pickup.captures == 1 and second.get_meta("coop_pickup_pending_request"), "second pickup remains queued while first reserves inventory")
     while pickup.chest_lock_active:
         await get_tree().process_frame
+    var pickup_deadline: int = Time.get_ticks_msec() + 2000
+    while (pickup.captures < 2 or pickup.chest_lock_active) and Time.get_ticks_msec() < pickup_deadline:
+        await get_tree().process_frame
+    check(pickup.captures == 2, "queued second pickup runs after first acknowledgement")
     Ref.preserve_node_manager.node_to_uuid_map.erase(first)
     Ref.preserve_node_manager.node_to_uuid_map.erase(second)
     first.free()
@@ -233,5 +256,12 @@ func run() -> int:
     await loading._handoff_runtime_lease({})
     check(loading.drains == 0 and not loading.lease_busy, "loading player cannot start a handoff that preserves disabled input")
     loading.free()
+    var streaming := LeaseCheckpoint.new()
+    add_child(streaming)
+    streaming.lease_checkpoint_allowed = true
+    streaming.lease_frozen = true
+    var before_checkpoint: int = Time.get_ticks_msec()
+    check(not await streaming._checkpoint_local_host_world() and streaming.save_yielded and Time.get_ticks_msec() - before_checkpoint < 1000, "lease checkpoint aborts promptly if streaming is active after asynchronous profile IO")
+    streaming.free()
     print("RESPONSIVENESS_RESULT ", checks, " checks ", failures, " failures")
     return failures

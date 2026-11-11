@@ -52,6 +52,20 @@ class PresenceManager extends "res://coop_mod/coop_manager.gd":
         return fixture_root.path_join("chunks")
     func _update_status_text() -> void:
         pass
+class SlowQueue extends "res://coop_mod/save_queue.gd":
+    func _execute(job: Job) -> void:
+        OS.delay_msec(100)
+        job.result = job.operation.call()
+class DropProbe extends Node3D:
+    var can_merge: bool = true
+class PickupRace extends Manager:
+    var drop: Node3D
+    func _find_existing_drop_by_uuid(_uuid: String):
+        return drop
+    func _apply_pickup_remainder(_uuid: String, _bundle: Dictionary) -> void:
+        pass
+    func _has_live_peer() -> bool:
+        return false
 class CheckpointResumeManager extends Manager:
     func _drain_lease_mutations() -> bool:
         return false
@@ -135,9 +149,11 @@ func run() -> int:
         checkpoint_manager.guest_checkpoint_locks_player = true
         checkpoint_manager.guest_checkpoint_was_disabled = initially_disabled
         Ref.player.disabled = true
-        await checkpoint_manager._handoff_runtime_lease({})
+        checkpoint_manager.lease_was_disabled = checkpoint_manager._disabled_before_checkpoint()
+        checkpoint_manager._resume_lease_runtime()
         check(Ref.player.disabled, "lease cancellation preserves active checkpoint lock")
         checkpoint_manager.guest_checkpoint_busy = false
+        checkpoint_manager.guest_checkpoint_locks_player = false
         checkpoint_manager._resume_lease_runtime()
         check(Ref.player.disabled == initially_disabled, "lease resume restores original state rather than temporary checkpoint lock")
     Ref.player.disabled = originally_disabled
@@ -228,11 +244,41 @@ func run() -> int:
     replacement.free()
     Ref.save_file_manager.loaded_file = prior_file
     manager.free()
+    await check_pickup_race()
     await check_presence_capture()
     await check_disconnected_reclaim()
     trace_orphan_inventories("after_reclaim_fixture")
     print("LEASE_RUNTIME_RESULT ", checks, " checks ", failures, " failures")
     return failures
+
+var pickup_race_result: Dictionary = {}
+var pickup_race_done: bool = false
+func launch_pickup_race(manager: Node, instance: String) -> void:
+    pickup_race_result = await manager._collect_durable_pickup(1, "host", instance, UUID, "c".repeat(64), 1, manager.terrain_epoch)
+    pickup_race_done = true
+
+func check_pickup_race() -> void:
+    var race := PickupRace.new()
+    race.fixture_root = "user://pickup_race_" + str(Time.get_ticks_usec())
+    add_child(race)
+    race.drop = DropProbe.new()
+    add_child(race.drop)
+    race.drop.process_mode = Node.PROCESS_MODE_ALWAYS
+    race.terrain_epoch = "race"
+    race.save_queue = SlowQueue.new()
+    var empty: Dictionary = {"node": {"player": {"Inventory": {"capacity": 1, "items": [PackedInt32Array(), Vector3i.ZERO]}}}}
+    var bundle: Dictionary = {"uuid": UUID, "scene_path": DROP, "position": Vector3.ZERO, "save_data": {"naraka": {"node": {UUID: {"global_position": Vector3.ZERO, "": {"capacity": 1, "items": [PackedInt32Array([7, 4, 0]), Vector3i.ZERO]}}}}}}
+    race.personal_store.save_checkpoint(race._profile_path("host"), empty, 0, "dimension__2", "naraka", [bundle], {DROP: true})
+    pickup_race_done = false
+    launch_pickup_race(race, "dimension:2")
+    await get_tree().process_frame
+    var duplicate: Dictionary = await race._collect_durable_pickup(1, "host", "dimension:2", UUID, "d".repeat(64), 1, "race")
+    check(duplicate.is_empty(), "same UUID is claimed before first file await")
+    while not pickup_race_done:
+        await get_tree().process_frame
+    check(pickup_race_result.get("revision") == 2 and race.drop.process_mode == Node.PROCESS_MODE_ALWAYS and race.drop.can_merge and race.pickup_claims.is_empty(), "interleaved pickup restores drop mode and merging exactly once")
+    race.drop.free()
+    race.free()
 
 func check_presence_capture() -> void:
     var presence := PresenceManager.new()

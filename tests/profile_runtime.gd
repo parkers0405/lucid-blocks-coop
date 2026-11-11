@@ -157,6 +157,26 @@ func run() -> int:
     var unchanged_item = inventory.items[0]
     manager._apply_profile_inventories(manager._capture_local_persistent_state())
     check(inventory.items[0] == unchanged_item, "unchanged profile slots preserve held and equipped item instances")
+    var pickup_baseline: Dictionary = manager._capture_local_persistent_state()
+    var pickup_ack: Dictionary = pickup_baseline.duplicate(true)
+    pickup_ack["node"]["player"]["Inventory"]["items"][2] = PackedInt32Array([7, 1, 0])
+    inventory.change_amount(0, -1)
+    var worn_item = inventory.items[0]
+    manager._apply_profile_inventories(pickup_ack, pickup_baseline)
+    check(inventory.items[0] == worn_item and inventory.items[0].count == 5 and inventory.items[1].count == 1, "pickup acknowledgement preserves unrelated live slot changes while adding loot")
+    inventory.set_item(0, null)
+    manager._apply_profile_inventories(pickup_ack, pickup_baseline)
+    check(inventory.items[0] == null, "pickup acknowledgement cannot resurrect a tool broken after checkpoint")
+    manager._apply_profile_inventories(pickup_baseline)
+    var intent_disabled: bool = Ref.player.disabled
+    Ref.player.coop_pending_drop = 0
+    Ref.player.coop_pending_drop_item = inventory.items[0]
+    Ref.player.coop_pending_interact = 0
+    Ref.player.coop_pending_interact_item = inventory.items[0]
+    Ref.player.disabled = true
+    Ref.player.interaction_process({}, 0.0)
+    check(Ref.player.coop_pending_drop == -1 and Ref.player.coop_pending_drop_item == null and Ref.player.coop_pending_interact == -1 and Ref.player.coop_pending_interact_item == null, "loading or disabled player clears deferred pickup action intent")
+    Ref.player.disabled = intent_disabled
     manager.personal_store = preload("res://coop_mod/personal_store.gd").new()
     check((await manager._persist_host_profile()), "host can save after restart")
     var revision: int = manager.profile_revision
@@ -222,6 +242,9 @@ func run() -> int:
         await get_tree().process_frame
         access_block.free()
         var original_disabled: bool = Ref.player.disabled
+        manager.begin_chest_inventory_lock(false)
+        check(not manager._is_client_gameplay_locked() and manager.chest_lock_active, "pickup protects inventory without locking attacks mining or hotbar")
+        manager._release_chest_inventory_lock()
         manager.begin_chest_inventory_lock()
         manager.chest_pending_token = "pending_fixture"
         manager.chest_active_token = "pending_fixture"

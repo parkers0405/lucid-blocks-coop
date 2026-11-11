@@ -1,6 +1,6 @@
 # Current work — gameplay quality
 
-Full audit and implementation in [gameplay-audit.md](gameplay-audit.md). The gameplay fixes and focused regressions are implemented. Final packed361assertions/68scripts, installer23, chest29 and two-process19functional assertions are recorded in playtest.md. Source and visual review completed; native Steam/shutdown limits remain explicit. Keep the normal two-command maintenance workflow below.
+Review follow-up in [gameplay-audit.md](gameplay-audit.md): confirmed findings corrected, focused regressions and independent source review complete; final packed/runtime verification underway. Current status NOT READY. Historical361assertions/68scripts, installer23, chest29 and two-process19functional assertions remain in playtest.md. Next: final packed run, exact-artifact offline/LAN comparison, then record the readiness decision. Keep the maintenance workflow below.
 
 # Lucid Blocks work
 
