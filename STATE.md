@@ -1,5 +1,5 @@
 # Lucid Blocks co-op state
-Updated 2026-11-11. NOT READY. Friction harness (scripts/test_friction.ps1, tests/lan) measured: handoff locks actions 267 ms clean and 5.1 s typical+slow (G4/G6 fail, needs a protocol decision); pickup lock fixed; 2 real bugs fixed (null terrain collider, living_block_path). G2/G5/G7 partial. See top entry of playtest.md.
+Updated 2026-11-11. NOT READY. Option-3 pass: write-behind ownership commit, single ledger read, boundary hysteresis (32 units) and a 3 s minimum handoff interval cut the clean+fast handoff freeze from ~300 to 145 ms median (p95 199, G4 limit 150 still missed) and typical+slow from ~2.8 to 1.6 s median (4.1 s max, G6 fails). G7 guest kill tests (pickup, chest, handoff install) conserve items on old and new code; the shared_loot discrepancy was the oracle (native merge race). G6 needs an in-memory handoff (design decision pending). See top entry of playtest.md.
 
 - Branch: fix/review-ready-compatibility. Preserve102unrelated.import edits and status-only test line endings.
 - Scope: smooth two-player gameplay with compatibility/functionality retained. No PR creation, merge, main push, installation or release performed.

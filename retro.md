@@ -1,5 +1,10 @@
 # Lucid Blocks mod retro
 
+## 2026-11-11: option-3 handoff pass
+Failures: (1) the 29/31 of 30 loot "discrepancy" was a test-oracle fault, native DroppedItem merging is racy; prevention: the oracle spawns non-merging drops and tallies per item id. (2) A killed runner left an orphan 480 MB game process and froze the session; prevention: one-pair mutex, stray cleanup at start, process-tree kill in finally, hard per-run timeout. (3) The fake chest block lacked `broken` and flooded 823 errors; prevention: the probe fake exposes the property. (4) A fixed-location exe without its mods/DLL layout hung at startup because the game loads mods relative to its exe; the whole runtime now lives beside the fixed exe.
+Worked: phase-time instrumentation showed disk jobs, not round trips, dominate the freeze; write-behind commit plus one ledger read halved it. Kill tests were cheap once the probe published kill-point markers.
+Did not work: trimming jobs cannot meet G4/G6; every disk job inside the freeze costs the full job latency and the checkpoint jobs cannot be skipped while entities move. Process cost: about 25 harness runs plus one 20-run matrix. Hypothesis answered: write-behind survived kills in the tested windows (conservation held) but is not sufficient for the gates.
+
 ## 2026-11-11: gameplay responsiveness audit
 Routine save/ack paths had been treated as global gameplay barriers. Capturing terrain snapshots before waiting, separating inventory actions from movement/camera, and using the engine's FIFO background file work removed measured routine input freezes while preserving host validation and atomic receipts. Partial stacks now conserve their remainder; chest controls fit the actual small logical viewport; cached lease modes avoid repeated subtree walks. No service, dependency or player setup was added.
 

@@ -4,7 +4,7 @@ Current objective: preserve compatibility and functionality while making routine
 
 ## 2026-11-11 review follow-up
 
-Status: NOT READY; implementation complete and final verification underway. The review's larger impairment matrix and numerical budgets are proposals, not measured results.
+Status: NOT READY; handoff freeze gates G4 and G6 still fail after the option-3 pass (write-behind commit, hysteresis); see playtest.md. The review's larger impairment matrix and numerical budgets are proposals, not measured results.
 
 - Confirmed against1644054: pickup gameplay lock and pre-await race (F1/F2), shared routine/durable checkpoint lock and stale disabled-state restoration (F3/F4), loading during handoff (F5), discarded active-write results (F6), synchronous store access (F7), whole-namespace handoff reads (F8), and pose-driven routine rewrites (F9).
 - F9 correction: save_checkpoint itself reads the ledger once; additional reads occur in surrounding helpers. Avoid attributing two reads to that function.

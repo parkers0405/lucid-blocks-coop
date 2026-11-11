@@ -127,7 +127,7 @@ foreach ($group in ($rows | Group-Object scenario, profile, disk, role)) {
 $conservation = @()
 foreach ($run in ($rows | Where-Object scenario -eq 'shared_loot' | Group-Object run)) {
     $players = @($run.Group | Where-Object { $_.items_delta -ne $null })
-    $drops = ($run.Group | Where-Object role -eq 'host' | Select-Object -First 1).drops_left
+    $drops = ($run.Group | Where-Object { $_.role -in 'host', 'solo' } | Select-Object -First 1).drops_left
     $gained = ($players | Measure-Object -Property items_delta -Sum).Sum
     $conservation += [pscustomobject]@{ run = $run.Name; gained = $gained; drops_left_host = $drops; expected = 30; ok = ($gained + [int]$drops -eq 30) }
 }

@@ -2,7 +2,7 @@
 
 Compatibility update and completion of [parkers0405/lucid-blocks-coop](https://github.com/parkers0405/lucid-blocks-coop). Original co-op implementation by parkers0405 and upstream contributors; this fork preserves their history and attribution.
 
-**Status: NOT READY; review fixes and verification in progress.** Target: Steam build **26206996**, game **5.2.0.0**, Godot **4.6 double** with GodotSteam **4.17.1**. See [playtest.md](playtest.md) for dated verification and limits. The inherited `dist` artifacts are stale; build from source rather than installing them. No new build has been installed or released.
+**Status: NOT READY; handoff freeze gates G4 and G6 failing (see playtest.md).** Target: Steam build **26206996**, game **5.2.0.0**, Godot **4.6 double** with GodotSteam **4.17.1**. See [playtest.md](playtest.md) for dated verification and limits. The inherited `dist` artifacts are stale; build from source rather than installing them. No new build has been installed or released.
 
 Scope: two-player Steam/LAN co-op, independent exploration and dimensions, persistent personal Apotheosis with visits, the known-issue fixes below, and personal ender-chest storage. New player models, skins, dedicated servers, and larger player counts are excluded. See [tasks.md](tasks.md) and [playtest.md](playtest.md) for actual progress and evidence.
 
