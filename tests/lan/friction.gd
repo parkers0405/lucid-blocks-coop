@@ -57,6 +57,8 @@ var pending_breaks: Array = []
 var pickup_ms: Array = []
 var mined: int = 0
 var spawned: Dictionary = {}
+var kill_seen: bool = false
+var peer_gone_seen: bool = false
 var items0: int = 0
 const LOCK_FLAGS := ["chest_lock_active", "chest_movement_locked", "lease_preparing", "lease_frozen", "lease_busy", "guest_checkpoint_busy", "reconnect_pending", "client_restore_in_progress", "receiving_host_world", "pickup_inventory_lock", "durable_pickup_busy", "terrain_sync_busy"]
 
@@ -192,6 +194,12 @@ func _physics_process(_delta: float) -> void:
     var reset: int = 1 if (prev_bb and not breaking and prev_progress > 0.0 and bot_active and Input.is_action_pressed("attack") and locked) else 0
     prev_bb = breaking
     prev_progress = progress
+    if role == "host" and not kill_seen and FileAccess.file_exists(scenario.path_join("guest_killpoint.json")):
+        kill_seen = true
+        _event("kill_seen")
+    if kill_seen and not peer_gone_seen and manager.admitted_player_keys.is_empty():
+        peer_gone_seen = true
+        _event("peer_gone")
     var total: int = _item_total()
     while not pending_breaks.is_empty() and Time.get_ticks_msec() - int(pending_breaks[0]) > 3000:
         pending_breaks.pop_front()
