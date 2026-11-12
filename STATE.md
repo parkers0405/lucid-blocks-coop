@@ -1,5 +1,5 @@
 # Lucid Blocks co-op state
-Updated 2026-11-11. NOT READY. Option-3 pass: write-behind ownership commit, single ledger read, boundary hysteresis (32 units) and a 3 s minimum handoff interval cut the clean+fast handoff freeze from ~300 to 145 ms median (p95 199, G4 limit 150 still missed) and typical+slow from ~2.8 to 1.6 s median (4.1 s max, G6 fails). G7 guest kill tests (pickup, chest, handoff install) conserve items on old and new code; the shared_loot discrepancy was the oracle (native merge race). G6 needs an in-memory handoff (design decision pending). See top entry of playtest.md.
+Updated 2026-11-11. NOT READY. Realistic cells (3 repeats): handoff freeze is 733-850 ms at typical latency and 2-4.7 s at bad latency (limits 150 ms action lock, 500 ms p95), so G4/G6 fail on round trips; host mining is also degraded in co-op (3-8 of 20 blocks vs 20 solo). Write-behind commit, hysteresis, rollback and backoff fixes are in; kill tests, shared_loot and chest_cycle conserve items. Native errors match controls except an ENet auth-packet error under the reordering profile. See top entry of playtest.md.
 
 - Branch: fix/review-ready-compatibility. Preserve102unrelated.import edits and status-only test line endings.
 - Scope: smooth two-player gameplay with compatibility/functionality retained. No PR creation, merge, main push, installation or release performed.
