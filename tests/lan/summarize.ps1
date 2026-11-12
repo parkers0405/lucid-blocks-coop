@@ -99,6 +99,11 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
         $ignored = @($win | Where-Object { $_.mi -eq 1 -and $_.mv -lt 0.001 -and ($_.dis -eq 1 -or $_.lk -eq 1) -and -not (& $flagsOf $_ | Where-Object { $_ -in $LoadingFlags }) }).Count
         $dts = [double[]]@($win | ForEach-Object { $_.dt / 1000.0 })
         $over50 = @($win | Where-Object { $_.dt -gt 50000 -and $_.ld -eq 0 -and -not (& $flagsOf $_ | Where-Object { $_ -in $LoadingFlags }) }).Count
+        # Reconnects and pickup acknowledgement timeouts are logged by the mod; any of them outside kill/cut runs is a gate failure.
+        $logReconnects = 0
+        foreach ($logFile in @(Get-ChildItem -LiteralPath $dir.FullName -Filter "${role}*.stdout.log" -ErrorAction SilentlyContinue)) { $logReconnects += @(Select-String -LiteralPath $logFile.FullName -Pattern 'Reconnecting:' -SimpleMatch).Count }
+        $pickupTimeouts = 0
+        foreach ($logFile in @(Get-ChildItem -LiteralPath $dir.FullName -Filter "${role}*.stdout.log" -ErrorAction SilentlyContinue)) { $pickupTimeouts += @(Select-String -LiteralPath $logFile.FullName -Pattern 'Chest transaction acknowledgement timed out' -SimpleMatch).Count }
         $pickups = $null
         $pickupPath = Join-Path $dir.FullName "${role}_pickups.json"
         if (Test-Path $pickupPath) { $pickups = Get-Content -Raw $pickupPath | ConvertFrom-Json }
@@ -107,7 +112,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
             run = $dir.Name; scenario = $config.scenario; profile = $(if ($config.solo) { 'solo' } else { $config.profile }); disk = $config.disk; role = $role
             elapsed_ms = $done.elapsed_ms; window_ms = $windowMs; frames = $win.Count
             handoff_lock_runs_ms = $handoffRuns; other_lock_ms = $otherRuns; lock_total_ms = (($handoffRuns | Measure-Object -Sum).Sum + ($otherRuns | Measure-Object -Sum).Sum)
-            switch_ms = $switchMs; switch_rejected = $switchRejected; chest_modal_frames = $chestOpenFrames; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; movement_ignored_frames = $ignored
+            switch_ms = $switchMs; switch_rejected = $switchRejected; chest_modal_frames = $chestOpenFrames; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; log_reconnects = $logReconnects; pickup_timeouts = $pickupTimeouts; movement_ignored_frames = $ignored
             break_resets = [int](($win | Measure-Object -Property rst -Sum).Sum)
             frame_p99_ms = (Get-Percentile $dts 0.99); frames_over_50ms = $over50
             pickup_p95_ms = $(if ($pickups -and $pickups.pickup_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ms) 0.95 } else { $null })
@@ -159,7 +164,10 @@ foreach ($group in ($rows | Group-Object scenario, profile, disk, role)) {
     $p95 = Get-Percentile $freezeAll 0.95
     $maxFreeze = ($freezeAll | Measure-Object -Maximum).Maximum
     $reconnects = ($r | Measure-Object -Property reconnects -Sum).Sum
-    $g.G6 = if (($p95 -gt 500) -or ($maxFreeze -gt 1500) -or ($reconnects -gt 0 -and $first.profile -ne 'cut')) { 'FAIL (partial: handoff freeze only; portal/quit not measured here)' } else { 'PASS (partial: handoff freeze only; portal/quit not measured here)' }
+    $logReconnects = ($r | Measure-Object -Property log_reconnects -Sum).Sum
+    $pickupTimeoutsSum = ($r | Measure-Object -Property pickup_timeouts -Sum).Sum
+    $expectedReconnect = ($first.profile -eq 'cut') -or ($first.scenario -like 'kill_*')
+    $g.G6 = if (($p95 -gt 500) -or ($maxFreeze -gt 1500) -or ($reconnects -gt 0 -and $first.profile -ne 'cut') -or (-not $expectedReconnect -and ($logReconnects -gt 0 -or $pickupTimeoutsSum -gt 0))) { 'FAIL (partial: handoff freeze only; portal/quit not measured here)' } else { 'PASS (partial: handoff freeze only; portal/quit not measured here)' }
     $oracleRows = @($r | Where-Object { $_.terrain_oracle -and ($_.terrain_oracle.host.expected + $_.terrain_oracle.guest.expected) -gt 0 })
     if ($first.scenario -eq 'shared_loot' -and $first.role -ne 'solo') { $g.G7 = 'see conservation' }
     elseif ($oracleRows.Count -gt 0) {
