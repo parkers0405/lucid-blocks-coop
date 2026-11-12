@@ -48,8 +48,6 @@ var guest_checkpoint_busy: bool = false
 var background_checkpoint_busy: bool = false
 var background_checkpoint_cancelled: bool = false
 var durable_checkpoint_waiters: int = 0
-# Profile checkpoints between their ownership snapshot and their ledger write; a lease commit waits for zero so no old-epoch save reaches the queue after it.
-var checkpoints_in_flight: int = 0
 var guest_checkpoint_locks_player: bool = false
 var guest_checkpoint_was_disabled: bool = false
 var canonical_apply_busy: bool = false
@@ -66,8 +64,6 @@ var lease_busy: bool = false
 var lease_token: String = ""
 var lease_ack: Dictionary = {}
 var lease_phase: String = ""
-var lease_install_index: int = 0
-var lease_install_busy: bool = false
 var lease_pending_install_epoch: int = 0
 var lease_pending_previous_chunks: Dictionary = {}
 var lease_was_disabled: bool = false
@@ -86,7 +82,6 @@ var known_profile_keys: Dictionary = {}
 var known_profile_directory: String = ""
 var lease_probe_busy: bool = false
 var pickup_checkpoint_allowed: bool = false
-var lease_started_at: int = 0
 const LEASE_HYSTERESIS: float = 32.0
 const LEASE_MIN_INTERVAL_MS: int = 3000
 const LEASE_PREPARE_TIMEOUT_MS: int = 3000
@@ -137,7 +132,6 @@ func _bundle_runtime_owner(bundle: Dictionary, instance: String, view: Variant =
     return int(objects[key])
 
 func _freeze_lease_runtime() -> void:
-    lease_started_at = Time.get_ticks_msec()
     lease_frozen = true
     Ref.world.simulate_enabled = false
     if is_instance_valid(Ref.entity_spawner):
@@ -406,14 +400,14 @@ func _disabled_before_checkpoint() -> bool:
 
 # One-round-trip handoff. Nothing is frozen and no action is locked: only the objects that change owner pause (lease_transit) while their
 # state travels, terrain edits that land on a chunk being installed wait for that install (installing_edits), and the durable commit is
-# write-behind. See handoff-design.md.
+# write-behind.
 const LEASE_BODY_CAP: int = 2097152
-const LEASE_SWITCH_BODY_SOFT_CAP: int = 8192
 const LEASE_COMMIT_WAIT_MS: int = 20000
 var lease_switch_ctx: Dictionary = {}
 var lease_staged: Dictionary = {}
 var lease_force_full: bool = false
 var lease_commit_gate_epoch: int = 0
+# Profile checkpoints between their ownership snapshot and their ledger write, by snapshot epoch; a lease commit waits for zero so no old-epoch save reaches the queue after it.
 var inflight_by_epoch: Dictionary = {}
 
 # decompress_dynamic only supports deflate and gzip in this engine build (it rejects zstd), so lease bodies use gzip.
@@ -672,8 +666,6 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     for key in outgoing_chunks:
         lease_transit_chunks[key] = true
     var body: PackedByteArray = _pack_body({"bundles": bundles, "terrain": terrain, "instance": instance})
-    if body.size() > LEASE_SWITCH_BODY_SOFT_CAP:
-        print("[lucid-blocks-coop] lease switch body %d bytes over the soft cap" % body.size())
     var base_hash: String = "" if lease_force_full else ChunkAuthority.map_hash(grants_now)
     var chunk_diff: Dictionary = ChunkAuthority.owner_diff({} if lease_force_full else grants_now, grants_next)
     lease_force_full = false
@@ -817,7 +809,6 @@ func lease_activated(_token: String, new_epoch: int) -> void:
 # The commit is queued even when the session ended meanwhile (the job is kept across invalidation): memory is already at this epoch, and
 # disconnect recovery reads the ledger after it. Only a different save file cancels it.
 func _lease_write_behind(path: String, epoch: int, previous_epoch: int, proposal: Dictionary, objects: Dictionary, transfers: Array, guest_patch: Dictionary, generation: int, file: Variant) -> void:
-    var started: int = Time.get_ticks_msec()
     var deadline: int = Time.get_ticks_msec() + LEASE_COMMIT_WAIT_MS
     while int(inflight_by_epoch.get(previous_epoch, 0)) > 0 and Time.get_ticks_msec() < deadline and Ref.save_file_manager.loaded_file == file:
         await get_tree().process_frame
@@ -829,7 +820,6 @@ func _lease_write_behind(path: String, epoch: int, previous_epoch: int, proposal
         persisted.erase("versions")
         await _merge_world_patch_into_save(persisted)
     await _commit_lease_write_behind(path, epoch, proposal, objects, transfers)
-    print("[lucid-blocks-coop] lease epoch %d durable after %d ms" % [epoch, Time.get_ticks_msec() - started])
     if lease_commit_gate_epoch == epoch:
         lease_commit_gate_epoch = 0
 
@@ -1201,10 +1191,8 @@ func _private_respawn_checkpoint(key: String, state: Dictionary, instance: Strin
 
 func _commit_player_checkpoint(key: String, state: Dictionary, instance: String, dimension: int, bundles: Array, skip_unchanged: bool = false) -> Dictionary:
     var snapshot_epoch: int = chunk_authority.lease_epoch
-    checkpoints_in_flight += 1
     inflight_by_epoch[snapshot_epoch] = int(inflight_by_epoch.get(snapshot_epoch, 0)) + 1
     var result: Dictionary = await _commit_player_checkpoint_inner(key, state, instance, dimension, bundles, skip_unchanged)
-    checkpoints_in_flight -= 1
     inflight_by_epoch[snapshot_epoch] = int(inflight_by_epoch.get(snapshot_epoch, 1)) - 1
     return result
 
@@ -2048,8 +2036,6 @@ const SHARED_BUBBLE_HARD_TETHER_DISTANCE: float = 80.0
 const SHARED_BUBBLE_TETHER_PULL: float = 10.0
 const ENTITY_SYNC_RADIUS: float = 144.0
 const DROP_SYNC_RADIUS: float = 96.0
-const GUEST_LOCAL_ENTITY_AUTHORITY_DISTANCE: float = 192.0
-const GUEST_LOCAL_ENTITY_RELEASE_DISTANCE: float = 160.0
 const GUEST_ENTITY_STATE_INTERVAL: float = 0.35
 const SESSION_TARGET_STICK_DISTANCE: float = 8.0
 const ENTITY_ATTACK_REQUEST_MAX_DISTANCE: float = 6.0
@@ -7638,10 +7624,6 @@ func _has_local_entity_authority() -> bool:
     return _is_local_world_authority() or _has_local_guest_entity_authority()
 
 
-func can_use_same_instance_load_proxies() -> bool:
-    return false
-
-
 func has_connected_remote_peers() -> bool:
     if multiplayer.multiplayer_peer == null:
         return false
@@ -12739,10 +12721,6 @@ func _queue_runtime_node_for_cleanup(node: Node) -> void:
     else:
         node.queue_free()
 
-
-func _promote_host_synced_entities_to_local_authority() -> void:
-    # Promotion is an exact UUID install performed only by the lease barrier.
-    _enforce_runtime_leases()
 
 func _adopt_existing_client_world_entities_and_drops() -> void:
     synced_entities.clear()

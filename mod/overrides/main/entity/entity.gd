@@ -332,10 +332,7 @@ func _should_ignore_visibility_culling() -> bool:
 
 
 func _can_use_session_load_proxy() -> bool:
-    return _use_session_targeting() \
-        and Ref.coop_manager != null \
-        and Ref.coop_manager.has_method("can_use_same_instance_load_proxies") \
-        and bool(Ref.coop_manager.call("can_use_same_instance_load_proxies"))
+    return false
 
 
 func _refresh_visibility_enabler_target() -> void:

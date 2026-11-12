@@ -53,8 +53,7 @@ static func map_hash(map: Dictionary) -> String:
     var lines := PackedStringArray()
     for key in keys:
         lines.append("%s=%d" % [key, int(map[key])])
-    return "
-".join(lines).sha256_text()
+    return "\n".join(lines).sha256_text()
 
 func object_owner(uuid: String, instance: String, chunk: Vector3i) -> int:
     return int(lease_objects.get(instance + "|" + uuid, leased_owner(chunk, instance)))

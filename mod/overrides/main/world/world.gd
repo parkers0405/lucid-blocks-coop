@@ -161,10 +161,6 @@ func _physics_process(_delta: float) -> void :
                 simulate_frame = false
 
 
-func uses_coop_multi_region_loading() -> bool:
-    return false
-
-
 func _process(_delta: float) -> void :
     simulate_frame = true
     var coop_override_now: bool = _is_coop_perf_override_active()

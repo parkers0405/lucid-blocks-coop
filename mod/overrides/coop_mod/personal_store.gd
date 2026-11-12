@@ -185,10 +185,6 @@ func read_ledger(path: String) -> Dictionary:
     var ledger = bytes_to_var(bytes)
     return ledger if _valid_ledger(ledger) else {}
 
-func profile_exists(path: String) -> bool:
-    var ledger: Dictionary = read_ledger(path)
-    return not ledger.is_empty() and ledger["profiles"].has(_profile_key(path))
-
 func read_profile(path: String) -> Dictionary:
     var ledger: Dictionary = read_ledger(path)
     return {} if ledger.is_empty() else ledger["profiles"].get(_profile_key(path), _new_profile())
