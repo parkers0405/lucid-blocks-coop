@@ -127,7 +127,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
             switch_ms = $switchMs; switch_rejected = $switchRejected; routine_edit_delay_ms = $routineEditRuns; chest_modal_frames = $chestOpenFrames; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; log_reconnects = $logReconnects; pickup_timeouts = $pickupTimeouts; movement_ignored_frames = $ignored
             break_resets = [int](($win | Measure-Object -Property rst -Sum).Sum)
             frame_p99_ms = (Get-Percentile $dts 0.99); frames_over_50ms = $over50
-            pickup_p95_ms = $(if ($pickups -and $pickups.pickup_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ms) 0.95 } else { $null })
+            pickup_p95_ms = $(if ($pickups -and $pickups.pickup_ack_ms -and $pickups.pickup_ack_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ack_ms) 0.95 } elseif ($pickups -and $pickups.pickup_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ms) 0.95 } else { $null })
             terrain_oracle = $(if ($pickups -and $pickups.terrain_oracle -and $pickups.terrain_oracle.host) { $pickups.terrain_oracle } else { $null })
             items_delta = $(if ($pickups) { $pickups.items - $pickups.items0 } else { $null }); drops_left = $(if ($pickups) { $pickups.drops_left } else { $null })
             probe_ok = $(if ($summary -and $summary.$role) { [bool]$summary.$role.valid } else { $false })

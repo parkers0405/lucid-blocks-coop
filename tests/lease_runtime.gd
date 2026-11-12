@@ -276,6 +276,7 @@ func run() -> int:
     var sw_object: String = "dimension:2|" + UUID
     var sw_path: String = sw._profile_path("host")
     sw.admitted_player_keys[0] = "guest"
+    sw.lease_guest_instance = "dimension:2"
     sw.chunk_authority.install_lease(1, {}, {})
     sw.terrain_epoch = "nonce:1"
     sw.lease_busy = true
@@ -307,6 +308,17 @@ func run() -> int:
     sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "proposal": {sw_key: 2}, "objects": {sw_object: 2}, "transfers": [], "path": sw_path, "previous_epoch": 1, "previous_chunks": {}, "instance": "dimension:2", "generation": sw.save_queue.generation}
     sw.lease_transit[sw_object] = true
     sw.inflight_by_epoch[1] = 1
+    check(sw._lease_valid_bundles([], "dimension:2") and not sw._lease_valid_bundles([], "garbage") and not sw._lease_valid_bundles(null, "dimension:2"), "bundles are validated against the dimension of their own instance")
+    sw.lease_busy = true
+    sw.lease_phase = "switching"
+    sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "started": Time.get_ticks_msec() - 11000}
+    sw.kicked.clear()
+    sw._tick_runtime_lease(0.0)
+    check(sw.kicked == [0] and sw.lease_phase == "" and not sw.lease_busy and sw.chunk_authority.lease_epoch == 1, "a switch the guest never answers times out on the host and drops the peer")
+    sw.lease_busy = true
+    sw.lease_phase = "switching"
+    sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "proposal": {sw_key: 2}, "objects": {sw_object: 2}, "transfers": [], "path": sw_path, "previous_epoch": 1, "previous_chunks": {}, "instance": "dimension:2", "generation": sw.save_queue.generation}
+    sw.lease_transit[sw_object] = true
     var good_body: PackedByteArray = sw._pack_body({"bundles": [], "terrain": {}, "instance": "dimension:2"})
     var switched := {"done": false}
     var switched_runner := func():

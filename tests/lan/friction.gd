@@ -55,6 +55,8 @@ var fault_queue
 var item_total_prev: int = -1
 var pending_breaks: Array = []
 var pickup_ms: Array = []
+var pickup_ack_ms: Array = []
+var pickup_seen: Dictionary = {}
 var mined: int = 0
 var spawned: Dictionary = {}
 var kill_seen: bool = false
@@ -218,6 +220,14 @@ func _physics_process(_delta: float) -> void:
         _event("items", {"total": total, "tally": _item_tally()})
     item_total_prev = total
     _track_handoff(manager)
+    # Pickup-to-inventory as the gate defines it: from the pickup request being pending to its acknowledgement (break-to-item time includes the drop falling and the game's own pickup delay).
+    for request in manager.pickup_pending:
+        if not pickup_seen.has(request):
+            pickup_seen[request] = Time.get_ticks_msec()
+    for request in pickup_seen.keys():
+        if not manager.pickup_pending.has(request):
+            pickup_ack_ms.append(Time.get_ticks_msec() - int(pickup_seen[request]))
+            pickup_seen.erase(request)
     var spawner = Ref.entity_spawner
     var parked = manager.get("installing_edits")
     var row := {"t": Time.get_ticks_msec(), "dt": gap, "in": 1 if bot_active else 0, "mi": 1 if (Input.is_action_pressed("up") or Input.is_action_pressed("down")) else 0, "mv": snappedf(step, 0.001),
@@ -719,7 +729,7 @@ func _finish_io() -> void:
         file.store_string(JSON.stringify({"disk": fault_queue.disk, "jobs": fault_queue.records.size(), "failed": fault_queue.failed, "log": fault_queue.records.slice(0, 400)}))
         file.close()
     var pickups := FileAccess.open(scenario.path_join(role + "_pickups.json"), FileAccess.WRITE)
-    pickups.store_string(JSON.stringify({"pickup_ms": pickup_ms, "mined": mined, "items": _item_total(), "items0": items0, "drops_left": _drops_left(), "tally": _item_tally(), "drops_tally": _drops_tally(), "spawned": spawned, "terrain_oracle": oracle_result}))
+    pickups.store_string(JSON.stringify({"pickup_ms": pickup_ms, "pickup_ack_ms": pickup_ack_ms, "mined": mined, "items": _item_total(), "items0": items0, "drops_left": _drops_left(), "tally": _item_tally(), "drops_tally": _drops_tally(), "spawned": spawned, "terrain_oracle": oracle_result}))
     pickups.close()
 
 func _world_ready() -> bool:

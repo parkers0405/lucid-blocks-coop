@@ -90,6 +90,7 @@ var lease_started_at: int = 0
 const LEASE_HYSTERESIS: float = 32.0
 const LEASE_MIN_INTERVAL_MS: int = 3000
 const LEASE_PREPARE_TIMEOUT_MS: int = 3000
+const LEASE_SWITCH_TIMEOUT_MS: int = 10000
 var lease_finished_at: int = 0
 var lease_recommit_needed: bool = false
 # Highest epoch whose write-behind commit failed; a later successful commit at or above it clears the flag.
@@ -341,6 +342,12 @@ func _lease_objects_changed(chunks: Dictionary) -> bool:
 
 func _tick_runtime_lease(delta: float) -> void:
     _enforce_runtime_leases()
+    # A switch the guest never answered: it may already have flipped, so do not resume; drop the peer and let host recovery run.
+    if lease_phase == "switching" and multiplayer.is_server() and Time.get_ticks_msec() - int(lease_switch_ctx.get("started", Time.get_ticks_msec())) > LEASE_SWITCH_TIMEOUT_MS:
+        _lease_end_switch()
+        for peer in admitted_player_keys.keys():
+            _lease_kick_peer(peer)
+        return
     if not _has_live_peer() or not _is_local_session_player_active() or lease_busy or chest_lock_active:
         return
     if not multiplayer.is_server() and (not guest_persistent_ready or receiving_host_world or client_restore_in_progress or reconnect_pending):
@@ -525,10 +532,15 @@ func _lease_valid_delta(sender_state: Dictionary, patch: Variant) -> bool:
     var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
     return patch["world_data"].get(prefix + "world", {}).get(prefix + "chunk_block", {}).size() <= ChunkAuthority.MAX_CHUNKS * 8
 
-func _lease_valid_bundles(bundles: Variant) -> bool:
-    if not bundles is Array or bundles.size() > 512 or not is_instance_valid(Ref.world):
+# Bundles are validated against the dimension of the instance they came from, not the receiver's current one.
+func _lease_plain_dimension(instance: String) -> String:
+    var parsed: Dictionary = _parse_dimension_instance_key(instance)
+    return SaveFile.DIMENSION_MAP.get(int(parsed["dimension"]), "") if not parsed.is_empty() else ""
+
+func _lease_valid_bundles(bundles: Variant, instance: String) -> bool:
+    var plain: String = _lease_plain_dimension(instance)
+    if not bundles is Array or bundles.size() > 512 or plain.is_empty():
         return false
-    var plain: String = SaveFile.DIMENSION_MAP[int(Ref.world.current_dimension)]
     for bundle in bundles:
         if not InstanceEntities.valid_bundle(bundle, plain, _preserved_scene_paths()):
             return false
@@ -666,13 +678,13 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     var chunk_diff: Dictionary = ChunkAuthority.owner_diff({} if lease_force_full else grants_now, grants_next)
     lease_force_full = false
     lease_phase = "switching"
-    lease_switch_ctx = {"token": token, "epoch": new_epoch, "proposal": fresh, "objects": final["objects"], "transfers": transfers, "path": path, "previous_epoch": chunk_authority.lease_epoch, "previous_chunks": chunk_authority.lease_owners.duplicate(), "instance": instance, "generation": generation}
+    lease_switch_ctx = {"token": token, "epoch": new_epoch, "proposal": fresh, "objects": final["objects"], "transfers": transfers, "path": path, "previous_epoch": chunk_authority.lease_epoch, "previous_chunks": chunk_authority.lease_owners.duplicate(), "instance": instance, "generation": generation, "started": Time.get_ticks_msec()}
     _enforce_runtime_leases()
     lease_switch.rpc(token, terrain_epoch, new_epoch, chunk_diff, ChunkAuthority.owner_diff(staged["objects"], final["objects"]), base_hash, _lease_map_hash(grants_next, final["objects"]), stage_blobs.size(), body)
 
 # A captured bundle rides on the transfer of its uuid (or becomes a new transfer when the ledger has not seen the uuid yet).
 func _lease_attach_bundles(transfers: Array, bundles: Array, instance: String, old_key: String, new_key: String) -> void:
-    var plain: String = SaveFile.DIMENSION_MAP[int(Ref.world.current_dimension)]
+    var plain: String = _lease_plain_dimension(instance)
     for bundle in bundles:
         var found: bool = false
         for transfer in transfers:
@@ -704,9 +716,9 @@ func lease_switch(token: String, epoch: String, new_epoch: int, chunk_diff: Dict
     lease_staged.erase(token)
     var parts: Dictionary = staged.get("parts", {})
     var data = _unpack_body(body)
-    var ok: bool = epoch == terrain_epoch and new_epoch > chunk_authority.lease_epoch and not lease_busy and not chest_lock_active and not reconnect_pending and not client_restore_in_progress and _is_local_session_player_active() and Ref.world.is_all_loaded()
+    var ok: bool = epoch == terrain_epoch and new_epoch > chunk_authority.lease_epoch and not lease_busy and not chest_lock_active and not reconnect_pending and not client_restore_in_progress and _is_local_session_player_active() and _can_sample_player() and Ref.world.is_all_loaded()
     ok = ok and staged.get("count", -1) == stage_count and parts.size() == stage_count and parts.get(0) is Dictionary and parts[0].get("objects") is Dictionary and data is Dictionary
-    ok = ok and data.get("instance") is String and _lease_valid_bundles(data.get("bundles")) and _lease_valid_delta(peer_states.get(1, {}), data.get("terrain", {}))
+    ok = ok and data.get("instance") is String and _lease_valid_bundles(data.get("bundles"), data["instance"]) and _lease_valid_delta(peer_states.get(1, {}), data.get("terrain", {}))
     var objects: Dictionary = {}
     var grants_next: Dictionary = {}
     if ok:
@@ -738,7 +750,7 @@ func lease_switch(token: String, epoch: String, new_epoch: int, chunk_diff: Dict
     lease_switched.rpc_id(1, token, new_epoch, true, _pack_body({"bundles": out_bundles, "terrain": out_terrain, "instance": instance}))
     var incoming: Array = data["bundles"].duplicate()
     for index in range(1, stage_count):
-        if _lease_valid_bundles(parts.get(index, {}).get("bundles")):
+        if _lease_valid_bundles(parts.get(index, {}).get("bundles"), data["instance"]):
             incoming.append_array(parts[index]["bundles"])
     var respawns: Dictionary = parts[0].get("private_respawns", {})
     await _lease_install_incoming(data["instance"], incoming, data.get("terrain", {}), respawns if PersonalStore.valid_respawn_update(respawns) else {})
@@ -754,7 +766,7 @@ func lease_switched(token: String, new_epoch: int, ok: bool, body: PackedByteArr
         _lease_end_switch()
         return
     var data = _unpack_body(body)
-    if not data is Dictionary or not data.get("instance") is String or not _lease_valid_bundles(data.get("bundles")) or not _lease_valid_delta(peer_states.get(sender, {}), data.get("terrain", {})):
+    if not data is Dictionary or not data.get("instance") is String or data["instance"] != lease_guest_instance or not _lease_valid_bundles(data.get("bundles"), data["instance"]) or not _lease_valid_delta(peer_states.get(sender, {}), data.get("terrain", {})):
         # A protocol violation after the guest already switched: no two-sided rollback; the guest reconnects and host recovery runs.
         _lease_end_switch()
         _lease_kick_peer(sender)
@@ -8685,7 +8697,7 @@ func _capture_host_water_changes(peer_id: int, center_position: Vector3, dimensi
                     continue
                 var water_level: int = int(Ref.world.get_water_level_at(cell_position))
                 # First sync sends only the cells that hold something; empty cells are the default on the guest.
-                if force_full_sync and water_level > 0:
+                if force_full_sync and (water_level > 0 or not cache.is_empty()):
                     changes.append([cell_position, water_level])
                 if water_level > 0:
                     current_levels[cell_position] = water_level
@@ -8730,7 +8742,7 @@ func _capture_host_fire_changes(peer_id: int, center_position: Vector3, dimensio
                     continue
                 var fire_level: int = int(Ref.world.get_fire_at(cell_position))
                 # First sync sends only the cells that hold something; empty cells are the default on the guest.
-                if force_full_sync and fire_level > 0:
+                if force_full_sync and (fire_level > 0 or not cache.is_empty()):
                     changes.append([cell_position, fire_level])
                 if fire_level > 0:
                     current_levels[cell_position] = fire_level
