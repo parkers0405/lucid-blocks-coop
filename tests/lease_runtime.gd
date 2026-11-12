@@ -51,6 +51,14 @@ class PrepareManager extends Manager:
     func _checkpoint_terrain_in_background() -> bool:
         order.append("terrain")
         return true
+class SwitchManager extends Manager:
+    var jobs: Array = []
+    var kicked: Array = []
+    func _store_job(store: RefCounted, method: String, arguments: Array, fallback: Variant) -> Variant:
+        jobs.append(method)
+        return await super(store, method, arguments, fallback)
+    func _lease_kick_peer(peer: int) -> void:
+        kicked.append(peer)
 class PresenceManager extends "res://coop_mod/coop_manager.gd":
     var fixture_root: String
     func _ready() -> void:
@@ -260,6 +268,51 @@ func run() -> int:
         await get_tree().process_frame
     check(presync["ok"] == true and prep.order == ["profile", "terrain"], "presync saves the profile, then the terrain delta")
     prep.free()
+    # H9: switch outcomes on the host. The remote sender id of a direct call is 0, so the fixture admits peer 0.
+    var sw := SwitchManager.new()
+    sw.fixture_root = "user://lease_switch_" + Crypto.new().generate_random_bytes(8).hex_encode()
+    add_child(sw)
+    var sw_key: String = sw.ChunkAuthority.chunk_key("dimension:2", Vector3i.ZERO)
+    var sw_object: String = "dimension:2|" + UUID
+    var sw_path: String = sw._profile_path("host")
+    sw.admitted_player_keys[0] = "guest"
+    sw.chunk_authority.install_lease(1, {}, {})
+    sw.terrain_epoch = "nonce:1"
+    sw.lease_busy = true
+    sw.lease_phase = "switching"
+    sw.lease_token = "tok"
+    sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "proposal": {sw_key: 2}, "objects": {sw_object: 2}, "transfers": [], "path": sw_path, "previous_epoch": 1, "previous_chunks": {}, "instance": "dimension:2", "generation": sw.save_queue.generation}
+    sw.lease_transit[sw_object] = true
+    sw.lease_transit_chunks[sw_key] = true
+    await sw.lease_switched("tok", 2, false, PackedByteArray())
+    check(sw.chunk_authority.lease_epoch == 1 and sw.terrain_epoch == "nonce:1" and sw.lease_transit.is_empty() and sw.lease_transit_chunks.is_empty() and not sw.lease_busy and sw.lease_phase == "" and sw.jobs.is_empty(), "SWITCHED(false) leaves memory, tag and disk queue at the old epoch with nothing in transit")
+    sw.lease_busy = true
+    sw.lease_phase = "switching"
+    sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "proposal": {sw_key: 2}, "objects": {sw_object: 2}, "transfers": [], "path": sw_path, "previous_epoch": 1, "previous_chunks": {}, "instance": "dimension:2", "generation": sw.save_queue.generation}
+    sw.lease_transit[sw_object] = true
+    await sw.lease_switched("tok", 2, true, PackedByteArray([1, 2, 3]))
+    check(sw.kicked == [0] and sw.chunk_authority.lease_epoch == 1 and sw.lease_transit.is_empty() and not sw.lease_busy, "invalid SWITCHED body sends the guest to reconnect and changes nothing")
+    sw.lease_busy = true
+    sw.lease_phase = "switching"
+    sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "proposal": {sw_key: 2}, "objects": {sw_object: 2}, "transfers": [], "path": sw_path, "previous_epoch": 1, "previous_chunks": {}, "instance": "dimension:2", "generation": sw.save_queue.generation}
+    sw.lease_transit[sw_object] = true
+    sw.inflight_by_epoch[1] = 1
+    var good_body: PackedByteArray = sw._pack_body({"bundles": [], "terrain": {}, "instance": "dimension:2"})
+    var switched := {"done": false}
+    var switched_runner := func():
+        await sw.lease_switched("tok", 2, true, good_body)
+        switched["done"] = true
+    switched_runner.call_deferred()
+    await get_tree().process_frame
+    await get_tree().process_frame
+    check(sw.chunk_authority.lease_epoch == 2 and sw.terrain_epoch == "nonce:2" and sw.lease_transit.is_empty() and not sw.lease_busy and not sw._is_client_gameplay_locked() and not sw.lease_frozen and not sw.lease_preparing, "valid SWITCHED flips memory and tag in the same step without freezing or locking anything")
+    check(not sw.jobs.has("commit_lease") and sw.lease_commit_gate_epoch == 2, "write-behind waits for the old epoch's in-flight checkpoint before the commit")
+    sw.inflight_by_epoch[1] = 0
+    var gate_deadline: int = Time.get_ticks_msec() + 10000
+    while (not switched["done"] or sw.lease_commit_gate_epoch != 0) and Time.get_ticks_msec() < gate_deadline:
+        await get_tree().process_frame
+    check(sw.jobs.has("commit_lease") and sw.personal_store.read_ledger(sw_path)["lease"]["epoch"] == 2 and sw.lease_commit_gate_epoch == 0, "ownership commit lands after the wait and releases the gate")
+    sw.free()
     var manager := Manager.new()
     manager.fixture_root = "user://lease_runtime_" + Crypto.new().generate_random_bytes(8).hex_encode()
     add_child(manager)

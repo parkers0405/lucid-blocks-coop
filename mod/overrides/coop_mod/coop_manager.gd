@@ -341,9 +341,6 @@ func _lease_objects_changed(chunks: Dictionary) -> bool:
 
 func _tick_runtime_lease(delta: float) -> void:
     _enforce_runtime_leases()
-    if lease_busy and Time.get_ticks_msec() - lease_started_at > 15000 and not multiplayer.is_server():
-        _begin_reconnect_flow("Lease installation timed out; restoring canonical world")
-        return
     if not _has_live_peer() or not _is_local_session_player_active() or lease_busy or chest_lock_active:
         return
     if not multiplayer.is_server() and (not guest_persistent_ready or receiving_host_world or client_restore_in_progress or reconnect_pending):
@@ -400,6 +397,194 @@ func _lease_ack_timeout_ms() -> int:
 func _disabled_before_checkpoint() -> bool:
     return guest_checkpoint_was_disabled if guest_checkpoint_locks_player else Ref.player.disabled
 
+# One-round-trip handoff. Nothing is frozen and no action is locked: only the objects that change owner pause (lease_transit) while their
+# state travels, terrain edits that land on a chunk being installed wait for that install (installing_edits), and the durable commit is
+# write-behind. See handoff-design.md.
+const LEASE_BODY_CAP: int = 2097152
+const LEASE_SWITCH_BODY_SOFT_CAP: int = 8192
+const LEASE_COMMIT_WAIT_MS: int = 20000
+var lease_switch_ctx: Dictionary = {}
+var lease_staged: Dictionary = {}
+var lease_force_full: bool = false
+var lease_commit_gate_epoch: int = 0
+var inflight_by_epoch: Dictionary = {}
+
+# decompress_dynamic only supports deflate and gzip in this engine build (it rejects zstd), so lease bodies use gzip.
+static func _pack_body(value: Variant) -> PackedByteArray:
+    return var_to_bytes(value).compress(FileAccess.COMPRESSION_GZIP)
+
+static func _unpack_body(bytes: PackedByteArray) -> Variant:
+    if bytes.size() < 18 or bytes.size() > LEASE_BODY_CAP or bytes[0] != 0x1f or bytes[1] != 0x8b:
+        return null
+    var raw: PackedByteArray = bytes.decompress_dynamic(LEASE_BODY_CAP, FileAccess.COMPRESSION_GZIP)
+    return bytes_to_var(raw) if not raw.is_empty() else null
+
+# Chunk grants only: an absent chunk is a host chunk, so the host's residency bookkeeping (explicit 1 entries) must not change the hash.
+static func _lease_grants(owners: Dictionary) -> Dictionary:
+    var grants: Dictionary = {}
+    for key in owners:
+        if owners[key] == 2:
+            grants[key] = 2
+    return grants
+
+static func _lease_map_hash(grants: Dictionary, objects: Dictionary) -> String:
+    return ChunkAuthority.map_hash(grants) + ChunkAuthority.map_hash(objects)
+
+func _lease_next_tag(new_epoch: int) -> String:
+    return terrain_epoch.get_slice(":", 0) + ":" + str(new_epoch)
+
+func _lease_live_nodes() -> Array:
+    var nodes: Array = []
+    for node in _get_live_tracked_entities() + _get_live_tracked_drops():
+        if is_instance_valid(node) and not node is Player and not is_remote_player_proxy(node) and not node.is_queued_for_deletion():
+            nodes.append(node)
+    return nodes
+
+# Owner of every ledger object under the proposed map, using live positions of locally owned nodes (the ledger can be a checkpoint old).
+func _lease_object_owners(ledger: Dictionary, proposal: Dictionary, guest_key: String) -> Dictionary:
+    var instance: String = get_active_dimension_instance_key()
+    var positions: Dictionary = lease_guest_positions.duplicate()
+    var live_owned: Array = []
+    for node in _lease_live_nodes():
+        if owns_runtime_node(node):
+            positions[instance + "|" + _get_sync_uuid(node)] = node.global_position
+            live_owned.append(node)
+    var objects: Dictionary = {}
+    var transfers: Array = []
+    var local_key: String = _get_local_player_key()
+    for ledger_instance in ledger.get("instances", {}):
+        var record: Dictionary = ledger["instances"][ledger_instance]
+        var wire: String = ledger_instance.replace("__", ":")
+        for uuid in record["nodes"]:
+            var position: Vector3 = positions.get(wire + "|" + uuid, record["nodes"][uuid]["position"])
+            var owner: int = int(proposal.get(ChunkAuthority.chunk_key(wire, _lease_chunk(position)), 1))
+            objects[wire + "|" + uuid] = owner
+            var new_key: String = guest_key if owner == 2 else local_key
+            if record["owners"][uuid] != new_key:
+                transfers.append({"instance": ledger_instance, "uuid": uuid, "old": record["owners"][uuid], "new": new_key})
+    for node in live_owned:
+        var key: String = instance + "|" + _get_sync_uuid(node)
+        if not objects.has(key):
+            objects[key] = int(proposal.get(ChunkAuthority.chunk_key(instance, _lease_chunk(node.global_position)), 1))
+    return {"objects": objects, "transfers": transfers}
+
+# Live, locally owned nodes whose owner changes under next_objects, as bundles. Called before the epoch flips.
+func _lease_capture_bundles(next_objects: Dictionary, local_rank: int) -> Array:
+    var instance: String = get_active_dimension_instance_key()
+    var bundles: Array = []
+    for node in _lease_live_nodes():
+        if not owns_runtime_node(node) or (node is Entity and node.dead) or (node is DroppedItem and node.item == null):
+            continue
+        var uuid: String = _get_sync_uuid(node)
+        if uuid == "" or int(next_objects.get(instance + "|" + uuid, local_rank)) == local_rank or not node.has_method("preserve_save"):
+            continue
+        var bundle: Dictionary = _capture_entity_save_bundle(node, uuid)
+        if bundle.is_empty() or not _preserved_scene_paths().has(bundle["scene_path"]):
+            continue
+        bundle["dimension_instance_key"] = instance
+        bundle["lease_origin_chunk"] = lease_origins.get(instance + "|" + uuid, _lease_chunk(node.global_position))
+        bundles.append(bundle)
+    return bundles
+
+func _lease_death_loot_pending(next_objects: Dictionary, local_rank: int) -> bool:
+    var instance: String = get_active_dimension_instance_key()
+    for node in _lease_live_nodes():
+        if node.get_meta("coop_death_loot_pending", false) and int(next_objects.get(instance + "|" + _get_sync_uuid(node), local_rank)) != local_rank:
+            return true
+    return false
+
+# Changed chunks (against the last canonical this side published) among the outgoing ones, captured in one frame.
+func _lease_capture_terrain(outgoing: Dictionary) -> Dictionary:
+    if outgoing.is_empty() or not _can_sample_player():
+        return {}
+    Ref.world.register_loaded_chunks()
+    var patch: Dictionary = _capture_local_world_patch()
+    if patch.is_empty():
+        return {}
+    var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
+    var root: Dictionary = patch["world_data"].get(prefix + "world", {})
+    var instance: String = patch["dimension_instance_key"]
+    var chunks: Array = []
+    for chunk in chunk_authority.changed(instance, root, prefix):
+        if outgoing.has(ChunkAuthority.chunk_key(instance, chunk)):
+            chunks.append(chunk)
+    if chunks.is_empty():
+        return {}
+    patch["world_data"] = _filter_world_data_to_chunk_positions(patch["world_data"], prefix, chunks)
+    patch.erase("respawn_positions")
+    return patch
+
+func _lease_valid_delta(sender_state: Dictionary, patch: Variant) -> bool:
+    if not patch is Dictionary:
+        return false
+    if patch.is_empty():
+        return true
+    var valid: bool = _validate_guest_world_patch(sender_state, patch) if multiplayer.is_server() else patch.get("dimension_instance_key") == get_active_dimension_instance_key()
+    if not valid:
+        return false
+    var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
+    return patch["world_data"].get(prefix + "world", {}).get(prefix + "chunk_block", {}).size() <= ChunkAuthority.MAX_CHUNKS * 8
+
+func _lease_valid_bundles(bundles: Variant) -> bool:
+    if not bundles is Array or bundles.size() > 512 or not is_instance_valid(Ref.world):
+        return false
+    var plain: String = SaveFile.DIMENSION_MAP[int(Ref.world.current_dimension)]
+    for bundle in bundles:
+        if not InstanceEntities.valid_bundle(bundle, plain, _preserved_scene_paths()):
+            return false
+    return true
+
+# Install what the other owner sent: objects first (they are paused until now), then terrain in slices (edits on those chunks wait for it).
+func _lease_install_incoming(instance: String, bundles: Array, terrain: Dictionary, respawns: Dictionary) -> void:
+    if instance != get_active_dimension_instance_key() or not _can_sample_player():
+        return
+    if not respawns.is_empty():
+        _apply_private_respawns(instance, respawns["positions"], respawns["chunks"], true)
+    for bundle in bundles:
+        _upsert_saved_entity_bundle(bundle)
+    _enforce_runtime_leases()
+    if terrain.is_empty():
+        return
+    terrain["epoch"] = terrain_epoch
+    var prefix: String = _resolve_dimension_namespace(terrain["dimension"], terrain["pocket_owner_key"]) + "_"
+    chunk_authority.seed_versions(instance, terrain["world_data"].get(prefix + "world", {}), prefix, terrain.get("versions", {}))
+    _merge_world_patch_into_cache(terrain)
+    await _apply_canonical_terrain(terrain)
+
+func _lease_stage_parts(ledger: Dictionary, objects: Dictionary, next_owners: Dictionary, recipient: int, recipient_key: String, instance: String) -> Array:
+    var parts: Array = [{"objects": objects}]
+    var parsed: Dictionary = _parse_dimension_instance_key(instance)
+    var record: Dictionary = ledger.get("instances", {}).get(_ledger_instance_key(instance), {})
+    if not parsed.is_empty() and _is_private_instance_dimension(int(parsed["dimension"])) and record.has("respawn_positions"):
+        var chunks: Array = []
+        var positions: Dictionary = {}
+        for chunk in (lease_guest_chunks if recipient == 2 else _local_loaded_lease_chunks()):
+            if next_owners.get(ChunkAuthority.chunk_key(instance, chunk), 1) == recipient:
+                chunks.append(chunk)
+        for position in record["respawn_positions"]:
+            if chunks.has(PersonalStore.respawn_chunk(position)):
+                positions[position] = true
+        var update: Dictionary = {"positions": positions, "chunks": chunks}
+        if PersonalStore.valid_respawn_update(update):
+            parts[0]["private_respawns"] = update
+    var offscreen: Array = []
+    for bundle in record.get("nodes", {}).values():
+        var uuid: String = bundle["uuid"]
+        if int(objects.get(instance + "|" + uuid, 0)) == recipient and record["owners"].get(uuid) != recipient_key and not is_instance_valid(_find_existing_entity_by_uuid(uuid)) and not is_instance_valid(_find_existing_drop_by_uuid(uuid)):
+            offscreen.append(bundle)
+    for batch in ChunkAuthority.batches(offscreen):
+        parts.append({"bundles": batch})
+    return parts
+
+func _lease_end_switch() -> void:
+    lease_transit.clear()
+    lease_transit_chunks.clear()
+    lease_switch_ctx = {}
+    lease_busy = false
+    lease_phase = ""
+    lease_finished_at = Time.get_ticks_msec()
+    _enforce_runtime_leases()
+
 func _handoff_runtime_lease(proposal: Dictionary) -> void:
     if lease_busy or not _has_live_peer() or chest_lock_active or not chest_sessions.is_empty() or not _is_local_session_player_active() or not Ref.world.is_all_loaded():
         return
@@ -409,7 +594,7 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
     lease_ack = {}
-    # Unfrozen pre-prepare: both sides save what they can while play continues, so the barrier below has little left to do.
+    # Unfrozen pre-prepare: both sides save what they can while play continues, so the switch carries only a small delta.
     lease_phase = "prepare"
     lease_prepare.rpc(token, terrain_epoch)
     var host_prepared: bool = await _checkpoint_local_host_world()
@@ -419,106 +604,200 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     if not host_prepared or not guest_prepared:
         if _has_live_peer():
             cancel_runtime_lease.rpc(token, terrain_epoch)
-        lease_busy = false
-        lease_phase = ""
-        lease_finished_at = Time.get_ticks_msec()
-        return
-    lease_ack = {}
-    lease_phase = "collect"
-    lease_was_disabled = _disabled_before_checkpoint()
-    if not await _drain_lease_mutations():
-        if lease_token == token and _same_save_context(generation, file):
-            _resume_lease_runtime()
-        return
-    if lease_token != token or not _same_save_context(generation, file):
-        return
-    _freeze_lease_runtime()
-    # Save the old owners' final state before changing any ownership.
-    lease_checkpoint_allowed = true
-    freeze_runtime_lease.rpc(token, terrain_epoch)
-    var local_ok: bool = await _await_local_world_checkpoint(0, true)
-    if not local_ok and lease_token == token and _same_save_context(generation, file):
-        if _has_live_peer():
-            cancel_runtime_lease.rpc(token, terrain_epoch)
-        _resume_lease_runtime()
-        return
-    var remote_ok: bool = await _wait_lease_ack(token)
-    if lease_token != token or not _same_save_context(generation, file):
-        return
-    lease_checkpoint_allowed = false
-    if not local_ok or not remote_ok:
-        if _has_live_peer():
-            cancel_runtime_lease.rpc(token, terrain_epoch)
-        _resume_lease_runtime()
+        _lease_end_switch()
         return
     var path: String = _profile_path(_get_local_player_key())
     var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
     if lease_token != token or not _same_save_context(generation, file):
         return
-    var objects: Dictionary = {}
-    var transfers: Array = []
-    var guest_key: String = str(admitted_player_keys.values()[0])
-    for instance in ledger.get("instances", {}):
-        for uuid in ledger["instances"][instance]["nodes"]:
-            var record: Dictionary = ledger["instances"][instance]
-            var wire_instance: String = instance.replace("__", ":")
-            var owner: int = int(proposal.get(ChunkAuthority.chunk_key(wire_instance, _lease_chunk(record["nodes"][uuid]["position"])), 1))
-            objects[wire_instance + "|" + uuid] = owner
-            var key: String = guest_key if owner == 2 else _get_local_player_key()
-            if record["owners"][uuid] != key:
-                transfers.append({"instance": instance, "uuid": uuid, "old": record["owners"][uuid], "new": key})
-    var epoch: int = maxi(chunk_authority.lease_epoch, int(ledger.get("lease", {}).get("epoch", 0))) + 1
-    # Write-behind: the durable ownership commit is queued (priority lane, kept across session invalidation) after the payload reads and is not awaited, so no disk job sits in the frozen window after the checkpoints.
-    var previous_chunks: Dictionary = chunk_authority.lease_owners.duplicate()
-    var previous_state: Dictionary = {"epoch": chunk_authority.lease_epoch, "owners": previous_chunks, "objects": chunk_authority.lease_objects.duplicate(), "terrain_epoch": terrain_epoch}
-    lease_pending_install_epoch = epoch
-    lease_pending_previous_chunks = previous_chunks
-    terrain_epoch = auth_session_nonce + ":" + str(epoch)
-    chunk_authority.install_lease(epoch, proposal, objects)
-    # Both sides stay frozen until all terrain, objects and maps are installed.
-    var local_payload: Dictionary = await _lease_install_payload(get_active_dimension_instance_key(), _local_loaded_lease_chunks(), previous_chunks, 1, ledger)
-    var remote_payload: Dictionary = await _lease_install_payload(lease_guest_instance, lease_guest_chunks, previous_chunks, 2, ledger)
-    if lease_token != token or not _same_save_context(generation, file):
-        return
-    if local_payload.is_empty() or remote_payload.is_empty():
-        # Nothing was committed or sent: put memory back at the durable epoch so disk and memory agree, then resume.
-        _rollback_pending_lease(previous_state)
-        status_message = "Cannot construct bounded lease installation; handoff cancelled"
-        _update_status_text()
+    if ledger.is_empty() or not _has_live_peer() or admitted_player_keys.is_empty():
         if _has_live_peer():
             cancel_runtime_lease.rpc(token, terrain_epoch)
-        _resume_lease_runtime()
+        _lease_end_switch()
         return
-    _commit_lease_write_behind(path, epoch, proposal, objects, transfers)
-    local_ok = true
-    for part in local_payload["parts"]:
-        if not await _install_lease_payload(part):
-            local_ok = false
-            break
-        if lease_token != token or not _same_save_context(generation, file):
-            return
-    if local_ok:
-        lease_pending_install_epoch = 0
-        lease_pending_previous_chunks.clear()
-    remote_ok = local_ok
-    if local_ok:
-        for index in range(remote_payload["parts"].size()):
-            if lease_token != token or not _same_save_context(generation, file):
-                return
-            lease_phase = "install_" + str(index)
-            lease_ack = {}
-            install_runtime_lease.rpc(token, terrain_epoch, epoch, proposal, objects, remote_payload["parts"][index], index)
-            if not await _wait_lease_ack(token):
-                remote_ok = false
-                break
-    if lease_token != token or not _same_save_context(generation, file):
+    var guest_key: String = str(admitted_player_keys.values()[0])
+    var instance: String = get_active_dimension_instance_key()
+    # Stage: what does not depend on the last few milliseconds (offscreen objects, object owners, private respawns).
+    var staged: Dictionary = _lease_object_owners(ledger, proposal, guest_key)
+    var stage_blobs: Array = []
+    for part in _lease_stage_parts(ledger, staged["objects"], proposal, 2, guest_key, instance):
+        stage_blobs.append(_pack_body(part))
+    for index in range(stage_blobs.size()):
+        lease_stage.rpc(token, index, stage_blobs.size(), stage_blobs[index])
+    # T0: from here to the SWITCH send there is no await.
+    var fresh: Dictionary = _lease_proposal()
+    var final: Dictionary = _lease_object_owners(ledger, fresh, guest_key)
+    var grants_now: Dictionary = _lease_grants(chunk_authority.lease_owners)
+    var grants_next: Dictionary = _lease_grants(fresh)
+    var transfers: Array = final["transfers"]
+    if (grants_now == grants_next and transfers.is_empty() and chunk_authority.lease_epoch != 0 and not _lease_recommit_due() and final["objects"] == chunk_authority.lease_objects) or durable_pickup_busy or _lease_death_loot_pending(final["objects"], 1):
+        cancel_runtime_lease.rpc(token, terrain_epoch)
+        _lease_end_switch()
         return
-    if local_ok and remote_ok:
-        resume_runtime_lease.rpc(token, terrain_epoch)
-        _resume_lease_runtime()
-    else:
-        status_message = "Lease installation was not acknowledged; gameplay remains frozen for safe reconnect"
-        _update_status_text()
+    var new_epoch: int = maxi(chunk_authority.lease_epoch, int(ledger.get("lease", {}).get("epoch", 0))) + 1
+    var outgoing_chunks: Dictionary = {}
+    for key in fresh:
+        if fresh[key] == 2 and chunk_authority.lease_owners.get(key, 1) != 2:
+            outgoing_chunks[key] = true
+    var bundles: Array = _lease_capture_bundles(final["objects"], 1)
+    var terrain: Dictionary = _lease_capture_terrain(outgoing_chunks) if lease_guest_instance == instance else {}
+    _lease_attach_bundles(transfers, bundles, instance, _get_local_player_key(), guest_key)
+    for bundle in bundles:
+        lease_transit[instance + "|" + bundle["uuid"]] = true
+    for key in outgoing_chunks:
+        lease_transit_chunks[key] = true
+    var body: PackedByteArray = _pack_body({"bundles": bundles, "terrain": terrain, "instance": instance})
+    if body.size() > LEASE_SWITCH_BODY_SOFT_CAP:
+        print("[lucid-blocks-coop] lease switch body %d bytes over the soft cap" % body.size())
+    var base_hash: String = "" if lease_force_full else ChunkAuthority.map_hash(grants_now)
+    var chunk_diff: Dictionary = ChunkAuthority.owner_diff({} if lease_force_full else grants_now, grants_next)
+    lease_force_full = false
+    lease_phase = "switching"
+    lease_switch_ctx = {"token": token, "epoch": new_epoch, "proposal": fresh, "objects": final["objects"], "transfers": transfers, "path": path, "previous_epoch": chunk_authority.lease_epoch, "previous_chunks": chunk_authority.lease_owners.duplicate(), "instance": instance, "generation": generation}
+    _enforce_runtime_leases()
+    lease_switch.rpc(token, terrain_epoch, new_epoch, chunk_diff, ChunkAuthority.owner_diff(staged["objects"], final["objects"]), base_hash, _lease_map_hash(grants_next, final["objects"]), stage_blobs.size(), body)
+
+# A captured bundle rides on the transfer of its uuid (or becomes a new transfer when the ledger has not seen the uuid yet).
+func _lease_attach_bundles(transfers: Array, bundles: Array, instance: String, old_key: String, new_key: String) -> void:
+    var plain: String = SaveFile.DIMENSION_MAP[int(Ref.world.current_dimension)]
+    for bundle in bundles:
+        var found: bool = false
+        for transfer in transfers:
+            if transfer["uuid"] == bundle["uuid"] and transfer["instance"] == _ledger_instance_key(instance):
+                transfer["bundle"] = bundle
+                found = true
+        if not found:
+            transfers.append({"instance": _ledger_instance_key(instance), "uuid": bundle["uuid"], "old": old_key, "new": new_key, "bundle": bundle, "dimension": plain})
+
+@rpc("authority", "call_remote", "reliable")
+func lease_stage(token: String, index: int, count: int, blob: PackedByteArray) -> void:
+    if multiplayer.is_server() or count < 1 or count > 64 or index < 0 or index >= count:
+        return
+    var staged: Dictionary = lease_staged.get(token, {})
+    if staged.is_empty():
+        lease_staged.clear()
+        staged = {"count": count, "parts": {}}
+        lease_staged[token] = staged
+    var part = _unpack_body(blob)
+    if part is Dictionary:
+        staged["parts"][index] = part
+
+@rpc("authority", "call_remote", "reliable")
+func lease_switch(token: String, epoch: String, new_epoch: int, chunk_diff: Dictionary, object_diff: Dictionary, base_hash: String, next_hash: String, stage_count: int, body: PackedByteArray) -> void:
+    if multiplayer.is_server():
+        return
+    lease_prepared_token = ""
+    var staged: Dictionary = lease_staged.get(token, {})
+    lease_staged.erase(token)
+    var parts: Dictionary = staged.get("parts", {})
+    var data = _unpack_body(body)
+    var ok: bool = epoch == terrain_epoch and new_epoch > chunk_authority.lease_epoch and not lease_busy and not chest_lock_active and not reconnect_pending and not client_restore_in_progress and _is_local_session_player_active() and Ref.world.is_all_loaded()
+    ok = ok and staged.get("count", -1) == stage_count and parts.size() == stage_count and parts.get(0) is Dictionary and parts[0].get("objects") is Dictionary and data is Dictionary
+    ok = ok and data.get("instance") is String and _lease_valid_bundles(data.get("bundles")) and _lease_valid_delta(peer_states.get(1, {}), data.get("terrain", {}))
+    var objects: Dictionary = {}
+    var grants_next: Dictionary = {}
+    if ok:
+        objects = ChunkAuthority.apply_diff(parts[0]["objects"], object_diff)
+        var grants_now: Dictionary = _lease_grants(chunk_authority.lease_owners)
+        ok = base_hash == "" or ChunkAuthority.map_hash(grants_now) == base_hash
+        if ok:
+            grants_next = ChunkAuthority.apply_diff({} if base_hash == "" else grants_now, chunk_diff)
+            ok = _lease_map_hash(grants_next, objects) == next_hash
+    var instance: String = get_active_dimension_instance_key()
+    var outgoing: Dictionary = {}
+    var out_bundles: Array = []
+    var out_terrain: Dictionary = {}
+    if ok:
+        for key in chunk_authority.lease_owners:
+            if chunk_authority.lease_owners[key] == 2 and not grants_next.has(key):
+                outgoing[key] = true
+        ok = not _lease_death_loot_pending(objects, 2)
+    if ok:
+        out_bundles = _lease_capture_bundles(objects, 2)
+        out_terrain = _lease_capture_terrain(outgoing)
+        ok = chunk_authority.install_lease(new_epoch, grants_next, objects)
+    if not ok:
+        lease_switched.rpc_id(1, token, new_epoch, false, PackedByteArray())
+        return
+    lease_window_epoch = terrain_epoch
+    terrain_epoch = _lease_next_tag(new_epoch)
+    lease_finished_at = Time.get_ticks_msec()
+    lease_switched.rpc_id(1, token, new_epoch, true, _pack_body({"bundles": out_bundles, "terrain": out_terrain, "instance": instance}))
+    var incoming: Array = data["bundles"].duplicate()
+    for index in range(1, stage_count):
+        if _lease_valid_bundles(parts.get(index, {}).get("bundles")):
+            incoming.append_array(parts[index]["bundles"])
+    var respawns: Dictionary = parts[0].get("private_respawns", {})
+    await _lease_install_incoming(data["instance"], incoming, data.get("terrain", {}), respawns if PersonalStore.valid_respawn_update(respawns) else {})
+
+@rpc("any_peer", "call_remote", "reliable")
+func lease_switched(token: String, new_epoch: int, ok: bool, body: PackedByteArray) -> void:
+    var sender: int = multiplayer.get_remote_sender_id()
+    var ctx: Dictionary = lease_switch_ctx
+    if not multiplayer.is_server() or not admitted_player_keys.has(sender) or lease_phase != "switching" or ctx.get("token") != token or ctx.get("epoch") != new_epoch:
+        return
+    if not ok:
+        lease_force_full = true
+        _lease_end_switch()
+        return
+    var data = _unpack_body(body)
+    if not data is Dictionary or not data.get("instance") is String or not _lease_valid_bundles(data.get("bundles")) or not _lease_valid_delta(peer_states.get(sender, {}), data.get("terrain", {})):
+        # A protocol violation after the guest already switched: no two-sided rollback; the guest reconnects and host recovery runs.
+        _lease_end_switch()
+        _lease_kick_peer(sender)
+        return
+    var previous_epoch: int = int(ctx["previous_epoch"])
+    if not chunk_authority.install_lease(new_epoch, ctx["proposal"], ctx["objects"]):
+        _lease_end_switch()
+        return
+    lease_pending_install_epoch = new_epoch
+    lease_pending_previous_chunks = ctx["previous_chunks"]
+    terrain_epoch = _lease_next_tag(new_epoch)
+    lease_commit_gate_epoch = new_epoch
+    var path: String = ctx["path"]
+    var transfers: Array = ctx["transfers"]
+    var proposal: Dictionary = ctx["proposal"]
+    var objects: Dictionary = ctx["objects"]
+    var generation: int = int(ctx["generation"])
+    var file = Ref.save_file_manager.loaded_file
+    _lease_end_switch()
+    lease_activated.rpc(token, new_epoch)
+    _lease_attach_bundles(transfers, data["bundles"], data["instance"], str(admitted_player_keys[sender]), _get_local_player_key())
+    var guest_patch: Dictionary = data.get("terrain", {}).duplicate(true)
+    # The commit does not wait for the terrain install: it only waits for the old epoch's saves, and the new epoch's saves wait for it.
+    _lease_write_behind.call_deferred(path, new_epoch, previous_epoch, proposal, objects, transfers, guest_patch, generation, file)
+    await _lease_install_incoming(data["instance"], data["bundles"], data.get("terrain", {}), {})
+    lease_pending_install_epoch = 0
+    lease_pending_previous_chunks.clear()
+
+func _lease_kick_peer(peer: int) -> void:
+    if multiplayer is SceneMultiplayer:
+        (multiplayer as SceneMultiplayer).disconnect_peer(peer)
+
+@rpc("authority", "call_remote", "reliable")
+func lease_activated(_token: String, new_epoch: int) -> void:
+    if not multiplayer.is_server() and chunk_authority.lease_epoch == new_epoch:
+        lease_window_epoch = ""
+
+# Write-behind: every save made under the old epoch reaches the queue first, then the guest's terrain delta (no echo), then the ownership commit.
+# The commit is queued even when the session ended meanwhile (the job is kept across invalidation): memory is already at this epoch, and
+# disconnect recovery reads the ledger after it. Only a different save file cancels it.
+func _lease_write_behind(path: String, epoch: int, previous_epoch: int, proposal: Dictionary, objects: Dictionary, transfers: Array, guest_patch: Dictionary, generation: int, file: Variant) -> void:
+    var started: int = Time.get_ticks_msec()
+    var deadline: int = Time.get_ticks_msec() + LEASE_COMMIT_WAIT_MS
+    while int(inflight_by_epoch.get(previous_epoch, 0)) > 0 and Time.get_ticks_msec() < deadline and Ref.save_file_manager.loaded_file == file:
+        await get_tree().process_frame
+    if Ref.save_file_manager.loaded_file != file:
+        lease_commit_gate_epoch = 0
+        return
+    if not guest_patch.is_empty() and _same_save_context(generation, file):
+        var persisted: Dictionary = guest_patch.duplicate(true)
+        persisted.erase("versions")
+        await _merge_world_patch_into_save(persisted)
+    await _commit_lease_write_behind(path, epoch, proposal, objects, transfers)
+    print("[lucid-blocks-coop] lease epoch %d durable after %d ms" % [epoch, Time.get_ticks_msec() - started])
+    if lease_commit_gate_epoch == epoch:
+        lease_commit_gate_epoch = 0
 
 # Guest side of the pre-prepare: routine terrain submits are held (3 s at most) until the freeze, a cancel, or the timeout.
 var lease_prepared_token: String = ""
@@ -558,35 +837,6 @@ func _lease_presync(token: String) -> bool:
     await _checkpoint_terrain_in_background()
     return profile_ok and lease_prepared_token == token
 
-@rpc("authority", "call_remote", "reliable")
-func freeze_runtime_lease(token: String, epoch: String) -> void:
-    lease_prepared_token = ""
-    if multiplayer.is_server() or epoch != terrain_epoch or lease_busy:
-        return
-    if chest_lock_active or not _is_local_session_player_active() or not Ref.world.is_all_loaded():
-        acknowledge_runtime_lease.rpc_id(1, token, "collect", terrain_epoch, false)
-        return
-    var generation: int = save_queue.generation
-    var file = Ref.save_file_manager.loaded_file
-    lease_token = token
-    lease_install_index = 0
-    lease_busy = true
-    lease_was_disabled = _disabled_before_checkpoint()
-    var drained: bool = await _drain_lease_mutations()
-    if token != lease_token or not _same_save_context(generation, file):
-        return
-    if not drained:
-        acknowledge_runtime_lease.rpc_id(1, token, "collect", terrain_epoch, false)
-        _resume_lease_runtime()
-        return
-    _freeze_lease_runtime()
-    lease_checkpoint_allowed = true
-    var ok: bool = await _await_local_world_checkpoint(0, true)
-    if token != lease_token or not _same_save_context(generation, file):
-        return
-    lease_checkpoint_allowed = false
-    acknowledge_runtime_lease.rpc_id(1, token, "collect", terrain_epoch, ok)
-
 @rpc("any_peer", "call_remote", "reliable")
 func acknowledge_runtime_lease(token: String, phase: String, epoch: String, ok: bool) -> void:
     if multiplayer.is_server() and admitted_player_keys.has(multiplayer.get_remote_sender_id()):
@@ -601,33 +851,6 @@ func cancel_runtime_lease(token: String, epoch: String) -> void:
     if token == lease_prepared_token:
         lease_prepared_token = ""
         return
-    if token == lease_token and epoch == terrain_epoch:
-        _resume_lease_runtime()
-
-@rpc("authority", "call_remote", "reliable")
-func install_runtime_lease(token: String, epoch: String, revision: int, chunks: Dictionary, objects: Dictionary, payload: Dictionary, index: int) -> void:
-    if multiplayer.is_server() or token != lease_token or not lease_frozen or lease_install_busy or index != lease_install_index:
-        return
-    if index == 0:
-        if not chunk_authority.install_lease(revision, chunks, objects):
-            return
-    elif revision != chunk_authority.lease_epoch or chunks != chunk_authority.lease_owners or objects != chunk_authority.lease_objects or epoch != terrain_epoch:
-        return
-    var generation: int = save_queue.generation
-    var file = Ref.save_file_manager.loaded_file
-    lease_install_busy = true
-    lease_started_at = Time.get_ticks_msec()
-    terrain_epoch = epoch
-    var ok: bool = await _install_lease_payload(payload)
-    if token != lease_token or epoch != terrain_epoch or not _same_save_context(generation, file):
-        return
-    if ok:
-        lease_install_index += 1
-    lease_install_busy = false
-    acknowledge_runtime_lease.rpc_id(1, token, "install_" + str(index), terrain_epoch, ok)
-
-@rpc("authority", "call_remote", "reliable")
-func resume_runtime_lease(token: String, epoch: String) -> void:
     if token == lease_token and epoch == terrain_epoch:
         _resume_lease_runtime()
 
@@ -647,7 +870,7 @@ func _lease_recommit_due() -> bool:
 func _commit_lease_write_behind(path: String, epoch: int, proposal: Dictionary, objects: Dictionary, transfers: Array) -> void:
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
-    var committed: bool = await _store_job(personal_store, "commit_lease", [path, epoch, proposal, objects, transfers], false)
+    var committed: bool = await _store_job(personal_store, "commit_lease", [path, epoch, proposal, objects, transfers, _preserved_scene_paths()], false)
     if not committed:
         # A lost result must not turn a durable commit into a failure.
         var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
@@ -943,9 +1166,12 @@ func _private_respawn_checkpoint(key: String, state: Dictionary, instance: Strin
     return {"ok": true, "update": update}
 
 func _commit_player_checkpoint(key: String, state: Dictionary, instance: String, dimension: int, bundles: Array, skip_unchanged: bool = false) -> Dictionary:
+    var snapshot_epoch: int = chunk_authority.lease_epoch
     checkpoints_in_flight += 1
+    inflight_by_epoch[snapshot_epoch] = int(inflight_by_epoch.get(snapshot_epoch, 0)) + 1
     var result: Dictionary = await _commit_player_checkpoint_inner(key, state, instance, dimension, bundles, skip_unchanged)
     checkpoints_in_flight -= 1
+    inflight_by_epoch[snapshot_epoch] = int(inflight_by_epoch.get(snapshot_epoch, 1)) - 1
     return result
 
 func _commit_player_checkpoint_inner(key: String, state: Dictionary, instance: String, dimension: int, bundles: Array, skip_unchanged: bool) -> Dictionary:
@@ -974,6 +1200,11 @@ func _commit_player_checkpoint_inner(key: String, state: Dictionary, instance: S
             return {}
         if (not _has_live_peer() and not lease_busy) or _bundle_runtime_owner(bundle, instance, objects_view) == rank:
             owned.append(bundle)
+    # A save under the new epoch must not reach the queue before the ownership commit that makes the new epoch durable.
+    while lease_commit_gate_epoch > 0 and expected_lease == lease_commit_gate_epoch and _same_save_context(context_generation, context_file):
+        await get_tree().process_frame
+    if not _same_save_context(context_generation, context_file):
+        return {}
     var result: Dictionary = await _store_job(personal_store, "save_checkpoint", [path, saved, int(state.get("_coop_revision", -1)), _ledger_instance_key(instance), SaveFile.DIMENSION_MAP[dimension], owned, _preserved_scene_paths(), respawns["update"], skip_unchanged, expected_lease], {})
     if not _same_save_context(context_generation, context_file):
         return {}
@@ -1338,7 +1569,7 @@ func _same_save_context(generation: int, file: Variant) -> bool:
 
 func _store_job(store: RefCounted, method: String, arguments: Array, fallback: Variant) -> Variant:
     var own_checkpoint: bool = (method == "save_checkpoint" or method == "commit_lease") and arguments[0] == _profile_path(_get_local_player_key())
-    var priority: bool = method in ["collect_drop", "transfer", "commit_lease"]
+    var priority: bool = method in ["collect_drop", "transfer"]
     var result = await save_queue.run(get_tree(), Callable(store, method).bindv(arguments.duplicate(true)), own_checkpoint, priority)
     if store == personal_store and method == "read_ledger" and result is Dictionary and not result.is_empty():
         known_profile_directory = str(arguments[0]).get_base_dir()
@@ -1753,7 +1984,7 @@ const CONFIG_PATH: String = "user://lucid_blocks_coop_config.json"
 const DEFAULT_PORT: int = 24567
 const MAX_PLAYERS: int = 2
 const MAX_CLIENTS: int = MAX_PLAYERS - 1
-const MOD_PROTOCOL_VERSION: int = 6
+const MOD_PROTOCOL_VERSION: int = 7
 const TARGET_GAME_VERSION: String = "5.2.0"
 const AUTH_TIMEOUT_SECONDS: float = 5.0
 const AUTH_MAX_BYTES: int = 2048
@@ -11542,6 +11773,15 @@ func _restore_disconnected_runtime_state() -> bool:
     var token: String = lease_token
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
+    # A switch the peer never answered leaves its paused objects untouched; a switch that flipped memory still has its commit queued.
+    lease_transit.clear()
+    lease_transit_chunks.clear()
+    lease_switch_ctx = {}
+    lease_window_epoch = ""
+    lease_prepared_token = ""
+    var gate_deadline: int = Time.get_ticks_msec() + LEASE_COMMIT_WAIT_MS + 5000
+    while lease_commit_gate_epoch > 0 and Time.get_ticks_msec() < gate_deadline and Ref.save_file_manager.loaded_file == file:
+        await get_tree().process_frame
     if not await _drain_lease_mutations():
         return false
     if lease_token != token or not _same_save_context(generation, file):
@@ -11787,6 +12027,7 @@ func _queue_client_main_menu_kick() -> void:
 func _begin_reconnect_flow(reason: String) -> void:
     if multiplayer.is_server() or local_quit_in_progress:
         return
+    print("[lucid-blocks-coop] Reconnecting: ", reason)
     if local_downed and not chest_lock_active:
         disconnect_session(false)
         return
