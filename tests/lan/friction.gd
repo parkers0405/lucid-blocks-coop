@@ -60,6 +60,11 @@ var spawned: Dictionary = {}
 var kill_seen: bool = false
 var peer_gone_seen: bool = false
 var items0: int = 0
+var mined_cells: Array = []
+var oracle_result: Dictionary = {}
+var oracle_dir: String = ""
+var oracle_namespace: String = ""
+var oracle_ids = null
 # H0 handoff instrumentation: per-uuid simulation state (can_process) so the pause of objects that change owner is measured whatever the protocol.
 var node_active: Dictionary = {}
 var prev_phase: String = ""
@@ -334,6 +339,7 @@ func _scn_mine_tunnel(_manager: Node) -> bool:
                 seen = false
         Input.action_release("attack")
         if broke:
+            mined_cells.append([target.x, target.y, target.z])
             mined += 1
             misses = 0
             pending_breaks.append(Time.get_ticks_msec())
@@ -381,8 +387,8 @@ func _scn_handoff_motion(_manager: Node) -> bool:
                     await get_tree().physics_frame
                     var d: float = Ref.player.global_position.x - origin.x
                     # Objects left behind the guest's path change owner when the guest comes back, which gives the pause measurement something to read.
-                    if yaw < 0.0 and trip == 0 and d > next_drop:
-                        _spawn_drop(drop_block, Ref.player.global_position + Vector3(0.0, 1.0, 6.0))
+                    if yaw < 0.0 and trip == 0 and d > next_drop and d > 100.0:
+                        _spawn_drop(drop_block, Ref.player.global_position + Vector3(0.0, 1.0, 20.0))
                         next_drop += 25.0
                     if (yaw < 0.0 and d > 300.0) or (yaw > 0.0 and d < 4.0):
                         break
@@ -645,13 +651,38 @@ func _install_disk(manager: Node) -> void:
     manager.save_queue = fault_queue
     print("FRICTION_DISK ", fault_queue.disk)
 
+# H2/G7: after the host session committed its world, read the host's region files and compare them with the cells each player broke.
+func _terrain_oracle(manager: Node, cells: Array) -> Dictionary:
+    if cells.is_empty() or oracle_dir.is_empty():
+        return {"expected": cells.size(), "matched": 0, "checked": false}
+    var chunks: Array = []
+    for cell in cells:
+        var chunk := Vector3i(floori(cell[0] / 16.0) * 16, floori(cell[1] / 16.0) * 16, floori(cell[2] / 16.0) * 16)
+        if not chunks.has(chunk):
+            chunks.append(chunk)
+    var stored: Dictionary = manager.region_checkpoint.read_regions(oracle_dir, oracle_namespace, oracle_ids, chunks)
+    if not stored.get("ok", false):
+        return {"expected": cells.size(), "matched": 0, "checked": false}
+    var blocks: Dictionary = {}
+    for region in stored["regions"].values():
+        blocks.merge(region["chunk_block"], true)
+    var matched: int = 0
+    for cell in cells:
+        var chunk := Vector3i(floori(cell[0] / 16.0) * 16, floori(cell[1] / 16.0) * 16, floori(cell[2] / 16.0) * 16)
+        var data = blocks.get(chunk)
+        if data != null:
+            var index: int = (int(cell[0]) - chunk.x) + (int(cell[2]) - chunk.z) * 16 + (int(cell[1]) - chunk.y) * 256
+            if index >= 0 and index < data.size() and data[index] <= 1:
+                matched += 1
+    return {"expected": cells.size(), "matched": matched, "checked": true}
+
 func _finish_io() -> void:
     if fault_queue != null:
         var file := FileAccess.open(scenario.path_join(role + "_io.json"), FileAccess.WRITE)
         file.store_string(JSON.stringify({"disk": fault_queue.disk, "jobs": fault_queue.records.size(), "failed": fault_queue.failed, "log": fault_queue.records.slice(0, 400)}))
         file.close()
     var pickups := FileAccess.open(scenario.path_join(role + "_pickups.json"), FileAccess.WRITE)
-    pickups.store_string(JSON.stringify({"pickup_ms": pickup_ms, "mined": mined, "items": _item_total(), "items0": items0, "drops_left": _drops_left(), "tally": _item_tally(), "drops_tally": _drops_tally(), "spawned": spawned}))
+    pickups.store_string(JSON.stringify({"pickup_ms": pickup_ms, "mined": mined, "items": _item_total(), "items0": items0, "drops_left": _drops_left(), "tally": _item_tally(), "drops_tally": _drops_tally(), "spawned": spawned, "terrain_oracle": oracle_result}))
     pickups.close()
 
 func _world_ready() -> bool:
@@ -707,14 +738,22 @@ func _run() -> void:
     if not succeeded:
         return
     if role == "guest":
-        _mark("scenario_complete")
+        _mark("scenario_complete", {"mined_cells": mined_cells})
         manager.disconnect_session(false)
     elif role == "host":
         if not await _wait(func(): return FileAccess.file_exists(scenario.path_join("guest_scenario_complete.json")), "guest finished", 120.0):
             return
         if not await _wait(func(): return manager.admitted_player_keys.is_empty(), "guest disconnected", 60.0):
             return
+        oracle_dir = manager._get_checkpoint_chunks_directory()
+        oracle_namespace = manager._resolve_dimension_namespace(int(Ref.world.current_dimension), manager.get_active_pocket_owner_key())
+        oracle_ids = manager._checkpoint_block_ids()
         check(await manager._shutdown_host_session(false, "friction run finished"), "host shutdown commits world")
+        var guest_cells: Array = []
+        var guest_done = JSON.parse_string(FileAccess.get_file_as_string(scenario.path_join("guest_scenario_complete.json")))
+        if guest_done is Dictionary:
+            guest_cells = guest_done.get("mined_cells", [])
+        oracle_result = {"host": _terrain_oracle(manager, mined_cells), "guest": _terrain_oracle(manager, guest_cells)}
     stage = "shutdown"
     if not await _wait(func(): return Ref.world.is_all_loaded(), "finish native loading", 60.0):
         return

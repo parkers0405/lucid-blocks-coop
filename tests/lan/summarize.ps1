@@ -80,6 +80,17 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
         $freezeRuns = Get-Runs $times $freezeFlags
         $editRuns = Get-Runs $times ([bool[]]@($win | ForEach-Object { $_.ed -gt 0 }))
         $nodeEvents[$role] = @($events | Where-Object ev -eq 'node')
+        # Host: time from the SWITCH being sent (phase "switching") to the epoch change, per handoff that completed; rejected switches are counted.
+        $switchMs = @(); $switchRejected = 0; $switchAt = $null; $idleAt = $null
+        foreach ($e in @($events | Where-Object { $_.ev -in 'phase', 'epoch' })) {
+            if ($null -ne $idleAt) {
+                # The idle phase and the epoch change are logged in the same frame; an epoch event right after it means the switch completed.
+                if ($e.ev -eq 'epoch' -and ($e.t - $idleAt) -le 50) { $switchMs += ($idleAt - $switchAt) } else { $switchRejected++ }
+                $idleAt = $null; $switchAt = $null
+            }
+            if ($e.ev -eq 'phase' -and ([string]$e.p).StartsWith('switching')) { $switchAt = $e.t }
+            elseif ($e.ev -eq 'phase' -and $null -ne $switchAt -and ([string]$e.p).StartsWith('|0')) { $idleAt = $e.t }
+        }
         if ($start -ne $null -and $role -ne 'solo') { $uWin[$role] = @(($events | Where-Object ev -eq 'scenario_start' | Select-Object -First 1).u, $(if ($done) { $done.u } else { [double]::MaxValue })) }
         $reconnectRuns = Get-Runs $times ([bool[]]@($win | ForEach-Object { [bool](& $flagsOf $_ | Where-Object { $_ -eq 'reconnect_pending' }) }))
         $ignored = @($win | Where-Object { $_.mi -eq 1 -and $_.mv -lt 0.001 -and ($_.dis -eq 1 -or $_.lk -eq 1) -and -not (& $flagsOf $_ | Where-Object { $_ -in $LoadingFlags }) }).Count
@@ -93,10 +104,11 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
             run = $dir.Name; scenario = $config.scenario; profile = $(if ($config.solo) { 'solo' } else { $config.profile }); disk = $config.disk; role = $role
             elapsed_ms = $done.elapsed_ms; window_ms = $windowMs; frames = $win.Count
             handoff_lock_runs_ms = $handoffRuns; other_lock_ms = $otherRuns; lock_total_ms = (($handoffRuns | Measure-Object -Sum).Sum + ($otherRuns | Measure-Object -Sum).Sum)
-            freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; movement_ignored_frames = $ignored
+            switch_ms = $switchMs; switch_rejected = $switchRejected; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; movement_ignored_frames = $ignored
             break_resets = [int](($win | Measure-Object -Property rst -Sum).Sum)
             frame_p99_ms = (Get-Percentile $dts 0.99); frames_over_50ms = $over50
             pickup_p95_ms = $(if ($pickups -and $pickups.pickup_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ms) 0.95 } else { $null })
+            terrain_oracle = $(if ($pickups -and $pickups.terrain_oracle -and $pickups.terrain_oracle.host) { $pickups.terrain_oracle } else { $null })
             items_delta = $(if ($pickups) { $pickups.items - $pickups.items0 } else { $null }); drops_left = $(if ($pickups) { $pickups.drops_left } else { $null })
             probe_ok = $(if ($summary -and $summary.$role) { [bool]$summary.$role.valid } else { $false })
             errors = $(if ($summary -and $summary.$role) { @($summary.$role.errors) } else { @() })
@@ -145,11 +157,17 @@ foreach ($group in ($rows | Group-Object scenario, profile, disk, role)) {
     $maxFreeze = ($freezeAll | Measure-Object -Maximum).Maximum
     $reconnects = ($r | Measure-Object -Property reconnects -Sum).Sum
     $g.G6 = if (($p95 -gt 500) -or ($maxFreeze -gt 1500) -or ($reconnects -gt 0 -and $first.profile -ne 'cut')) { 'FAIL (partial: handoff freeze only; portal/quit not measured here)' } else { 'PASS (partial: handoff freeze only; portal/quit not measured here)' }
-    if ($first.scenario -eq 'shared_loot' -and $first.role -ne 'solo') { $g.G7 = 'see conservation' } else { $g.G7 = 'BLOCKED (no oracle for this scenario)' }
+    $oracleRows = @($r | Where-Object { $_.terrain_oracle })
+    if ($first.scenario -eq 'shared_loot' -and $first.role -ne 'solo') { $g.G7 = 'see conservation' }
+    elseif ($oracleRows.Count -gt 0) {
+        $bad = @($oracleRows | Where-Object { $_.terrain_oracle.host.matched -ne $_.terrain_oracle.host.expected -or $_.terrain_oracle.guest.matched -ne $_.terrain_oracle.guest.expected -or -not $_.terrain_oracle.host.checked })
+        $g.G7 = if ($bad.Count) { 'FAIL (terrain oracle: ' + (($bad | ForEach-Object { 'host ' + $_.terrain_oracle.host.matched + '/' + $_.terrain_oracle.host.expected + ' guest ' + $_.terrain_oracle.guest.matched + '/' + $_.terrain_oracle.guest.expected }) -join '; ') + ')' } else { 'PASS (terrain oracle on host disk, all repeats)' }
+    }
+    else { $g.G7 = 'BLOCKED (no oracle for this scenario)' }
     $cells += [pscustomobject]@{
         scenario = $first.scenario; profile = $first.profile; disk = $first.disk; role = $first.role; repeats = $repeatRuns
         complete = ($repeatRuns -ge $RequiredRepeats); probe_ok = (-not @($r | Where-Object { -not $_.probe_ok }).Count)
-        max_handoff_lock_ms = $maxHandoff; handoff_count = $allHandoff.Count; freeze_p95_ms = $p95; freeze_max_ms = $maxFreeze; old_freeze_p95_ms = (Get-Percentile $oldOnly 0.95); old_freeze_max_ms = ($oldOnly | Measure-Object -Maximum).Maximum; pause_p95_ms = (Get-Percentile $pauseOnly 0.95); pause_max_ms = ($pauseOnly | Measure-Object -Maximum).Maximum; pause_count = $pauseOnly.Count; lock_fraction = [Math]::Round($lockFraction, 4)
+        max_handoff_lock_ms = $maxHandoff; handoff_count = $allHandoff.Count; freeze_p95_ms = $p95; freeze_max_ms = $maxFreeze; old_freeze_p95_ms = (Get-Percentile $oldOnly 0.95); old_freeze_max_ms = ($oldOnly | Measure-Object -Maximum).Maximum; pause_p95_ms = (Get-Percentile $pauseOnly 0.95); pause_max_ms = ($pauseOnly | Measure-Object -Maximum).Maximum; pause_count = $pauseOnly.Count; switch_p95_ms = (Get-Percentile ([double[]]@($r | ForEach-Object { $_.switch_ms } | Where-Object { $_ -ne $null })) 0.95); switch_max_ms = (@($r | ForEach-Object { $_.switch_ms } | Where-Object { $_ -ne $null }) | Measure-Object -Maximum).Maximum; switch_count = @($r | ForEach-Object { $_.switch_ms } | Where-Object { $_ -ne $null }).Count; switch_rejected = ($r | Measure-Object -Property switch_rejected -Sum).Sum; lock_fraction = [Math]::Round($lockFraction, 4)
         elapsed_ms_avg = (($r | Measure-Object -Property elapsed_ms -Average).Average); movement_ignored = ($r | Measure-Object -Property movement_ignored_frames -Sum).Sum
         break_resets = ($r | Measure-Object -Property break_resets -Sum).Sum; gates = $g
     }
@@ -205,9 +223,9 @@ $modScript = @($errorCats.Keys | Where-Object { $_ -like 'mod|*' -and $_ -match 
 
 $report = [ordered]@{ batch = $Batch; generated = (Get-Date).ToString('s'); cells = $cells; conservation = $conservation; G8 = $g8; G9_mod_script_errors = $modScript; G9_error_counts = $errorCats }
 $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Batch 'friction-report.json') -Encoding UTF8
-$md = @("# Friction report ($Batch)", '', '| scenario | profile | disk | role | repeats | max handoff lock ms | freeze p95/max ms | old freeze p95/max | object pause p95/max (n) | lock frac | resets | G3 | G4 | G5 | G6 | G7 |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+$md = @("# Friction report ($Batch)", '', '| scenario | profile | disk | role | repeats | max handoff lock ms | freeze p95/max ms | old freeze p95/max | object pause p95/max (n) | switch p95/max (n, rejected) | lock frac | resets | G3 | G4 | G5 | G6 | G7 |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
 foreach ($c in $cells) {
-    $md += "| $($c.scenario) | $($c.profile) | $($c.disk) | $($c.role) | $($c.repeats)$(if (-not $c.complete) { ' (INCOMPLETE)' }) | $($c.max_handoff_lock_ms) | $($c.freeze_p95_ms)/$($c.freeze_max_ms) | $($c.old_freeze_p95_ms)/$($c.old_freeze_max_ms) | $($c.pause_p95_ms)/$($c.pause_max_ms) ($($c.pause_count)) | $($c.lock_fraction) | $($c.break_resets) | $($c.gates.G3) | $($c.gates.G4) | $($c.gates.G5) | $($c.gates.G6) | $($c.gates.G7) |"
+    $md += "| $($c.scenario) | $($c.profile) | $($c.disk) | $($c.role) | $($c.repeats)$(if (-not $c.complete) { ' (INCOMPLETE)' }) | $($c.max_handoff_lock_ms) | $($c.freeze_p95_ms)/$($c.freeze_max_ms) | $($c.old_freeze_p95_ms)/$($c.old_freeze_max_ms) | $($c.pause_p95_ms)/$($c.pause_max_ms) ($($c.pause_count)) | $($c.switch_p95_ms)/$($c.switch_max_ms) ($($c.switch_count), $($c.switch_rejected)) | $($c.lock_fraction) | $($c.break_resets) | $($c.gates.G3) | $($c.gates.G4) | $($c.gates.G5) | $($c.gates.G6) | $($c.gates.G7) |"
 }
 $md += ''; $md += "G8: $g8"; $md += ''; $md += 'Conservation (shared_loot):'
 foreach ($c in $conservation) { $md += "- $($c.run)$(if ($c.kill) { ' kill=' + $c.kill }): total $($c.gained) (drops left $($c.drops_left_host)) vs expected $($c.expected): $(if ($c.ok) { 'PASS' } else { 'FAIL' })" }
