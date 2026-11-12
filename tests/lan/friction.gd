@@ -60,6 +60,10 @@ var spawned: Dictionary = {}
 var kill_seen: bool = false
 var peer_gone_seen: bool = false
 var items0: int = 0
+# H0 handoff instrumentation: per-uuid simulation state (can_process) so the pause of objects that change owner is measured whatever the protocol.
+var node_active: Dictionary = {}
+var prev_phase: String = ""
+var prev_epoch: int = -1
 const LOCK_FLAGS := ["chest_lock_active", "chest_movement_locked", "lease_preparing", "lease_frozen", "lease_busy", "guest_checkpoint_busy", "reconnect_pending", "client_restore_in_progress", "receiving_host_world", "pickup_inventory_lock", "durable_pickup_busy", "terrain_sync_busy"]
 
 func _enter_tree() -> void:
@@ -208,15 +212,44 @@ func _physics_process(_delta: float) -> void:
     if total != item_total_prev:
         _event("items", {"total": total, "tally": _item_tally()})
     item_total_prev = total
+    _track_handoff(manager)
     var spawner = Ref.entity_spawner
+    var parked = manager.get("installing_edits")
     var row := {"t": Time.get_ticks_msec(), "dt": gap, "in": 1 if bot_active else 0, "mi": 1 if (Input.is_action_pressed("up") or Input.is_action_pressed("down")) else 0, "mv": snappedf(step, 0.001),
         "dis": 1 if Ref.player.disabled else 0, "lk": 1 if locked else 0, "f": ",".join(flags),
         "atk": 1 if Input.is_action_pressed("attack") else 0, "brk": 1 if breaking else 0, "prog": snappedf(progress, 0.01), "rst": reset,
         "sim": 1 if Ref.world.simulate_enabled else 0, "ent": 1 if (is_instance_valid(spawner) and spawner.process_mode != Node.PROCESS_MODE_DISABLED) else 0,
         "ld": 0 if Ref.world.is_all_loaded() else 1, "q": fault_queue.pending.size() if fault_queue != null else -1}
+    if parked is Dictionary and not parked.is_empty():
+        row["ed"] = parked.size()
     tele.append(JSON.stringify(row))
     if tele.size() >= 240:
         _flush_tele()
+
+func _track_handoff(manager: Node) -> void:
+    var phase: String = "%s|%d|%d|%d" % [manager.lease_phase, 1 if manager.lease_busy else 0, 1 if manager.lease_frozen else 0, 1 if manager.lease_preparing else 0]
+    if phase != prev_phase:
+        prev_phase = phase
+        _event("phase", {"p": phase})
+    var epoch: int = manager.chunk_authority.lease_epoch
+    if epoch != prev_epoch:
+        prev_epoch = epoch
+        _event("epoch", {"e": epoch})
+    var seen: Dictionary = {}
+    for node in manager._get_live_tracked_entities() + manager._get_live_tracked_drops():
+        if not is_instance_valid(node):
+            continue
+        var uuid: String = manager._get_sync_uuid(node)
+        if uuid == "":
+            continue
+        var active: bool = node.can_process()
+        seen[uuid] = active
+        if node_active.get(uuid, null) != active:
+            _event("node", {"id": uuid.substr(0, 8), "on": 1 if active else 0})
+    for uuid in node_active:
+        if not seen.has(uuid):
+            _event("node", {"id": uuid.substr(0, 8), "on": -1})
+    node_active = seen
 
 func _flush_tele() -> void:
     if tele_file == null:
@@ -229,6 +262,7 @@ func _flush_tele() -> void:
 func _event(name_value: String, extra: Dictionary = {}) -> void:
     extra["ev"] = name_value
     extra["t"] = Time.get_ticks_msec()
+    extra["u"] = int(Time.get_unix_time_from_system() * 1000.0)
     tele.append(JSON.stringify(extra))
 
 func _aim(yaw: float, pitch: float) -> void:
@@ -335,6 +369,8 @@ func _scn_handoff_motion(_manager: Node) -> bool:
     var origin: Vector3 = Ref.player.global_position
     var started: int = Time.get_ticks_msec()
     if role != "host":
+        var next_drop: float = 25.0
+        var drop_block: int = _solid_block_ids()[0]
         for trip in range(int(config.get("trips", 2))):
             for yaw in [-PI / 2.0, PI / 2.0]:
                 _aim(yaw, 0.0)
@@ -344,6 +380,10 @@ func _scn_handoff_motion(_manager: Node) -> bool:
                 while Time.get_ticks_msec() < deadline:
                     await get_tree().physics_frame
                     var d: float = Ref.player.global_position.x - origin.x
+                    # Objects left behind the guest's path change owner when the guest comes back, which gives the pause measurement something to read.
+                    if yaw < 0.0 and trip == 0 and d > next_drop:
+                        _spawn_drop(drop_block, Ref.player.global_position + Vector3(0.0, 1.0, 6.0))
+                        next_drop += 25.0
                     if (yaw < 0.0 and d > 300.0) or (yaw > 0.0 and d < 4.0):
                         break
                 Input.action_release("up")
@@ -531,6 +571,61 @@ func _open_chest_session(manager: Node) -> bool:
     cube.global_position = Vector3(spot["x"], spot["y"], spot["z"])
     manager.open_personal_chest(cube)
     return await _wait(func(): return _chest_idle(manager), "chest session", 30.0)
+
+# H1: reliable RPCs of different methods must arrive in send order. One global sequence number per direction across 3 methods and mixed sizes.
+var rpc_expected: int = 0
+var rpc_inversions: int = 0
+var rpc_duplicates: int = 0
+var rpc_received: int = 0
+
+func _rpc_seen(seq: int) -> void:
+    rpc_received += 1
+    if seq == rpc_expected:
+        rpc_expected += 1
+    elif seq < rpc_expected:
+        rpc_duplicates += 1
+    else:
+        rpc_inversions += 1
+        rpc_expected = seq + 1
+
+@rpc("any_peer", "call_remote", "reliable")
+func rpc_order_a(seq: int, _pad: PackedByteArray) -> void:
+    _rpc_seen(seq)
+
+@rpc("any_peer", "call_remote", "reliable")
+func rpc_order_b(seq: int, _pad: PackedByteArray) -> void:
+    _rpc_seen(seq)
+
+@rpc("any_peer", "call_remote", "reliable")
+func rpc_order_c(seq: int, _pad: PackedByteArray) -> void:
+    _rpc_seen(seq)
+
+func _scn_rpc_order(manager: Node) -> bool:
+    var total: int = int(config.get("rpc_count", 2000))
+    var peer: int = 1 if role == "guest" else int(multiplayer.get_peers()[0])
+    var started: int = Time.get_ticks_msec()
+    var sent: int = 0
+    while sent < total:
+        for _i in range(4):
+            if sent >= total:
+                break
+            var pad := PackedByteArray()
+            pad.resize(1 if sent % 7 != 0 else 3000)
+            match sent % 3:
+                0: rpc_order_a.rpc_id(peer, sent, pad)
+                1: rpc_order_b.rpc_id(peer, sent, pad)
+                _: rpc_order_c.rpc_id(peer, sent, pad)
+            sent += 1
+        await get_tree().physics_frame
+    var done: bool = await _wait(func(): return rpc_received >= total, "rpc_order received", 90.0)
+    check(done and rpc_received == total, "rpc_order received %d of %d" % [rpc_received, total])
+    check(rpc_inversions == 0, "rpc_order inversions %d" % rpc_inversions)
+    check(rpc_duplicates == 0, "rpc_order duplicates %d" % rpc_duplicates)
+    _event("scenario_done", {"name": "rpc_order", "elapsed_ms": Time.get_ticks_msec() - started, "inversions": rpc_inversions, "duplicates": rpc_duplicates})
+    _mark("rpc_done", {"received": rpc_received, "inversions": rpc_inversions, "duplicates": rpc_duplicates})
+    # Keep the peer connected until the other side has received everything too.
+    var other: String = "host" if role == "guest" else "guest"
+    return await _wait_marker(other, "rpc_done", 90.0)
 
 func _run_scenario(manager: Node) -> bool:
     if FileAccess.file_exists(scenario.path_join(role + "_recover.flag")):

@@ -23,12 +23,35 @@ function Get-Runs([int[]] $Times, [bool[]] $Flags) {
     if ($start -ge 0) { $runs += ($Times[-1] - $start) }
     , $runs
 }
+# H0/D2: pause of objects that change owner. An object is "simulated" while at least one process has it processing; a pause is a gap with
+# none, between two processing spans, that did not end in a despawn. Works for any protocol (global freeze or per-object transit).
+function Get-TransitPauses($NodeEvents, [double] $From, [double] $To) {
+    $all = @()
+    foreach ($role in $NodeEvents.Keys) { foreach ($e in $NodeEvents[$role]) { $all += [pscustomobject]@{ u = [double]$e.u; id = $e.id; role = $role; on = [int]$e.on } } }
+    $pauses = @()
+    foreach ($g in ($all | Group-Object id)) {
+        $state = @{}; $zeroAt = $null; $had = $false
+        foreach ($e in ($g.Group | Sort-Object u)) {
+            $state[$e.role] = ($e.on -eq 1)
+            $count = @($state.Values | Where-Object { $_ }).Count
+            if ($count -gt 0) {
+                if ($null -ne $zeroAt -and $e.u -ge $From -and $e.u -le $To) { $pauses += ($e.u - $zeroAt) }
+                $zeroAt = $null; $had = $true
+            }
+            elseif ($had -and $null -eq $zeroAt -and $e.on -eq 0) { $zeroAt = $e.u }
+            elseif ($e.on -eq -1) { $zeroAt = $null }
+        }
+    }
+    , $pauses
+}
 function Normalize-Error([string] $Line) {
     ($Line -replace '0x[0-9a-fA-F]+', '0xN' -replace '\d+', 'N' -replace '\s+', ' ').Trim()
 }
 
 $rows = @()
 foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
+    $nodeEvents = @{}; $uWin = @{}
+    $firstRow = $rows.Count
     $configPath = Join-Path $dir.FullName 'config.json'
     if (-not (Test-Path $configPath)) { continue }
     $config = Get-Content -Raw $configPath | ConvertFrom-Json
@@ -55,6 +78,9 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
         $otherRuns = Get-Runs $times $otherLock
         $freezeFlags = [bool[]]@(for ($i = 0; $i -lt $win.Count; $i++) { ($win[$i].sim -eq 0 -or $win[$i].ent -eq 0) -and -not $loading[$i] })
         $freezeRuns = Get-Runs $times $freezeFlags
+        $editRuns = Get-Runs $times ([bool[]]@($win | ForEach-Object { $_.ed -gt 0 }))
+        $nodeEvents[$role] = @($events | Where-Object ev -eq 'node')
+        if ($start -ne $null -and $role -ne 'solo') { $uWin[$role] = @(($events | Where-Object ev -eq 'scenario_start' | Select-Object -First 1).u, $(if ($done) { $done.u } else { [double]::MaxValue })) }
         $reconnectRuns = Get-Runs $times ([bool[]]@($win | ForEach-Object { [bool](& $flagsOf $_ | Where-Object { $_ -eq 'reconnect_pending' }) }))
         $ignored = @($win | Where-Object { $_.mi -eq 1 -and $_.mv -lt 0.001 -and ($_.dis -eq 1 -or $_.lk -eq 1) -and -not (& $flagsOf $_ | Where-Object { $_ -in $LoadingFlags }) }).Count
         $dts = [double[]]@($win | ForEach-Object { $_.dt / 1000.0 })
@@ -67,7 +93,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
             run = $dir.Name; scenario = $config.scenario; profile = $(if ($config.solo) { 'solo' } else { $config.profile }); disk = $config.disk; role = $role
             elapsed_ms = $done.elapsed_ms; window_ms = $windowMs; frames = $win.Count
             handoff_lock_runs_ms = $handoffRuns; other_lock_ms = $otherRuns; lock_total_ms = (($handoffRuns | Measure-Object -Sum).Sum + ($otherRuns | Measure-Object -Sum).Sum)
-            freeze_runs_ms = $freezeRuns; reconnects = $reconnectRuns.Count; movement_ignored_frames = $ignored
+            freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; movement_ignored_frames = $ignored
             break_resets = [int](($win | Measure-Object -Property rst -Sum).Sum)
             frame_p99_ms = (Get-Percentile $dts 0.99); frames_over_50ms = $over50
             pickup_p95_ms = $(if ($pickups -and $pickups.pickup_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ms) 0.95 } else { $null })
@@ -76,6 +102,9 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
             errors = $(if ($summary -and $summary.$role) { @($summary.$role.errors) } else { @() })
         }
     }
+    $pauses = @()
+    if ($uWin.Count) { $pauses = Get-TransitPauses $nodeEvents (($uWin.Values | ForEach-Object { $_[0] } | Measure-Object -Minimum).Minimum) (($uWin.Values | ForEach-Object { $_[1] } | Measure-Object -Maximum).Maximum) }
+    foreach ($row in @($rows | Select-Object -Skip $firstRow)) { $row | Add-Member -NotePropertyName transit_pause_ms -NotePropertyValue $pauses }
 }
 
 # Group repeats into cells and evaluate gates.
@@ -90,7 +119,7 @@ foreach ($group in ($rows | Group-Object scenario, profile, disk, role)) {
     $soloElapsed = if ($solo.Count) { ($solo | Measure-Object -Property elapsed_ms -Average).Average } else { $null }
     $soloP99 = if ($solo.Count) { ($solo | Measure-Object -Property frame_p99_ms -Average).Average } else { $null }
     $g = [ordered]@{}
-    $allHandoff = @($r | ForEach-Object { $_.handoff_lock_runs_ms } | Where-Object { $_ -ne $null })
+    $allHandoff = @($r | ForEach-Object { @($_.handoff_lock_runs_ms) + @($_.edit_delay_runs_ms) } | Where-Object { $_ -ne $null })
     $allOther = @($r | ForEach-Object { $_.other_lock_ms } | Where-Object { $_ -ne $null })
     $g.G3 = if (@($r | Where-Object { $_.movement_ignored_frames -gt 0 }).Count) { 'FAIL' } else { 'PASS' }
     $maxHandoff = ($allHandoff | Measure-Object -Maximum).Maximum
@@ -108,7 +137,10 @@ foreach ($group in ($rows | Group-Object scenario, profile, disk, role)) {
         $g.G5 = if ($timeGate -and ($pick.Count -eq 0 -or ($pick | Measure-Object -Maximum).Maximum -le $pickLimit) -and -not $frameBad) { 'PASS' } else { 'FAIL' }
         $g.G5_detail = 'time ratio {0:N2} (limit {1}), pickup p95 max {2} (limit {3}), frames>50ms {4}' -f $ratio, $limit, (($pick | Measure-Object -Maximum).Maximum), $pickLimit, (($r | Measure-Object -Property frames_over_50ms -Sum).Sum)
     }
-    $freezeAll = [double[]]@($r | ForEach-Object { $_.freeze_runs_ms } | Where-Object { $_ -ne $null })
+    # D2: the global freeze signal stays; the object-pause signal is added (union, so a protocol without a global freeze cannot read 0 by construction).
+    $pauseOnly = [double[]]@($r | Select-Object -ExpandProperty run -Unique | ForEach-Object { $name = $_; ($r | Where-Object run -eq $name | Select-Object -First 1).transit_pause_ms } | Where-Object { $_ -ne $null })
+    $oldOnly = [double[]]@($r | ForEach-Object { $_.freeze_runs_ms } | Where-Object { $_ -ne $null })
+    $freezeAll = [double[]]@($oldOnly + $pauseOnly)
     $p95 = Get-Percentile $freezeAll 0.95
     $maxFreeze = ($freezeAll | Measure-Object -Maximum).Maximum
     $reconnects = ($r | Measure-Object -Property reconnects -Sum).Sum
@@ -117,7 +149,7 @@ foreach ($group in ($rows | Group-Object scenario, profile, disk, role)) {
     $cells += [pscustomobject]@{
         scenario = $first.scenario; profile = $first.profile; disk = $first.disk; role = $first.role; repeats = $repeatRuns
         complete = ($repeatRuns -ge $RequiredRepeats); probe_ok = (-not @($r | Where-Object { -not $_.probe_ok }).Count)
-        max_handoff_lock_ms = $maxHandoff; handoff_count = $allHandoff.Count; freeze_p95_ms = $p95; freeze_max_ms = $maxFreeze; lock_fraction = [Math]::Round($lockFraction, 4)
+        max_handoff_lock_ms = $maxHandoff; handoff_count = $allHandoff.Count; freeze_p95_ms = $p95; freeze_max_ms = $maxFreeze; old_freeze_p95_ms = (Get-Percentile $oldOnly 0.95); old_freeze_max_ms = ($oldOnly | Measure-Object -Maximum).Maximum; pause_p95_ms = (Get-Percentile $pauseOnly 0.95); pause_max_ms = ($pauseOnly | Measure-Object -Maximum).Maximum; pause_count = $pauseOnly.Count; lock_fraction = [Math]::Round($lockFraction, 4)
         elapsed_ms_avg = (($r | Measure-Object -Property elapsed_ms -Average).Average); movement_ignored = ($r | Measure-Object -Property movement_ignored_frames -Sum).Sum
         break_resets = ($r | Measure-Object -Property break_resets -Sum).Sum; gates = $g
     }
@@ -173,9 +205,9 @@ $modScript = @($errorCats.Keys | Where-Object { $_ -like 'mod|*' -and $_ -match 
 
 $report = [ordered]@{ batch = $Batch; generated = (Get-Date).ToString('s'); cells = $cells; conservation = $conservation; G8 = $g8; G9_mod_script_errors = $modScript; G9_error_counts = $errorCats }
 $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Batch 'friction-report.json') -Encoding UTF8
-$md = @("# Friction report ($Batch)", '', '| scenario | profile | disk | role | repeats | max handoff lock ms | freeze p95/max ms | lock frac | resets | G3 | G4 | G5 | G6 | G7 |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+$md = @("# Friction report ($Batch)", '', '| scenario | profile | disk | role | repeats | max handoff lock ms | freeze p95/max ms | old freeze p95/max | object pause p95/max (n) | lock frac | resets | G3 | G4 | G5 | G6 | G7 |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
 foreach ($c in $cells) {
-    $md += "| $($c.scenario) | $($c.profile) | $($c.disk) | $($c.role) | $($c.repeats)$(if (-not $c.complete) { ' (INCOMPLETE)' }) | $($c.max_handoff_lock_ms) | $($c.freeze_p95_ms)/$($c.freeze_max_ms) | $($c.lock_fraction) | $($c.break_resets) | $($c.gates.G3) | $($c.gates.G4) | $($c.gates.G5) | $($c.gates.G6) | $($c.gates.G7) |"
+    $md += "| $($c.scenario) | $($c.profile) | $($c.disk) | $($c.role) | $($c.repeats)$(if (-not $c.complete) { ' (INCOMPLETE)' }) | $($c.max_handoff_lock_ms) | $($c.freeze_p95_ms)/$($c.freeze_max_ms) | $($c.old_freeze_p95_ms)/$($c.old_freeze_max_ms) | $($c.pause_p95_ms)/$($c.pause_max_ms) ($($c.pause_count)) | $($c.lock_fraction) | $($c.break_resets) | $($c.gates.G3) | $($c.gates.G4) | $($c.gates.G5) | $($c.gates.G6) | $($c.gates.G7) |"
 }
 $md += ''; $md += "G8: $g8"; $md += ''; $md += 'Conservation (shared_loot):'
 foreach ($c in $conservation) { $md += "- $($c.run)$(if ($c.kill) { ' kill=' + $c.kill }): total $($c.gained) (drops left $($c.drops_left_host)) vs expected $($c.expected): $(if ($c.ok) { 'PASS' } else { 'FAIL' })" }
