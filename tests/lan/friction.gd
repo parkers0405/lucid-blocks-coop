@@ -225,6 +225,9 @@ func _physics_process(_delta: float) -> void:
         "atk": 1 if Input.is_action_pressed("attack") else 0, "brk": 1 if breaking else 0, "prog": snappedf(progress, 0.01), "rst": reset,
         "sim": 1 if Ref.world.simulate_enabled else 0, "ent": 1 if (is_instance_valid(spawner) and spawner.process_mode != Node.PROCESS_MODE_DISABLED) else 0,
         "ld": 0 if Ref.world.is_all_loaded() else 1, "q": fault_queue.pending.size() if fault_queue != null else -1}
+    row["ii"] = 1 if Ref.player.is_interacting() else 0
+    row["hi"] = Ref.player.held_item.get_class() if is_instance_valid(Ref.player.held_item) else ""
+    row["bt"] = str(bb.get("target")) if bb != null and breaking else ""
     if parked is Dictionary and not parked.is_empty():
         row["ed"] = parked.size()
     tele.append(JSON.stringify(row))

@@ -1318,13 +1318,18 @@ func _end_canonical_install(replay: bool) -> void:
     installing_chunks.clear()
     var edits: Dictionary = installing_edits
     installing_edits = {}
-    if not replay:
-        return
+    var world = _canonical_world()
     for block_position in edits:
-        if int(edits[block_position]) <= 0:
-            _apply_loaded_network_break(block_position)
+        var block_id: int = int(edits[block_position])
+        if replay and is_instance_valid(world) and world.is_position_loaded(block_position):
+            if block_id <= 0:
+                _apply_loaded_network_break(block_position)
+            else:
+                _apply_loaded_network_place(block_position, block_id)
         else:
-            _apply_loaded_network_place(block_position, int(edits[block_position]))
+            # Aborted install (chunk partly overwritten) or the chunk unloaded meanwhile: the edit lands when the cell is next loaded.
+            _ensure_remote_world_scope()
+            pending_remote_block_changes[block_position] = block_id
 
 
 
@@ -6904,7 +6909,7 @@ func _autosave_host_world_if_needed() -> void:
 
 
 func _ensure_remote_world_scope() -> void:
-    var scope: String = terrain_epoch + "|" + get_active_dimension_instance_key()
+    var scope: String = get_active_dimension_instance_key()
     if pending_remote_scope != scope:
         pending_remote_block_changes.clear()
         pending_remote_water_changes.clear()
@@ -6922,6 +6927,8 @@ func _flush_pending_remote_world_changes() -> void:
             continue
         var block_id: int = int(pending_remote_block_changes[block_position])
         pending_remote_block_changes.erase(block_position)
+        if _park_installing_edit(block_position, block_id):
+            continue
         if block_id <= 0:
             _apply_loaded_network_break(block_position)
         else:
@@ -14173,6 +14180,8 @@ func _apply_network_block_changes(changes: Array) -> void:
             continue
         var block_position: Vector3i = entry[0]
         var block_id: int = int(entry[1])
+        if _park_installing_edit(block_position, block_id):
+            continue
         if not Ref.world.is_position_loaded(block_position):
             continue
 

@@ -73,7 +73,10 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
         $flagsOf = { param($f) @(([string]$f.f) -split ',' | Where-Object { $_ }) }
         $handoffLock = [bool[]]@($win | ForEach-Object { $_.lk -eq 1 -and (& $flagsOf $_ | Where-Object { $_ -in $HandoffFlags }) })
         $loading = [bool[]]@($win | ForEach-Object { [bool](& $flagsOf $_ | Where-Object { $_ -in $LoadingFlags }) })
-        $otherLock = [bool[]]@(for ($i = 0; $i -lt $win.Count; $i++) { $win[$i].lk -eq 1 -and -not $handoffLock[$i] -and -not $loading[$i] -and -not [bool](& $flagsOf $win[$i] | Where-Object { $_ -eq 'chest_lock_active' -and $win[$i].lk -eq 1 -and $false }) })
+        # Allowed G4 exception (logged): the open chest modal. A pickup lock (pickup_inventory_lock) is not an exception.
+        $chestOpen = [bool[]]@($win | ForEach-Object { $f = & $flagsOf $_; ($f -contains 'chest_lock_active') -and -not ($f -contains 'pickup_inventory_lock') })
+        $otherLock = [bool[]]@(for ($i = 0; $i -lt $win.Count; $i++) { $win[$i].lk -eq 1 -and -not $handoffLock[$i] -and -not $loading[$i] -and -not $chestOpen[$i] })
+        $chestOpenFrames = @($chestOpen | Where-Object { $_ }).Count
         $handoffRuns = Get-Runs $times $handoffLock
         $otherRuns = Get-Runs $times $otherLock
         $freezeFlags = [bool[]]@(for ($i = 0; $i -lt $win.Count; $i++) { ($win[$i].sim -eq 0 -or $win[$i].ent -eq 0) -and -not $loading[$i] })
@@ -104,7 +107,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
             run = $dir.Name; scenario = $config.scenario; profile = $(if ($config.solo) { 'solo' } else { $config.profile }); disk = $config.disk; role = $role
             elapsed_ms = $done.elapsed_ms; window_ms = $windowMs; frames = $win.Count
             handoff_lock_runs_ms = $handoffRuns; other_lock_ms = $otherRuns; lock_total_ms = (($handoffRuns | Measure-Object -Sum).Sum + ($otherRuns | Measure-Object -Sum).Sum)
-            switch_ms = $switchMs; switch_rejected = $switchRejected; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; movement_ignored_frames = $ignored
+            switch_ms = $switchMs; switch_rejected = $switchRejected; chest_modal_frames = $chestOpenFrames; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; movement_ignored_frames = $ignored
             break_resets = [int](($win | Measure-Object -Property rst -Sum).Sum)
             frame_p99_ms = (Get-Percentile $dts 0.99); frames_over_50ms = $over50
             pickup_p95_ms = $(if ($pickups -and $pickups.pickup_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ms) 0.95 } else { $null })

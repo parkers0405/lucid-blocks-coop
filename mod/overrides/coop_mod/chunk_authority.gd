@@ -52,7 +52,7 @@ static func map_hash(map: Dictionary) -> String:
     keys.sort()
     var lines := PackedStringArray()
     for key in keys:
-        lines.append("%s=%s" % [key, map[key]])
+        lines.append("%s=%d" % [key, int(map[key])])
     return "
 ".join(lines).sha256_text()
 

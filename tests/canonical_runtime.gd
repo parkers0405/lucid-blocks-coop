@@ -138,6 +138,15 @@ func run() -> int:
     check(guest.get_block_type_at(Vector3(late_position) + Vector3(0.5, 0.5, 0.5)).id <= 1, "edit made between slices survives the install")
     var parked = manager.get("installing_edits")
     check(parked is Dictionary and parked.is_empty() and manager.get("installing_chunks") is Dictionary and manager.get("installing_chunks").is_empty(), "replay map and install set are empty after the install")
+    # Review fixes: an aborted install keeps its parked edits for the next load; the parking check also covers the batched block-change path.
+    manager.installing_chunks[guest_chunk] = true
+    manager._apply_network_break(late_position)
+    manager._apply_network_block_changes([[late_position + Vector3i(1, 0, 0), 0]])
+    check(manager.installing_edits.size() == 2, "network edits on an installing chunk are parked on every path")
+    manager._end_canonical_install(false)
+    check(manager.installing_edits.is_empty() and manager.pending_remote_block_changes.size() == 2 and manager.installing_chunks.is_empty(), "aborted install moves parked edits to the pending list")
+    manager.pending_remote_block_changes.clear()
+    check(preload("res://coop_mod/chunk_authority.gd").map_hash({"a": 1}) == preload("res://coop_mod/chunk_authority.gd").map_hash({"a": 1.0}), "map hash ignores int versus float owners")
     manager.canonical_apply_busy = true
     check(not await manager._apply_canonical_terrain(patch), "queued application never acknowledges installation")
     await manager._apply_canonical_terrain(patch)
