@@ -89,3 +89,6 @@ Multiplayer Co-op mod For Lucid Blocks.
 - Player-Model: I put this player model in pretty fast but it is kinda fitting, I want to add more aniamtions to it, and add in easy way to get any 3d model playable, and be able to add skins, and pick skin in game.
 - Ender Chest: Minecraft like ender-chest.
 - Dedtcated server: Be able to host the server independent from lan or steam, and have a ton of players on one world for 2B2T vibes.
+
+## Status 2026-11-12 (handoff redesign)
+NOT READY. Protocol 6 is unchanged. Install-time edit replay, checkpoint ownership snapshot, transit set, peer epoch window and an unfrozen pre-prepare are in; the one-round-trip handoff (protocol 7) lives on build/h9-one-roundtrip-wip and is blocked (see playtest.md). Strict gates are reported per cell in playtest.md.
