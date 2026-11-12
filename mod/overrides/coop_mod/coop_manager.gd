@@ -538,6 +538,11 @@ func _lease_valid_bundles(bundles: Variant) -> bool:
 func _lease_install_incoming(instance: String, bundles: Array, terrain: Dictionary, respawns: Dictionary) -> void:
     if instance != get_active_dimension_instance_key() or not _can_sample_player():
         return
+    # Mark the incoming chunks now, before any await, so a network edit that lands before the slices start is parked instead of overwritten.
+    if not terrain.is_empty():
+        var mark_prefix: String = _resolve_dimension_namespace(terrain["dimension"], terrain["pocket_owner_key"]) + "_"
+        for chunk in terrain["world_data"].get(mark_prefix + "world", {}).get(mark_prefix + "chunk_block", {}):
+            installing_chunks[chunk] = true
     if not respawns.is_empty():
         _apply_private_respawns(instance, respawns["positions"], respawns["chunks"], true)
     for bundle in bundles:
@@ -549,7 +554,8 @@ func _lease_install_incoming(instance: String, bundles: Array, terrain: Dictiona
     var prefix: String = _resolve_dimension_namespace(terrain["dimension"], terrain["pocket_owner_key"]) + "_"
     chunk_authority.seed_versions(instance, terrain["world_data"].get(prefix + "world", {}), prefix, terrain.get("versions", {}))
     _merge_world_patch_into_cache(terrain)
-    await _apply_canonical_terrain(terrain)
+    if not await _apply_canonical_terrain(terrain):
+        _end_canonical_install(false)
 
 func _lease_stage_parts(ledger: Dictionary, objects: Dictionary, next_owners: Dictionary, recipient: int, recipient_key: String, instance: String) -> Array:
     var parts: Array = [{"objects": objects}]
@@ -575,6 +581,10 @@ func _lease_stage_parts(ledger: Dictionary, objects: Dictionary, next_owners: Di
     for batch in ChunkAuthority.batches(offscreen):
         parts.append({"bundles": batch})
     return parts
+
+# An object whose state is travelling to the other owner cannot be picked up: the new owner may already hold it.
+func _lease_pickup_blocked(instance: String, uuid: String) -> bool:
+    return lease_transit.has(instance + "|" + uuid)
 
 func _lease_end_switch() -> void:
     lease_transit.clear()
@@ -605,6 +615,8 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
         if _has_live_peer():
             cancel_runtime_lease.rpc(token, terrain_epoch)
         _lease_end_switch()
+        # A guest that cannot finish pre-prepare holds its terrain submits each time: wait before trying again.
+        lease_finished_at = Time.get_ticks_msec() + LEASE_MIN_INTERVAL_MS
         return
     var path: String = _profile_path(_get_local_player_key())
     var ledger: Dictionary = await _store_job(personal_store, "read_ledger", [path], {})
@@ -748,10 +760,19 @@ func lease_switched(token: String, new_epoch: int, ok: bool, body: PackedByteArr
         return
     var previous_epoch: int = int(ctx["previous_epoch"])
     if not chunk_authority.install_lease(new_epoch, ctx["proposal"], ctx["objects"]):
+        # The guest already flipped; peers must not stay split, so it reconnects and host recovery runs.
         _lease_end_switch()
+        _lease_kick_peer(sender)
         return
     lease_pending_install_epoch = new_epoch
     lease_pending_previous_chunks = ctx["previous_chunks"]
+    # Objects first seen in an outgoing chunk after T0 are in no bundle: the host keeps them (latched owner) so they cannot vanish.
+    var flip_instance: String = get_active_dimension_instance_key()
+    for node in _lease_live_nodes():
+        var spawned_uuid: String = _get_sync_uuid(node)
+        var spawned_key: String = flip_instance + "|" + spawned_uuid
+        if spawned_uuid != "" and not ctx["objects"].has(spawned_key) and lease_transit_chunks.has(ChunkAuthority.chunk_key(flip_instance, _lease_chunk(node.global_position))):
+            chunk_authority.lease_objects[spawned_key] = 1
     terrain_epoch = _lease_next_tag(new_epoch)
     lease_commit_gate_epoch = new_epoch
     var path: String = ctx["path"]
@@ -6551,6 +6572,8 @@ func _collect_claimed_pickup(peer: int, key: String, instance: String, uuid: Str
     var context_generation: int = save_queue.generation
     var context_file = Ref.save_file_manager.loaded_file
     var target_drop = _find_existing_drop_by_uuid(uuid)
+    if _lease_pickup_blocked(instance, uuid):
+        return {}
     if request.length() != 64 or not request.is_valid_hex_number() or lease_frozen or lease_preparing or epoch != terrain_epoch or chest_sessions.has(peer):
         return {}
     var receipt: String = ("pickup|" + key + "|" + instance + "|" + uuid + "|" + request).sha256_text()

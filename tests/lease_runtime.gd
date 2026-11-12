@@ -292,6 +292,16 @@ func run() -> int:
     sw.lease_transit[sw_object] = true
     await sw.lease_switched("tok", 2, true, PackedByteArray([1, 2, 3]))
     check(sw.kicked == [0] and sw.chunk_authority.lease_epoch == 1 and sw.lease_transit.is_empty() and not sw.lease_busy, "invalid SWITCHED body sends the guest to reconnect and changes nothing")
+    check(sw._lease_pickup_blocked("dimension:2", UUID) == false or sw.lease_transit.has(sw_object) == false, "pickup helper agrees with the transit set")
+    sw.lease_transit[sw_object] = true
+    check(sw._lease_pickup_blocked("dimension:2", UUID), "an object in transit cannot be picked up")
+    sw.lease_transit.clear()
+    sw.lease_busy = true
+    sw.lease_phase = "switching"
+    sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "proposal": {sw_key: 3}, "objects": {}, "transfers": [], "path": sw_path, "previous_epoch": 1, "previous_chunks": {}, "instance": "dimension:2", "generation": sw.save_queue.generation}
+    sw.kicked.clear()
+    await sw.lease_switched("tok", 2, true, sw._pack_body({"bundles": [], "terrain": {}, "instance": "dimension:2"}))
+    check(sw.kicked == [0] and sw.chunk_authority.lease_epoch == 1 and not sw.lease_busy, "a host install failure after the guest flipped kicks the guest instead of leaving the peers split")
     sw.lease_busy = true
     sw.lease_phase = "switching"
     sw.lease_switch_ctx = {"token": "tok", "epoch": 2, "proposal": {sw_key: 2}, "objects": {sw_object: 2}, "transfers": [], "path": sw_path, "previous_epoch": 1, "previous_chunks": {}, "instance": "dimension:2", "generation": sw.save_queue.generation}
