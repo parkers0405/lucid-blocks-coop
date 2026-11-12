@@ -26,6 +26,36 @@ func install_lease(epoch: int, chunks: Dictionary, objects: Dictionary) -> bool:
     lease_objects = objects.duplicate()
     return true
 
+# Ownership maps travel as a diff against the previous epoch. A key that left the map has value 0.
+static func owner_diff(prev: Dictionary, next: Dictionary) -> Dictionary:
+    var diff: Dictionary = {}
+    for key in next:
+        if prev.get(key) != next[key]:
+            diff[key] = next[key]
+    for key in prev:
+        if not next.has(key):
+            diff[key] = 0
+    return diff
+
+static func apply_diff(prev: Dictionary, diff: Dictionary) -> Dictionary:
+    var result: Dictionary = prev.duplicate()
+    for key in diff:
+        if diff[key] == 0:
+            result.erase(key)
+        else:
+            result[key] = diff[key]
+    return result
+
+# Insertion order does not matter: both peers compare this hash after applying a diff.
+static func map_hash(map: Dictionary) -> String:
+    var keys: Array = map.keys()
+    keys.sort()
+    var lines := PackedStringArray()
+    for key in keys:
+        lines.append("%s=%s" % [key, map[key]])
+    return "
+".join(lines).sha256_text()
+
 func object_owner(uuid: String, instance: String, chunk: Vector3i) -> int:
     return int(lease_objects.get(instance + "|" + uuid, leased_owner(chunk, instance)))
 
@@ -85,4 +115,10 @@ func seed(instance: String, root: Dictionary, prefix: String, versions: Dictiona
     for chunk in root.get(prefix + "chunk_block", {}):
         var key: String = chunk_key(instance, chunk)
         fingerprints[key] = _chunk_fingerprint(root, prefix, chunk)
+        revisions[key] = int(versions.get(key, 0))
+
+# Versions from the previous owner without a fingerprint: this side's next routine checkpoint sees the chunk as changed and makes it durable.
+func seed_versions(instance: String, root: Dictionary, prefix: String, versions: Dictionary) -> void:
+    for chunk in root.get(prefix + "chunk_block", {}):
+        var key: String = chunk_key(instance, chunk)
         revisions[key] = int(versions.get(key, 0))

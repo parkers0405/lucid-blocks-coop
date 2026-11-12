@@ -283,21 +283,39 @@ func save_checkpoint(path: String, state: Dictionary, revision: int, instance: S
     ledger["profiles"][key] = profile
     return profile if _write_ledger(path, ledger) else {}
 
-# Save the new owners and their lease number together.
-func commit_lease(path: String, epoch: int, chunks: Dictionary, objects: Dictionary, transfers: Array) -> bool:
+# Save the new owners and their lease number together. Transfers may race with pickups and spawns that happen while play continues:
+# a tombstoned uuid is skipped (a pickup already consumed it), a transfer with a captured bundle for a uuid the ledger has not seen is inserted
+# under the new owner, and a present uuid takes the new owner and the captured bundle. An old-owner mismatch still fails the whole commit.
+func commit_lease(path: String, epoch: int, chunks: Dictionary, objects: Dictionary, transfers: Array, allowed_scenes: Dictionary = {}) -> bool:
     var ledger: Dictionary = read_ledger(path)
     if ledger.is_empty() or epoch <= int(ledger.get("lease", {}).get("epoch", 0)) or chunks.size() > 32768 or objects.size() > 8192:
         return false
     for transfer in transfers:
         if not transfer is Dictionary or not Files.valid_component(str(transfer.get("new", ""))):
             return false
-        var record: Dictionary = ledger["instances"].get(transfer.get("instance"), {})
+        var instance = transfer.get("instance")
         var uuid = transfer.get("uuid")
-        if record.is_empty() or not record["nodes"].has(uuid) or record["owners"].get(uuid) != transfer.get("old") or record["tombstones"].has(uuid):
+        var bundle = transfer.get("bundle")
+        var record: Dictionary = ledger["instances"].get(instance, {})
+        if record.is_empty():
+            if bundle == null or not instance is String or not Files.valid_component(instance) or not transfer.get("dimension") is String:
+                return false
+            record = {"dimension": transfer["dimension"], "nodes": {}, "owners": {}, "observed": {}, "tombstones": {}}
+            ledger["instances"][instance] = record
+        if record["tombstones"].has(uuid):
+            continue
+        if bundle != null and (not InstanceEntities.valid_bundle(bundle, record["dimension"], allowed_scenes) or bundle["uuid"] != uuid):
+            return false
+        if not record["nodes"].has(uuid):
+            if bundle == null:
+                return false
+        elif record["owners"].get(uuid) != transfer.get("old"):
             return false
         var owner: String = transfer["new"]
         if not ledger["profiles"].has(owner):
             ledger["profiles"][owner] = _new_profile()
+        if bundle != null:
+            record["nodes"][uuid] = bundle.duplicate(true)
         record["owners"][uuid] = owner
         if not record["observed"].has(owner):
             record["observed"][owner] = {}

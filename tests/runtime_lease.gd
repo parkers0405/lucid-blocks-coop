@@ -28,6 +28,16 @@ func run() -> int:
     check(not authority.install_lease(1, {key: 1}, {}) and authority.leased_owner(chunk, instance) == 2, "old install epoch rejected")
     check(not authority.install_lease(2, {key: 3}, {}), "invalid rank rejected")
     check(not authority.install_lease(2, {key: 2.0}, {}), "non-integer rank rejected")
+    # H4: ownership diff, order-independent hash, versions seeded without fingerprints.
+    var prev_map: Dictionary = {"i:0,0,0": 1, "i:16,0,0": 2, "i:32,0,0": 2}
+    var next_map: Dictionary = {"i:16,0,0": 1, "i:32,0,0": 2, "i:48,0,0": 2}
+    var diff: Dictionary = Authority.owner_diff(prev_map, next_map)
+    check(diff == {"i:0,0,0": 0, "i:16,0,0": 1, "i:48,0,0": 2}, "owner diff lists changed and removed keys only")
+    check(Authority.apply_diff(prev_map, diff) == next_map, "apply_diff(prev, diff(prev, next)) == next")
+    check(Authority.map_hash(Authority.apply_diff(prev_map, diff)) == Authority.map_hash({"i:48,0,0": 2, "i:32,0,0": 2, "i:16,0,0": 1}) and Authority.map_hash(prev_map) != Authority.map_hash(next_map), "map hash ignores insertion order and tells maps apart")
+    var seeded = Authority.new()
+    seeded.seed_versions("i", {"chunk_block": {Vector3i.ZERO: PackedByteArray([1])}}, "", {"i:0,0,0": 7})
+    check(seeded.revisions.get("i:0,0,0") == 7 and seeded.fingerprints.is_empty(), "seed_versions sets revisions and leaves the fingerprint unset")
     var store = Store.new()
     var path: String = "user://runtime_lease_" + Crypto.new().generate_random_bytes(8).hex_encode() + "/host.bin"
     var guest_path: String = path.get_base_dir().path_join("guest.bin")
@@ -71,6 +81,21 @@ func run() -> int:
     var split: Dictionary = store.collect_drop(spill_path, 4, "d".repeat(64), "spill", UUID, func(_id): return 64)
     var split_items: Array = split["state"]["node"]["player"]["Inventory"]["items"]
     check(split_items[0][1] == 64 and split_items[2][1] == 3 and store.instance_bundles(path, "spill")["bundles"].is_empty(), "second pickup conserves all four items and removes exact UUID")
+    # H3: transfers racing with pickups and spawns while play continues.
+    var late: String = "33333333-3333-4333-8333-333333333333"
+    var late_bundle: Dictionary = {"uuid": late, "position": Vector3.ZERO, "scene_path": DROP, "save_data": {"naraka": {"node": {late: {"global_position": Vector3.ZERO}}}}}
+    var base_epoch: int = 10
+    var tomb: Array = [{"instance": "spill", "uuid": UUID, "old": "host", "new": "guest"}]
+    check(store.commit_lease(path, base_epoch, {}, {}, tomb) and store.read_ledger(path)["lease"]["epoch"] == base_epoch and store.read_ledger(path)["instances"]["spill"]["tombstones"].has(UUID) and not store.read_ledger(path)["instances"]["spill"]["owners"].has(UUID), "tombstoned transfer skipped, commit succeeds")
+    var insert: Array = [{"instance": "spill", "uuid": late, "old": "host", "new": "guest", "bundle": late_bundle}]
+    check(not store.commit_lease(path, base_epoch + 1, {}, {}, insert) and store.read_ledger(path)["lease"]["epoch"] == base_epoch, "bundle with a scene outside the allowed set rejected, epoch unchanged")
+    check(store.commit_lease(path, base_epoch + 1, {}, {}, insert, {DROP: true}) and store.read_ledger(path)["instances"]["spill"]["owners"][late] == "guest" and store.instance_bundles(path, "spill")["bundles"].size() == 1, "absent uuid with a bundle inserted under the new owner")
+    var update: Array = [{"instance": "spill", "uuid": late, "old": "guest", "new": "host", "bundle": late_bundle.duplicate(true)}]
+    update[0]["bundle"]["position"] = Vector3(7, 0, 0)
+    check(store.commit_lease(path, base_epoch + 2, {}, {}, update, {DROP: true}) and store.read_ledger(path)["instances"]["spill"]["owners"][late] == "host" and store.read_ledger(path)["instances"]["spill"]["nodes"][late]["position"] == Vector3(7, 0, 0), "present uuid takes the new owner and the captured bundle")
+    var wrong_owner: Array = [{"instance": "spill", "uuid": late, "old": "guest", "new": "guest"}]
+    check(not store.commit_lease(path, base_epoch + 3, {}, {}, wrong_owner) and store.read_ledger(path)["lease"]["epoch"] == base_epoch + 2, "owner mismatch still fails and leaves the epoch unchanged")
+    check(not store.commit_lease(path, base_epoch + 3, {}, {}, [{"instance": "spill", "uuid": "44444444-4444-4444-8444-444444444444", "old": "host", "new": "guest"}]), "absent uuid without a bundle still fails")
     var corrupt: Dictionary = store.read_ledger(path)
     corrupt["lease"]["objects"]["broken"] = 8
     check(store.files._replace_file(Store.storage_path(path), var_to_bytes(corrupt)) and store.read_ledger(path).is_empty(), "corrupt durable lease fails closed")

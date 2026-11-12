@@ -78,7 +78,7 @@ func run() -> int:
     check(store.save_checkpoint(guest_path, state, 0, "pocket__alice", "pocket", [], {SCENE: true}).get("revision") == 1, "guest pickup commits inventory and deletion")
     check(store.read_profile(guest_path)["state"] == state and store.instance_bundles(path, "pocket__alice")["bundles"].is_empty(), "successful pickup survives fresh read")
     check(store.save_checkpoint(path, empty, 2, "pocket__alice", "pocket", [alice], {SCENE: true}).get("revision") == 3 and store.instance_bundles(path, "pocket__alice")["bundles"].is_empty(), "permanent tombstone blocks stale former owner resurrection")
-    check(not store.commit_lease(path, 4, {}, {}, [{"instance": "pocket__alice", "uuid": UUID_A, "old": "alice", "new": "guest"}]), "tombstone cannot transfer")
+    check(store.commit_lease(path, 4, {}, {}, [{"instance": "pocket__alice", "uuid": UUID_A, "old": "alice", "new": "guest"}]) and store.instance_bundles(path, "pocket__alice")["bundles"].is_empty() and not store.read_ledger(path)["instances"]["pocket__alice"]["owners"].has(UUID_A), "tombstone cannot transfer: the transfer is skipped and the object stays deleted")
     var bob: Dictionary = bundle(UUID_B, "pocket")
     var bob_path: String = manager._profile_path("bob")
     check(store.save_checkpoint(bob_path, empty, 0, "pocket__bob", "pocket", [bob], {SCENE: true}).get("revision") == 1, "second private instance checkpoint")
