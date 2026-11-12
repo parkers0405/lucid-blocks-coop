@@ -51,3 +51,5 @@ try {
 finally { Stop-Strays }
 if ($notRun.Count) { Add-Content -LiteralPath $log -Value ("NOT RUN (batch time cap): " + ($notRun -join ', ')) }
 & (Join-Path $PSScriptRoot '../tests/lan/summarize.ps1') -Batch $runs
+# Retention: finished runs lose copied binaries/inputs, logs and results stay; the 5 newest failed runs stay in full.
+& (Join-Path $PSScriptRoot 'prune_runs.ps1') -Runs $runs
