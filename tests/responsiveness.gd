@@ -272,5 +272,16 @@ func run() -> int:
             living_mismatch += 1
     check(living_mismatch == 0, "living block scene path reads the 5.2 Block property for every block")
     living.free()
+    var cells := Probe.new()
+    add_child(cells)
+    var scanned: Dictionary = {"dimension_instance_key": "dimension:2", "bucket": Vector3i.ZERO, "last_scan_msec": Time.get_ticks_msec(), "levels": {Vector3i(1, 2, 3): 4}}
+    cells.host_water_snapshot_cache = {7: scanned.duplicate(true)}
+    cells.host_fire_snapshot_cache = {7: scanned.duplicate(true)}
+    cells._invalidate_host_dynamic_cell_caches()
+    var diff_ready: bool = true
+    for cache in [cells.host_water_snapshot_cache, cells.host_fire_snapshot_cache]:
+        diff_ready = diff_ready and cache.has(7) and cache[7]["levels"] == scanned["levels"] and not cells._can_skip_host_dynamic_cell_rescan(cache[7], Vector3i.ZERO)
+    check(diff_ready, "a host terrain edit rescans water and fire as a diff, not a full 420 KB resync per kind")
+    cells.free()
     print("RESPONSIVENESS_RESULT ", checks, " checks ", failures, " failures")
     return failures

@@ -8613,11 +8613,14 @@ func _apply_storage_inventory_snapshot(block_position: Vector3i, serialized_item
     applying_remote_storage_positions.erase(block_position)
 
 
+# A terrain edit forces the next scan but keeps the last levels, so the guest gets a diff. Clearing the cache forced a full
+# resync (every cell of the window, about 420 KB per kind) on each edit, which queued seconds ahead of every reliable RPC at 150 ms RTT.
 func _invalidate_host_dynamic_cell_caches() -> void:
     if not multiplayer.is_server():
         return
-    host_water_snapshot_cache.clear()
-    host_fire_snapshot_cache.clear()
+    for cache in [host_water_snapshot_cache, host_fire_snapshot_cache]:
+        for peer_id in cache:
+            cache[peer_id]["last_scan_msec"] = 0
 
 
 func _get_water_sync_bucket(center: Vector3) -> Vector3i:
