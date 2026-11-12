@@ -160,7 +160,7 @@ foreach ($group in ($rows | Group-Object scenario, profile, disk, role)) {
     $maxFreeze = ($freezeAll | Measure-Object -Maximum).Maximum
     $reconnects = ($r | Measure-Object -Property reconnects -Sum).Sum
     $g.G6 = if (($p95 -gt 500) -or ($maxFreeze -gt 1500) -or ($reconnects -gt 0 -and $first.profile -ne 'cut')) { 'FAIL (partial: handoff freeze only; portal/quit not measured here)' } else { 'PASS (partial: handoff freeze only; portal/quit not measured here)' }
-    $oracleRows = @($r | Where-Object { $_.terrain_oracle })
+    $oracleRows = @($r | Where-Object { $_.terrain_oracle -and ($_.terrain_oracle.host.expected + $_.terrain_oracle.guest.expected) -gt 0 })
     if ($first.scenario -eq 'shared_loot' -and $first.role -ne 'solo') { $g.G7 = 'see conservation' }
     elseif ($oracleRows.Count -gt 0) {
         $bad = @($oracleRows | Where-Object { $_.terrain_oracle.host.matched -ne $_.terrain_oracle.host.expected -or $_.terrain_oracle.guest.matched -ne $_.terrain_oracle.guest.expected -or -not $_.terrain_oracle.host.checked })

@@ -1,5 +1,5 @@
 # Lucid Blocks co-op state
-Updated 2026-11-12. NOT READY. H0-H8 of the one-round-trip handoff are in (commits 517e585..490e33d, protocol 6 still). H9 (protocol 7) is on build/h9-one-roundtrip-wip and BLOCKED: after the first handoff the host reply to every guest pickup is not delivered under the typical relay (guest reconnects), though the handoff itself shows 0 lock frames and switch p95 317 ms. H10, H11, the gate matrix and the reviewer pass are not done. Host mining (4 of 20) still unexplained. See top entry of playtest.md.
+Updated 2026-11-12. NOT READY (G4, G5, G6, G9 fail; conservation, terrain oracle and G8 pass). Kept tree: protocol 6 + H3-H8 + review fixes (8b8dd5a). H9 (protocol 7) is on build/h9-one-roundtrip-wip, unresolved: host reply receive_durable_pickup never reaches the guest under the relay. RESUME: root-cause H9 or lower freeze on protocol 6 (clean+fast handoff lock 233 ms vs 150 limit; typical+slow 4.4 s); host mining 4/20 under latency; build water_travel, quit_midaction, host-kill, reorder-free AUTH control. Details: playtest.md top entry.
 
 - Branch: fix/review-ready-compatibility. Preserve102unrelated.import edits and status-only test line endings.
 - Scope: smooth two-player gameplay with compatibility/functionality retained. No PR creation, merge, main push, installation or release performed.
