@@ -92,3 +92,5 @@ Multiplayer Co-op mod For Lucid Blocks.
 
 ## Status 2026-11-12 (handoff redesign)
 NOT READY. Protocol 6 is unchanged. Install-time edit replay, checkpoint ownership snapshot, transit set, peer epoch window and an unfrozen pre-prepare are in; the one-round-trip handoff (protocol 7) lives on build/h9-one-roundtrip-wip and is blocked (see playtest.md). Strict gates are reported per cell in playtest.md.
+
+Update: protocol 7 (one-round-trip handoff) is now on this branch; the earlier statement that it is blocked was wrong (root cause: water/fire snapshot cache flood, fixed). Still NOT READY, see playtest.md.

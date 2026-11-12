@@ -12,3 +12,5 @@ Update: realistic-latency cells show the handoff needs fewer sequential round tr
 
 ## Resume 2026-11-12
 1. Decide H9: root-cause why the host reply receive_durable_pickup never reaches the guest under the typical relay after a protocol-7 switch (reliable channel is alive; sync_canonical_terrain and sync_break_block arrive; RPC table change, priority lane, deferred install and lease_activated were each ruled out). 2. Host mining under latency (4 of 20; clean passes 20). 3. Build water_travel, quit_midaction, host-kill and install-time kill points. 4. Rerun the full matrix; status wording stays NOT READY until every gate passes in one run.
+
+Update 2026-11-12: supersedes the H9 resume list above. Open: spike+failing host freeze 9.5 s, G5 pickup latency metric, ref_count x3, cut host lock 197 ms, water_travel, host-kill autosave, reorder-free AUTH control, a fresh review of the merged H9 code.

@@ -60,3 +60,5 @@ Strict LAN still FAILS host12/guest13errors:2/3offline Steam achievement calls a
 
 ## 2026-11-12 review follow-up
 Fixed after the fresh review: aborted installs no longer discard parked edits, replay checks the cell is loaded, the batched and pending block-change paths honour parking, the pending scope no longer resets at a handoff, ownership hashes ignore int/float differences. H9-only findings (post-T0 spawns, tombstoned-but-installed bundles, failed host install after the guest flipped) are not applicable on this tree and remain open for the H9 branch.
+
+Update 2026-11-12: H9 review findings 1, 4, 5, 6 are implemented (installing chunks marked early, in-transit pickups refused, post-T0 spawns kept by the host, failed host install kicks the guest). Findings 4 and 5 have no end-to-end regression, only the helper check for 4.

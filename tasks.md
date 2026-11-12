@@ -2,8 +2,9 @@
 - [x] H0 instrumentation (517e585), H1 ordering proof (517e585), H2 terrain oracle (490e33d)
 - [x] H3 commit_lease rules, H4 ownership diff (31da55d); H5 install replay, H6 checkpoint snapshot, H7 transit and epoch window, H8 pre-prepare (92af9c5)
 - [ ] H8b lost hits on transit mobs: not measured (no mobs in the scenarios)
-- [ ] H9 SWITCH/SWITCHED/ACTIVATED: implemented on build/h9-one-roundtrip-wip, BLOCKED by undelivered pickup replies under the relay (playtest.md 2026-11-12)
-- [ ] H10 recovery and quit kill points; H11 full gate matrix; reviewer pass; README, architecture, gameplay-audit, CONTINUATION, retro updates
+- [x] H9 SWITCH/SWITCHED/ACTIVATED merged (aaa7bfd); the earlier blocker was the water/fire cache flood (4154294)
+- [~] H10 quit_midaction and protocol-7 kill points built; host-kill, water_travel, reorder-free AUTH control open
+- [~] H11 matrix final-matrix3 run, NOT READY (see playtest.md)
 
 # Current work — gameplay quality
 
