@@ -12,7 +12,7 @@ class_name Bubblebear extends Entity
 @onready var anim: AnimationTree = %BubblebearModel.get_node("%AnimationTree")
 @onready var ambient_sound_enabled: bool = %AmbientSound.enabled
 
-enum {IDLE, WALK, PANIC, ANGRY}
+enum {IDLE, WALK, PANIC}
 
 var state: int = IDLE
 var will_jump: bool = false
@@ -72,15 +72,6 @@ func _physics_process(delta: float) -> void :
 
     if dead:
         desired_direction = Vector3()
-    elif state == ANGRY:
-        if is_instance_valid(panic_source):
-            var chase: Vector3 = panic_source.global_position - global_position
-            chase.y = 0.0
-            set_desired_direction(chase.normalized())
-            will_jump = will_jump or (is_on_floor() and %JumpRayCast.is_colliding())
-        else:
-            state = IDLE
-        anim["parameters/fear/blend_amount"] = lerp(anim["parameters/fear/blend_amount"], 1.0, delta * 8.0)
     elif state == PANIC:
         if is_instance_valid(panic_source):
             last_source_position = panic_source.global_position
