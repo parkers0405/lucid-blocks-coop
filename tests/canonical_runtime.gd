@@ -16,6 +16,8 @@ class Manager extends "res://coop_mod/coop_manager.gd":
         pass
     func _physics_process(_delta: float) -> void:
         pass
+    func _apply_loaded_network_break(block_position: Vector3i) -> void:
+        fixture_world.break_block_at(block_position, true, false)
     func _can_sample_player() -> bool:
         return fixture_world != null and fixture_world.load_enabled
     func get_active_dimension_instance_key() -> String:
@@ -116,6 +118,26 @@ func run() -> int:
     check(guest.get_block_type_at(Vector3(1025.5, 0.5, 0.5)).id == solid, "canonical terrain updates actual loaded voxel")
     check(guest.get_water_level_at(Vector3(1026.5, 0.5, 0.5)) == 4, "canonical water applied")
     check(guest.get_fire_at(Vector3(1032.5, 0.5, 0.5)) == 5, "canonical fire applied after neighboring water removal")
+    # H5: an edit that arrives between two slices of a chunk install must survive it. Cell 4000 is solid in the canonical copy; the guest breaks it mid-install.
+    var late_cell: int = 4000
+    var late_position := Vector3i(guest_chunk + Vector3i(late_cell % 16, late_cell / 256, (late_cell / 16) % 16))
+    root["naraka_chunk_block"][guest_chunk][late_cell] = solid
+    guest.place_block_at(Vector3(late_position) + Vector3(0.5, 0.5, 0.5), ItemMap.map(solid), false, false)
+    check(guest.get_block_type_at(Vector3(late_position) + Vector3(0.5, 0.5, 0.5)).id == solid, "late cell solid before the race")
+    var install := {"done": false}
+    var runner := func():
+        install["ok"] = await manager._apply_canonical_terrain(patch)
+        install["done"] = true
+    runner.call_deferred()
+    await get_tree().process_frame
+    await get_tree().process_frame
+    check(manager.canonical_apply_busy and not install["done"], "install yields between slices")
+    manager._apply_network_break(late_position)
+    while not install["done"]:
+        await get_tree().process_frame
+    check(guest.get_block_type_at(Vector3(late_position) + Vector3(0.5, 0.5, 0.5)).id <= 1, "edit made between slices survives the install")
+    var parked = manager.get("installing_edits")
+    check(parked is Dictionary and parked.is_empty() and manager.get("installing_chunks") is Dictionary and manager.get("installing_chunks").is_empty(), "replay map and install set are empty after the install")
     manager.canonical_apply_busy = true
     check(not await manager._apply_canonical_terrain(patch), "queued application never acknowledges installation")
     await manager._apply_canonical_terrain(patch)

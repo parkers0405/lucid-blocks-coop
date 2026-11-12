@@ -48,10 +48,15 @@ var guest_checkpoint_busy: bool = false
 var background_checkpoint_busy: bool = false
 var background_checkpoint_cancelled: bool = false
 var durable_checkpoint_waiters: int = 0
+# Profile checkpoints between their ownership snapshot and their ledger write; a lease commit waits for zero so no old-epoch save reaches the queue after it.
+var checkpoints_in_flight: int = 0
 var guest_checkpoint_locks_player: bool = false
 var guest_checkpoint_was_disabled: bool = false
 var canonical_apply_busy: bool = false
 var pending_canonical_patches: Array = []
+# Chunks whose canonical terrain is being installed in slices; edits that land on them wait here (cell -> block id, 0 = break) and replay after the last slice.
+var installing_chunks: Dictionary = {}
+var installing_edits: Dictionary = {}
 const InstanceEntities = preload("res://coop_mod/instance_entities.gd")
 var allowed_preserved_scenes: Dictionary = {}
 var lease_frozen: bool = false
@@ -84,6 +89,7 @@ var pickup_checkpoint_allowed: bool = false
 var lease_started_at: int = 0
 const LEASE_HYSTERESIS: float = 32.0
 const LEASE_MIN_INTERVAL_MS: int = 3000
+const LEASE_PREPARE_TIMEOUT_MS: int = 3000
 var lease_finished_at: int = 0
 var lease_recommit_needed: bool = false
 # Highest epoch whose write-behind commit failed; a later successful commit at or above it clears the flag.
@@ -111,20 +117,23 @@ func owns_runtime_node(node: Node3D) -> bool:
     var uuid: String = _assign_sync_uuid(node)
     var key: String = get_active_dimension_instance_key() + "|" + uuid
     var chunk: Vector3i = _lease_chunk(node.global_position)
+    if lease_transit.has(key) or (not chunk_authority.lease_objects.has(key) and lease_transit_chunks.has(ChunkAuthority.chunk_key(get_active_dimension_instance_key(), chunk))):
+        return false
     if not chunk_authority.lease_objects.has(key):
         chunk_authority.lease_objects[key] = _leased_chunk_owner(chunk, get_active_dimension_instance_key())
         lease_origins[key] = chunk
     var owner: int = chunk_authority.lease_objects[key]
     return owner == (1 if multiplayer.is_server() else 2)
 
-func _bundle_runtime_owner(bundle: Dictionary, instance: String) -> int:
+func _bundle_runtime_owner(bundle: Dictionary, instance: String, view: Variant = null) -> int:
+    var objects: Dictionary = chunk_authority.lease_objects if view == null else view
     var key: String = instance + "|" + str(bundle["uuid"])
-    if not chunk_authority.lease_objects.has(key):
+    if not objects.has(key):
         var origin = bundle.get("lease_origin_chunk", _lease_chunk(bundle["position"]))
         if not origin is Vector3i:
             return 0
-        chunk_authority.lease_objects[key] = _leased_chunk_owner(origin, instance)
-    return int(chunk_authority.lease_objects[key])
+        objects[key] = _leased_chunk_owner(origin, instance)
+    return int(objects[key])
 
 func _freeze_lease_runtime() -> void:
     lease_started_at = Time.get_ticks_msec()
@@ -187,6 +196,15 @@ func _enforce_runtime_leases() -> void:
 func can_mutate_runtime_node(node: Node3D) -> bool:
     return not lease_preparing and (node != Ref.player or not chest_lock_active or pickup_inventory_lock) and owns_runtime_node(node)
 
+# A guest that applied a switch accepts the host's previous tag until the host's activation arrives; everywhere else the tag must match exactly.
+var lease_window_epoch: String = ""
+# uuid keys ("instance|uuid") and chunk keys whose state is travelling to the other owner; those nodes pause until the install.
+var lease_transit: Dictionary = {}
+var lease_transit_chunks: Dictionary = {}
+
+func _peer_epoch_ok(epoch: String) -> bool:
+    return epoch == terrain_epoch or (not lease_window_epoch.is_empty() and epoch == lease_window_epoch)
+
 func _valid_runtime_sender(sender: int, epoch: String) -> bool:
     var state: Dictionary = peer_states.get(sender, {})
     if not multiplayer.is_server() or not admitted_player_keys.has(sender):
@@ -200,7 +218,7 @@ func _valid_runtime_sender(sender: int, epoch: String) -> bool:
 @rpc("authority", "call_remote", "reliable")
 func apply_leased_entity_attack(uuid: String, position: Vector3, damage: int, knockback: float, fly: float, burn: bool, epoch: String) -> void:
     var target = _find_existing_entity_by_uuid(uuid)
-    if multiplayer.is_server() or epoch != terrain_epoch or not is_instance_valid(target) or not can_mutate_runtime_node(target):
+    if multiplayer.is_server() or not _peer_epoch_ok(epoch) or not is_instance_valid(target) or not can_mutate_runtime_node(target):
         return
     var host: Dictionary = peer_states.get(1, {})
     if host.get("dimension_instance_key") != get_active_dimension_instance_key() or Vector3(host.get("position", Vector3.INF)).distance_to(target.global_position) > ENTITY_ATTACK_REQUEST_MAX_DISTANCE + 1.25:
@@ -213,7 +231,7 @@ func apply_leased_entity_attack(uuid: String, position: Vector3, damage: int, kn
 @rpc("authority", "call_remote", "reliable")
 func apply_leased_entity_ignite(uuid: String, epoch: String) -> void:
     var target = _find_existing_entity_by_uuid(uuid)
-    if multiplayer.is_server() or epoch != terrain_epoch or not is_instance_valid(target) or not can_mutate_runtime_node(target) or not target.has_node("%Burn"):
+    if multiplayer.is_server() or not _peer_epoch_ok(epoch) or not is_instance_valid(target) or not can_mutate_runtime_node(target) or not target.has_node("%Burn"):
         return
     if Vector3(peer_states.get(1, {}).get("position", Vector3.INF)).distance_to(target.global_position) <= 7.0:
         target.get_node("%Burn").ignite()
@@ -370,8 +388,8 @@ func request_runtime_lease(instance: String, chunks: Array, positions: Dictionar
         if chunk_authority.object_owner(uuid, instance, _lease_chunk(positions[uuid])) == 2:
             lease_guest_positions[instance + "|" + uuid] = positions[uuid]
 
-func _wait_lease_ack(token: String) -> bool:
-    var deadline: int = Time.get_ticks_msec() + _lease_ack_timeout_ms()
+func _wait_lease_ack(token: String, timeout_ms: int = -1) -> bool:
+    var deadline: int = Time.get_ticks_msec() + (_lease_ack_timeout_ms() if timeout_ms < 0 else timeout_ms)
     while lease_token == token and not lease_ack.get("done", false) and _has_live_peer() and Time.get_ticks_msec() < deadline:
         await get_tree().process_frame
     return lease_token == token and lease_ack.get("done", false) and lease_ack.get("ok", false)
@@ -390,6 +408,21 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
     var token: String = lease_token
     var generation: int = save_queue.generation
     var file = Ref.save_file_manager.loaded_file
+    lease_ack = {}
+    # Unfrozen pre-prepare: both sides save what they can while play continues, so the barrier below has little left to do.
+    lease_phase = "prepare"
+    lease_prepare.rpc(token, terrain_epoch)
+    var host_prepared: bool = await _checkpoint_local_host_world()
+    var guest_prepared: bool = await _wait_lease_ack(token, LEASE_PREPARE_TIMEOUT_MS)
+    if lease_token != token or not _same_save_context(generation, file):
+        return
+    if not host_prepared or not guest_prepared:
+        if _has_live_peer():
+            cancel_runtime_lease.rpc(token, terrain_epoch)
+        lease_busy = false
+        lease_phase = ""
+        lease_finished_at = Time.get_ticks_msec()
+        return
     lease_ack = {}
     lease_phase = "collect"
     lease_was_disabled = _disabled_before_checkpoint()
@@ -487,8 +520,47 @@ func _handoff_runtime_lease(proposal: Dictionary) -> void:
         status_message = "Lease installation was not acknowledged; gameplay remains frozen for safe reconnect"
         _update_status_text()
 
+# Guest side of the pre-prepare: routine terrain submits are held (3 s at most) until the freeze, a cancel, or the timeout.
+var lease_prepared_token: String = ""
+var lease_hold_until: int = 0
+
+func _lease_hold_active() -> bool:
+    if lease_prepared_token.is_empty():
+        return false
+    if Time.get_ticks_msec() >= lease_hold_until:
+        lease_prepared_token = ""
+        return false
+    return true
+
+@rpc("authority", "call_remote", "reliable")
+func lease_prepare(token: String, epoch: String) -> void:
+    if multiplayer.is_server() or not _peer_epoch_ok(epoch) or lease_busy or chest_lock_active or not _is_local_session_player_active() or not Ref.world.is_all_loaded():
+        acknowledge_runtime_lease.rpc_id(1, token, "prepare", terrain_epoch, false)
+        return
+    lease_prepared_token = token
+    lease_hold_until = Time.get_ticks_msec() + LEASE_PREPARE_TIMEOUT_MS
+    var ok: bool = await _lease_presync(token)
+    if lease_prepared_token == token:
+        acknowledge_runtime_lease.rpc_id(1, token, "prepare", terrain_epoch, ok)
+
+# Wait for any routine checkpoint in flight (so READY never overlaps it), then save the profile and the terrain delta without locking anything.
+func _lease_presync(token: String) -> bool:
+    var generation: int = save_queue.generation
+    var file = Ref.save_file_manager.loaded_file
+    var deadline: int = Time.get_ticks_msec() + LEASE_PREPARE_TIMEOUT_MS - 500
+    while (background_checkpoint_busy or guest_checkpoint_busy) and Time.get_ticks_msec() < deadline:
+        await get_tree().process_frame
+    if background_checkpoint_busy or guest_checkpoint_busy or lease_prepared_token != token or not _same_save_context(generation, file):
+        return false
+    var profile_ok: bool = await _await_profile_checkpoint()
+    if lease_prepared_token != token or not _same_save_context(generation, file):
+        return false
+    await _checkpoint_terrain_in_background()
+    return profile_ok and lease_prepared_token == token
+
 @rpc("authority", "call_remote", "reliable")
 func freeze_runtime_lease(token: String, epoch: String) -> void:
+    lease_prepared_token = ""
     if multiplayer.is_server() or epoch != terrain_epoch or lease_busy:
         return
     if chest_lock_active or not _is_local_session_player_active() or not Ref.world.is_all_loaded():
@@ -526,6 +598,9 @@ func _accept_runtime_lease_ack(token: String, phase: String, epoch: String, ok: 
 
 @rpc("authority", "call_remote", "reliable")
 func cancel_runtime_lease(token: String, epoch: String) -> void:
+    if token == lease_prepared_token:
+        lease_prepared_token = ""
+        return
     if token == lease_token and epoch == terrain_epoch:
         _resume_lease_runtime()
 
@@ -868,7 +943,15 @@ func _private_respawn_checkpoint(key: String, state: Dictionary, instance: Strin
     return {"ok": true, "update": update}
 
 func _commit_player_checkpoint(key: String, state: Dictionary, instance: String, dimension: int, bundles: Array, skip_unchanged: bool = false) -> Dictionary:
+    checkpoints_in_flight += 1
+    var result: Dictionary = await _commit_player_checkpoint_inner(key, state, instance, dimension, bundles, skip_unchanged)
+    checkpoints_in_flight -= 1
+    return result
+
+func _commit_player_checkpoint_inner(key: String, state: Dictionary, instance: String, dimension: int, bundles: Array, skip_unchanged: bool) -> Dictionary:
     var expected_lease: int = chunk_authority.lease_epoch if chunk_authority.lease_epoch > 0 and (_has_live_peer() or lease_busy) else -1
+    # Filter bundles with the ownership view that matches expected_lease; the epoch may flip during the awaits below.
+    var objects_view: Dictionary = chunk_authority.lease_objects.duplicate()
     var context_generation: int = save_queue.generation
     var context_file = Ref.save_file_manager.loaded_file
     if lease_frozen and not lease_checkpoint_allowed:
@@ -889,7 +972,7 @@ func _commit_player_checkpoint(key: String, state: Dictionary, instance: String,
     for bundle in bundles:
         if not InstanceEntities.valid_bundle(bundle, SaveFile.DIMENSION_MAP[dimension], _preserved_scene_paths()):
             return {}
-        if (not _has_live_peer() and not lease_busy) or _bundle_runtime_owner(bundle, instance) == rank:
+        if (not _has_live_peer() and not lease_busy) or _bundle_runtime_owner(bundle, instance, objects_view) == rank:
             owned.append(bundle)
     var result: Dictionary = await _store_job(personal_store, "save_checkpoint", [path, saved, int(state.get("_coop_revision", -1)), _ledger_instance_key(instance), SaveFile.DIMENSION_MAP[dimension], owned, _preserved_scene_paths(), respawns["update"], skip_unchanged, expected_lease], {})
     if not _same_save_context(context_generation, context_file):
@@ -1042,7 +1125,7 @@ func filter_local_checkpoint(data: Dictionary, prefix: String) -> Dictionary:
     var chunks: Array = []
     var local_owner: int = 1 if multiplayer.is_server() else 2
     for chunk in data.get(prefix + "world", {}).get(prefix + "chunk_block", {}):
-        if _leased_chunk_owner(chunk, instance) == local_owner:
+        if _leased_chunk_owner(chunk, instance) == local_owner and not lease_transit_chunks.has(ChunkAuthority.chunk_key(instance, chunk)):
             chunks.append(chunk)
     var filtered: Dictionary = _filter_world_data_to_chunk_positions(data, prefix, chunks)
     if filtered.is_empty():
@@ -1056,7 +1139,7 @@ func filter_local_checkpoint(data: Dictionary, prefix: String) -> Dictionary:
 func _tick_canonical_terrain(delta: float) -> void:
     if suppress_local_game_quit_session_shutdown or receiving_host_world or client_restore_in_progress or reconnect_pending:
         return
-    if lease_busy or not _has_live_peer() or not _can_sample_player() or terrain_sync_busy or canonical_apply_busy or not pending_canonical_patches.is_empty():
+    if lease_busy or not _has_live_peer() or not _can_sample_player() or terrain_sync_busy or _lease_hold_active() or canonical_apply_busy or not pending_canonical_patches.is_empty():
         return
     if not Ref.world.is_all_loaded():
         return
@@ -1084,7 +1167,7 @@ func _tick_canonical_terrain(delta: float) -> void:
 
 @rpc("authority", "call_remote", "reliable")
 func sync_canonical_terrain(patch: Dictionary) -> void:
-    if multiplayer.is_server() or patch.get("epoch") != terrain_epoch:
+    if multiplayer.is_server() or not _peer_epoch_ok(patch.get("epoch")):
         return
     var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
     chunk_authority.seed(patch["dimension_instance_key"], patch.get("world_data", {}).get(prefix + "world", {}), prefix, patch.get("versions", {}))
@@ -1171,6 +1254,8 @@ func _apply_canonical_terrain(patch: Dictionary) -> bool:
     var root: Dictionary = patch["world_data"].get(prefix + "world", {})
     var budget_start: int = Time.get_ticks_usec()
     for chunk in root.get(prefix + "chunk_block", {}):
+        installing_chunks[chunk] = true
+    for chunk in root.get(prefix + "chunk_block", {}):
         var region: Dictionary = {}
         for channel in RegionCheckpoint.CHANNELS:
             region[channel] = {}
@@ -1194,6 +1279,7 @@ func _apply_canonical_terrain(patch: Dictionary) -> bool:
             if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= 2000:
                 await get_tree().process_frame
                 if world != _canonical_world() or instance != get_active_dimension_instance_key() or patch.get("epoch") != terrain_epoch:
+                    _end_canonical_install(false)
                     canonical_apply_busy = false
                     return false
                 budget_start = Time.get_ticks_usec()
@@ -1210,12 +1296,35 @@ func _apply_canonical_terrain(patch: Dictionary) -> bool:
             if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= 2000:
                 await get_tree().process_frame
                 if world != _canonical_world() or instance != get_active_dimension_instance_key() or patch.get("epoch") != terrain_epoch:
+                    _end_canonical_install(false)
                     canonical_apply_busy = false
                     return false
                 budget_start = Time.get_ticks_usec()
+    _end_canonical_install(true)
     canonical_apply_busy = false
     _drain_canonical_queue()
     return true
+
+
+# Edits to a chunk that is mid-install must not land between slices (the next slice would overwrite them), so they wait for the install.
+func _park_installing_edit(block_position: Vector3i, block_id: int) -> bool:
+    if installing_chunks.is_empty() or not installing_chunks.has(_lease_chunk(Vector3(block_position))):
+        return false
+    installing_edits[block_position] = block_id
+    return true
+
+
+func _end_canonical_install(replay: bool) -> void:
+    installing_chunks.clear()
+    var edits: Dictionary = installing_edits
+    installing_edits = {}
+    if not replay:
+        return
+    for block_position in edits:
+        if int(edits[block_position]) <= 0:
+            _apply_loaded_network_break(block_position)
+        else:
+            _apply_loaded_network_place(block_position, int(edits[block_position]))
 
 
 
@@ -6281,7 +6390,7 @@ func _apply_pickup_remainder(uuid: String, bundle: Dictionary) -> void:
 
 @rpc("authority", "call_remote", "reliable")
 func sync_pickup_remainder(instance: String, uuid: String, bundle: Dictionary, epoch: String) -> void:
-    if multiplayer.is_server() or epoch != terrain_epoch or instance != get_active_dimension_instance_key():
+    if multiplayer.is_server() or not _peer_epoch_ok(epoch) or instance != get_active_dimension_instance_key():
         return
     if not bundle.is_empty() and (bundle.get("uuid") != uuid or not InstanceEntities.valid_bundle(bundle, SaveFile.DIMENSION_MAP[int(Ref.world.current_dimension)], _preserved_scene_paths())):
         return
@@ -14012,6 +14121,8 @@ func _play_client_entity_hit_feedback(target, _attacker, _damage_position: Vecto
 
 
 func _apply_network_place(block_position: Vector3i, block_id: int) -> void:
+    if _park_installing_edit(block_position, block_id):
+        return
     _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world):
         return
@@ -14030,6 +14141,8 @@ func _apply_loaded_network_place(block_position: Vector3i, block_id: int) -> voi
 
 
 func _apply_network_break(block_position: Vector3i) -> void:
+    if _park_installing_edit(block_position, 0):
+        return
     _ensure_remote_world_scope()
     if not is_instance_valid(Ref.world):
         return
@@ -15229,7 +15342,7 @@ func sync_break_block(dimension_instance_key: String, block_position: Vector3i, 
 
 @rpc("authority", "call_remote", "reliable")
 func sync_spawn_drop(drop_uuid: String, item_data: PackedInt32Array, drop_position: Vector3, drop_velocity: Vector3, can_collect: bool = true, epoch: String = "") -> void:
-    if epoch != terrain_epoch or lease_frozen or chunk_authority.object_owner(drop_uuid, get_active_dimension_instance_key(), _lease_chunk(drop_position)) == 2:
+    if not _peer_epoch_ok(epoch) or lease_frozen or chunk_authority.object_owner(drop_uuid, get_active_dimension_instance_key(), _lease_chunk(drop_position)) == 2:
         return
     if multiplayer.is_server():
         return
@@ -15259,7 +15372,7 @@ func sync_spawn_drop(drop_uuid: String, item_data: PackedInt32Array, drop_positi
 
 @rpc("authority", "call_remote", "reliable")
 func sync_remove_drop(drop_uuid: String, epoch: String = "") -> void:
-    if epoch != terrain_epoch or lease_frozen:
+    if not _peer_epoch_ok(epoch) or lease_frozen:
         return
     if multiplayer.is_server():
         return
@@ -15282,7 +15395,7 @@ func sync_remove_drop(drop_uuid: String, epoch: String = "") -> void:
 
 @rpc("authority", "call_remote", "unreliable")
 func server_world_state(sequence: int, drop_snapshots: Array, entity_snapshots: Array = [], epoch: String = "") -> void:
-    if epoch != terrain_epoch:
+    if not _peer_epoch_ok(epoch):
         return
     if multiplayer.is_server() or receiving_host_world or lease_frozen:
         return
@@ -15391,7 +15504,7 @@ func receive_remote_player_direct_hit(attacker_uuid: String, attacker_position: 
 
 @rpc("authority", "call_remote", "reliable")
 func confirm_entity_attack(target_uuid: String, entity_position: Vector3, entity_yaw: float, movement_velocity: Vector3, gravity_velocity: Vector3, knockback_velocity: Vector3, rope_velocity: Vector3, dead: bool, disabled: bool, server_time: float, epoch: String = "") -> void:
-    if multiplayer.is_server() or epoch != terrain_epoch or lease_frozen:
+    if multiplayer.is_server() or not _peer_epoch_ok(epoch) or lease_frozen:
         return
 
     _mark_host_contact()

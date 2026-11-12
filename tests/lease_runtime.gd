@@ -36,6 +36,21 @@ class Manager extends "res://coop_mod/coop_manager.gd":
         return 0
     func _update_status_text() -> void:
         pass
+class RaceManager extends Manager:
+    var flip: Callable
+    func _private_respawn_checkpoint(_key: String, _state: Dictionary, _instance: String, _dimension: int) -> Dictionary:
+        await get_tree().process_frame
+        if flip.is_valid():
+            flip.call()
+        return {"ok": true, "update": {}}
+class PrepareManager extends Manager:
+    var order: Array = []
+    func _await_profile_checkpoint() -> bool:
+        order.append("profile")
+        return true
+    func _checkpoint_terrain_in_background() -> bool:
+        order.append("terrain")
+        return true
 class PresenceManager extends "res://coop_mod/coop_manager.gd":
     var fixture_root: String
     func _ready() -> void:
@@ -158,6 +173,93 @@ func run() -> int:
         check(Ref.player.disabled == initially_disabled, "lease resume restores original state rather than temporary checkpoint lock")
     Ref.player.disabled = originally_disabled
     checkpoint_manager.free()
+    # H6: a profile checkpoint filters its bundles with the ownership view it started under, and counts itself while in flight.
+    var race := RaceManager.new()
+    race.fixture_root = "user://lease_race_" + Crypto.new().generate_random_bytes(8).hex_encode()
+    add_child(race)
+    var race_key: String = race.ChunkAuthority.chunk_key("dimension:2", Vector3i.ZERO)
+    var race_object: String = "dimension:2|" + UUID
+    race.chunk_authority.install_lease(1, {race_key: 1}, {race_object: 1})
+    var race_path: String = race._profile_path("host")
+    check(race.personal_store.commit_lease(race_path, 1, {race_key: 1}, {}, []), "race fixture durable epoch 1")
+    var race_bundle: Dictionary = {"uuid": UUID, "position": Vector3.ZERO, "scene_path": DROP, "save_data": {"naraka": {"node": {UUID: {"global_position": Vector3.ZERO}}}}}
+    var race_state: Dictionary = {"_coop_revision": 0, "node": {"player": {}}}
+    check((await race._commit_player_checkpoint("host", race_state, "dimension:2", 2, [race_bundle])).get("revision") == 1, "race fixture host owns the object durably")
+    race.flip = func(): race.chunk_authority.install_lease(2, {race_key: 2}, {race_object: 2})
+    race_state["_coop_revision"] = 1
+    var in_flight := {"done": false}
+    var in_flight_runner := func():
+        in_flight["result"] = await race._commit_player_checkpoint("host", race_state, "dimension:2", 2, [race_bundle])
+        in_flight["done"] = true
+    in_flight_runner.call_deferred()
+    await get_tree().process_frame
+    check(int(race.get("checkpoints_in_flight")) == 1, "checkpoint counts itself while in flight")
+    while not in_flight["done"]:
+        await get_tree().process_frame
+    var race_result: Dictionary = in_flight["result"]
+    var race_ledger: Dictionary = race.personal_store.read_ledger(race_path)
+    check(not race_result.is_empty() and not race_ledger["instances"]["dimension__2"]["tombstones"].has(UUID) and race_ledger["instances"]["dimension__2"]["owners"].get(UUID) == "host", "epoch flipped during the checkpoint does not tombstone the object")
+    check(int(race.get("checkpoints_in_flight")) == 0, "in-flight counter returns to zero")
+    race.free()
+    # H7: transit set, peer epoch window, and routine capture that skips chunks in transit.
+    var window := Manager.new()
+    window.fixture_root = "user://lease_window_" + Crypto.new().generate_random_bytes(8).hex_encode()
+    add_child(window)
+    window.terrain_epoch = "nonce:2"
+    check(window.has_method("_peer_epoch_ok") and window._peer_epoch_ok("nonce:2") and not window._peer_epoch_ok("nonce:1"), "outside a window only the exact epoch is accepted")
+    window.set("lease_window_epoch", "nonce:1")
+    check(window.has_method("_peer_epoch_ok") and window._peer_epoch_ok("nonce:1") and window._peer_epoch_ok("nonce:2") and not window._peer_epoch_ok("nonce:0"), "inside a window the previous epoch is also accepted")
+    window.set("lease_window_epoch", "")
+    check(window.has_method("_peer_epoch_ok") and not window._peer_epoch_ok("nonce:1"), "window closed again after activation")
+    var transit_actor := Node3D.new()
+    transit_actor.set_meta("coop_uuid", UUID)
+    add_child(transit_actor)
+    var window_key: String = window.ChunkAuthority.chunk_key("dimension:2", Vector3i.ZERO)
+    window.chunk_authority.install_lease(1, {window_key: 1}, {"dimension:2|" + UUID: 1})
+    check(window.owns_runtime_node(transit_actor), "owned node simulates before transit")
+    var transit = window.get("lease_transit")
+    if transit is Dictionary:
+        transit["dimension:2|" + UUID] = true
+    check(not window.owns_runtime_node(transit_actor), "node in transit is not owned until the install")
+    if transit is Dictionary:
+        transit.clear()
+    var chunks_in_transit = window.get("lease_transit_chunks")
+    var skip_data: Dictionary = {"naraka_world": {"naraka_chunk_block": {Vector3i.ZERO: PackedInt32Array([1]), Vector3i(16, 0, 0): PackedInt32Array([1])}, "naraka_chunk_water": {}, "naraka_chunk_water_awake": {}, "naraka_chunk_fire": {}}}
+    if chunks_in_transit is Dictionary:
+        chunks_in_transit[window.ChunkAuthority.chunk_key("dimension:2", Vector3i.ZERO)] = true
+    var kept: Dictionary = window.filter_local_checkpoint(skip_data, "naraka_")
+    check(chunks_in_transit is Dictionary and not kept.get("naraka_world", {}).get("naraka_chunk_block", {}).has(Vector3i.ZERO), "chunk in transit is absent from the routine host checkpoint")
+    window.free()
+    transit_actor.free()
+    # H8: pre-prepare hold and READY ordering.
+    var prep := PrepareManager.new()
+    prep.fixture_root = "user://lease_prep_" + Crypto.new().generate_random_bytes(8).hex_encode()
+    add_child(prep)
+    check(prep.has_method("_lease_hold_active") and not prep._lease_hold_active(), "no hold without a prepare")
+    prep.set("lease_prepared_token", "t1")
+    prep.set("lease_hold_until", Time.get_ticks_msec() + 60000)
+    check(prep.has_method("_lease_hold_active") and prep._lease_hold_active(), "prepare holds routine terrain submits")
+    prep.cancel_runtime_lease("t1", prep.terrain_epoch)
+    check(prep.has_method("_lease_hold_active") and not prep._lease_hold_active() and not prep.lease_busy, "cancel releases the hold without touching the lease state")
+    prep.set("lease_prepared_token", "t2")
+    prep.set("lease_hold_until", Time.get_ticks_msec() - 1)
+    check(prep.has_method("_lease_hold_active") and not prep._lease_hold_active() and prep.get("lease_prepared_token") == "", "timeout releases the hold")
+    prep.set("lease_prepared_token", "t3")
+    prep.set("lease_hold_until", Time.get_ticks_msec() + 60000)
+    prep.background_checkpoint_busy = true
+    var presync := {"done": false, "ok": false}
+    var presync_runner := func():
+        presync["ok"] = await prep.call("_lease_presync", "t3")
+        presync["done"] = true
+    presync_runner.call_deferred()
+    await get_tree().process_frame
+    await get_tree().process_frame
+    check(prep.order.is_empty() and not presync["done"], "READY work does not start while a routine checkpoint is in flight")
+    prep.background_checkpoint_busy = false
+    while not presync["done"]:
+        await get_tree().process_frame
+    check(presync["ok"] == true and prep.order == ["profile", "terrain"], "presync saves the profile, then the terrain delta")
+    prep.free()
     var manager := Manager.new()
     manager.fixture_root = "user://lease_runtime_" + Crypto.new().generate_random_bytes(8).hex_encode()
     add_child(manager)
