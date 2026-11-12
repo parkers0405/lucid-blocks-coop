@@ -9,6 +9,7 @@ const PROFILES := {
     "spike": {"delay": 60, "jitter": 15, "loss": 0.01, "reorder": 0.0, "stall_every": 20000, "stall_ms": 1500},
     "cut": {"delay": 0, "jitter": 0, "loss": 0.0, "reorder": 0.0, "cut_after": 25000, "cut_ms": 8000},
 }
+const RECV_BUFFER := 1 << 22
 var guest := PacketPeerUDP.new()
 var host := PacketPeerUDP.new()
 var guest_ip: String = ""
@@ -16,10 +17,11 @@ var guest_port: int = 0
 var profile: Dictionary
 var rng := RandomNumberGenerator.new()
 var queue: Array = []  # [due_ms, to_host, bytes]
-var stats := {"profile": "", "forwarded": 0, "dropped": 0, "reordered": 0, "stalled": 0, "cut_dropped": 0, "max_delay_ms": 0}
+var stats := {"profile": "", "forwarded": 0, "dropped": 0, "reordered": 0, "stalled": 0, "cut_dropped": 0, "max_delay_ms": 0, "send_errors": 0, "max_loop_gap_ms": 0, "bytes_to_host": 0, "bytes_to_guest": 0}
 var first_ms: int = -1
 var log_path: String
 var stop_path: String
+var last_loop_ms: int = -1
 
 func _initialize() -> void:
     var a := OS.get_cmdline_user_args()
@@ -32,7 +34,8 @@ func _initialize() -> void:
     rng.seed = int(a[3])
     log_path = a[4]
     stop_path = a[5]
-    if guest.bind(int(a[0]), "127.0.0.1") != OK:
+    # The default 64 KB receive ring overflows on one full ENet window (WARNING "Buffer full, dropping packets"), which is loss on top of the profile.
+    if guest.bind(int(a[0]), "127.0.0.1", RECV_BUFFER) != OK or host.bind(0, "127.0.0.1", RECV_BUFFER) != OK:
         push_error("udp_relay: bind failed")
         quit(3)
         return
@@ -41,6 +44,9 @@ func _initialize() -> void:
 
 func _process(_delta: float) -> bool:
     var now: int = Time.get_ticks_msec()
+    if last_loop_ms >= 0:
+        stats["max_loop_gap_ms"] = maxi(int(stats["max_loop_gap_ms"]), now - last_loop_ms)
+    last_loop_ms = now
     while guest.get_available_packet_count() > 0:
         var bytes := guest.get_packet()
         guest_ip = guest.get_packet_ip()
@@ -53,10 +59,12 @@ func _process(_delta: float) -> bool:
         if item[0] > now:
             rest.append(item)
         elif item[1]:
-            host.put_packet(item[2])
+            _count_send(host.put_packet(item[2]))
+            stats["bytes_to_host"] += item[2].size()
         elif guest_port != 0:
             guest.set_dest_address(guest_ip, guest_port)
-            guest.put_packet(item[2])
+            _count_send(guest.put_packet(item[2]))
+            stats["bytes_to_guest"] += item[2].size()
     queue = rest
     if FileAccess.file_exists(stop_path):
         var file := FileAccess.open(log_path, FileAccess.WRITE)
@@ -90,3 +98,7 @@ func _enqueue(now: int, to_host: bool, bytes: PackedByteArray) -> void:
     stats["max_delay_ms"] = maxi(int(stats["max_delay_ms"]), due - now)
     stats["forwarded"] += 1
     queue.append([due, to_host, bytes])
+
+func _count_send(err: Error) -> void:
+    if err != OK:
+        stats["send_errors"] += 1
