@@ -37,6 +37,8 @@ func _on_dropped_item_entered(area: Area3D) -> void:
     if not area.get_parent() is DroppedItem:
         return
     var dropped_item: DroppedItem = area.get_parent() as DroppedItem
+    if Ref.coop_manager != null and Ref.coop_manager.intercept_durable_pickup(entity, dropped_item):
+        return
 
     if blocks_only and not ItemMap.map(dropped_item.item.id) is Block:
         return

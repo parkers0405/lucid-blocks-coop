@@ -29,12 +29,7 @@ var last_discovery_spawn_attempt_msec: int = 0
 
 
 func _can_use_multi_region_logic() -> bool:
-    return multiplayer.is_server() \
-        and Ref.coop_manager != null \
-        and Ref.coop_manager.has_connected_remote_peers() \
-        and Ref.world != null \
-        and Ref.world.has_method("uses_coop_multi_region_loading") \
-        and bool(Ref.world.call("uses_coop_multi_region_loading"))
+    return false
 
 
 func _ready() -> void :

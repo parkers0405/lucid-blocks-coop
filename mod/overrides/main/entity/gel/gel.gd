@@ -9,6 +9,10 @@ class_name Gel extends Entity
 @export var jump_target_multiplier: float = 0.5
 @export var base_color: Color = Color("78c4d0ff")
 @export var idle_jump: bool = true
+@export var is_mini: bool = false
+
+@onready var major_indices: PackedInt32Array = [8, 9, 26, 27, 44, 45]
+@onready var minor_indices: PackedInt32Array = major_indices
 
 @onready var softbody: SoftBody3D = %GelModel / SoftBody3D
 @onready var jump_timer: Timer = %JumpTimer
@@ -113,6 +117,8 @@ func _on_jump_timeout() -> void :
 
 
 func _physics_process(delta: float) -> void :
+    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
+        return
     if disabled:
         return
 
@@ -180,9 +186,10 @@ func update_bothersome_target() -> void :
 
 func get_softbody_approximate_position() -> Vector3:
     var average_position: Vector3 = Vector3()
-    for index in [124, 125, 24, 25, 74, 75]:
+    var indices: PackedInt32Array = minor_indices if is_mini else major_indices
+    for index in indices:
         average_position += softbody.get_point_transform(index)
-    return average_position / 6.0
+    return average_position / float(indices.size())
 
 
 func _on_modulate_changed(new_modulate: Color) -> void :
@@ -201,10 +208,12 @@ func flush_deleted_entities() -> void :
     bothersome_entities = new_entities
 
 
-func attacked(attacker: Entity, damage: int) -> void :
+func attacked(attacker: Entity, damage: int, damage_position: Vector3) -> void :
+    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
+        return
     if dead or disabled or softbody.process_mode == PROCESS_MODE_DISABLED:
         return
-    super.attacked(attacker, damage)
+    super.attacked(attacker, damage, damage_position)
     if is_instance_valid(attacker):
         bothersome = attacker
 
@@ -224,6 +233,7 @@ func update_positions() -> bool:
 
 func override_position() -> void :
     last_softbody_position = global_position
+    softbody.global_position = global_position
     last_position = global_position
 
 

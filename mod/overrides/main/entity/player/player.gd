@@ -764,11 +764,16 @@ func _physics_process(delta: float) -> void :
     push_process(delta)
 
 
+var coop_pending_drop: int = -1
+var coop_pending_drop_item: ItemState
+var coop_pending_interact: int = -1
+var coop_pending_interact_item: ItemState
+
 func _input(event: InputEvent) -> void :
     if disabled:
         return
 
-    if can_switch_hotbar and MouseHandler.fully_captured:
+    if can_switch_hotbar and MouseHandler.fully_captured and (Ref.coop_manager == null or not Ref.coop_manager._is_client_gameplay_locked()):
         var new_index: int = held_item_index
         for i in range(6):
             if event.is_action_pressed("hotbar_%d" % (i + 1), false):
@@ -785,8 +790,12 @@ func _input(event: InputEvent) -> void :
             hold_item(new_index)
 
     var local_movement_enabled: bool = movement_enabled and MouseHandler.fully_captured
-    if local_movement_enabled and is_instance_valid(held_item) and is_action_pressed_safe("drop_item") and Input.is_action_just_pressed("drop_item"):
-        %DropItems.drop_and_remove_from_inventory( %Hotbar, held_item_index)
+    if local_movement_enabled and (Ref.coop_manager == null or not Ref.coop_manager._is_client_gameplay_locked()) and is_instance_valid(held_item) and is_action_pressed_safe("drop_item") and Input.is_action_just_pressed("drop_item"):
+        if Ref.coop_manager != null and Ref.coop_manager.pickup_inventory_lock:
+            coop_pending_drop = held_item_index
+            coop_pending_drop_item = %Hotbar.items[held_item_index]
+        else:
+            %DropItems.drop_and_remove_from_inventory( %Hotbar, held_item_index)
 
     if local_movement_enabled and event is InputEventKey:
         var key_event := event as InputEventKey
@@ -1038,6 +1047,9 @@ func camera_process(delta: float) -> void :
 
 
 func attack_process(data: Dictionary) -> void :
+    if Ref.coop_manager != null and Ref.coop_manager._is_client_gameplay_locked():
+        %BreakBlocks.break_block_stop()
+        return
     var attack_pressed: bool = is_action_pressed_safe("attack")
     if not is_interacting():
         if attack_pressed and Input.is_action_just_pressed("attack"):
@@ -1096,9 +1108,33 @@ func attack_process(data: Dictionary) -> void :
 
 
 func interaction_process(data: Dictionary, delta: float) -> void :
+    if Ref.coop_manager != null and Ref.coop_manager._is_client_gameplay_locked():
+        coop_pending_drop = -1
+        coop_pending_drop_item = null
+        coop_pending_interact = -1
+        coop_pending_interact_item = null
+        %BreakBlocks.break_block_stop()
+        return
     if disabled:
+        coop_pending_drop = -1
+        coop_pending_drop_item = null
+        coop_pending_interact = -1
+        coop_pending_interact_item = null
         return
     var interact_pressed: bool = _get_coop_interact_pressed(is_action_pressed_safe("interact"), delta)
+    var inventory_locked: bool = Ref.coop_manager != null and Ref.coop_manager.pickup_inventory_lock
+    if not inventory_locked and coop_pending_drop >= 0:
+        if %Hotbar.items[coop_pending_drop] == coop_pending_drop_item:
+            %DropItems.drop_and_remove_from_inventory(%Hotbar, coop_pending_drop)
+        coop_pending_drop = -1
+        coop_pending_drop_item = null
+    var retry_interact: bool = not inventory_locked and coop_pending_interact == held_item_index and %Hotbar.items[held_item_index] == coop_pending_interact_item
+    if not inventory_locked:
+        coop_pending_interact = -1
+        coop_pending_interact_item = null
+    if inventory_locked and interact_pressed and Input.is_action_just_pressed("interact"):
+        coop_pending_interact = held_item_index
+        coop_pending_interact_item = %Hotbar.items[held_item_index]
 
     can_interact_with_block = ("target_position" in data and is_instance_valid(Ref.world.get_living_block_at(data.target_position)) and Ref.world.get_living_block_at(data.target_position).can_currently_interact(self))
     can_interact_using_item = is_instance_valid(held_item) and held_item.can_interact(data)
@@ -1108,7 +1144,7 @@ func interaction_process(data: Dictionary, delta: float) -> void :
         var living_block: LivingBlock = Ref.world.get_living_block_at(data.target_position) as LivingBlock
         living_block.interact(self)
 
-    elif interact_pressed and Input.is_action_just_pressed("interact") and not is_interacting() and is_instance_valid(held_item):
+    elif not inventory_locked and (retry_interact or interact_pressed and Input.is_action_just_pressed("interact")) and not is_interacting() and is_instance_valid(held_item):
         var interaction_type: int = held_item.interaction_type
         var success: bool = can_interact_using_item and await held_item.interact(true, data)
         if success:
@@ -1253,11 +1289,13 @@ func get_interact_data(skip_look: bool = false) -> Dictionary:
         data.interact_end = %InteractRayCast3D.get_collision_point()
         var collider: Object = %InteractRayCast3D.get_collider()
         var resolved_target = _resolve_interact_owner_from_collider(collider)
-        var collider_name: String = collider.name if collider is Node else str(collider)
-        var resolved_name: String = resolved_target.name if resolved_target is Node else str(resolved_target)
-        data["debug_collider"] = "%s:%s" % [collider.get_class(), collider_name]
-        data["debug_resolved"] = "%s:%s" % [resolved_target.get_class(), resolved_name] if is_instance_valid(resolved_target) else "<none>"
-        if collider.owner is Star:
+        # Native terrain bodies can have no collider object; the original script guarded this the same way.
+        if is_instance_valid(collider):
+            var collider_name: String = collider.name if collider is Node else str(collider)
+            var resolved_name: String = resolved_target.name if resolved_target is Node else str(resolved_target)
+            data["debug_collider"] = "%s:%s" % [collider.get_class(), collider_name]
+            data["debug_resolved"] = "%s:%s" % [resolved_target.get_class(), resolved_name] if is_instance_valid(resolved_target) else "<none>"
+        if is_instance_valid(collider) and collider.owner is Star:
             data.star_target = collider.owner
         elif resolved_target is Ball or resolved_target is Heart:
             data.ball_target = resolved_target

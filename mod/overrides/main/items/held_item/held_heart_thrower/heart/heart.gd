@@ -23,5 +23,5 @@ func deal_damage(target: Entity) -> void :
         return
 
     target.set_deferred("knockback_velocity", target.knockback_velocity + knockback_delta)
-    target.attacked(entity_owner, heal_amount)
+    target.attacked(entity_owner, heal_amount, global_position)
     _on_timeout()

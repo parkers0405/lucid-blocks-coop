@@ -1,5 +1,7 @@
 class_name Entity extends CharacterBody3D
 
+var dexterity: int = 0
+
 @export_group("Stats")
 @export var max_health: int = 10:
     set(val):
@@ -330,10 +332,7 @@ func _should_ignore_visibility_culling() -> bool:
 
 
 func _can_use_session_load_proxy() -> bool:
-    return _use_session_targeting() \
-        and Ref.coop_manager != null \
-        and Ref.coop_manager.has_method("can_use_same_instance_load_proxies") \
-        and bool(Ref.coop_manager.call("can_use_same_instance_load_proxies"))
+    return false
 
 
 func _refresh_visibility_enabler_target() -> void:
@@ -395,6 +394,8 @@ func _on_equipment_inventory_item_slot_changed(_inventory: Inventory, _index: in
 
 
 func _physics_process(delta: float) -> void :
+    if not self is Player and Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
+        return
     if disabled:
         return
 
@@ -465,6 +466,22 @@ func rope_process(delta: float) -> void :
 
     for rope in rope_velocities:
         rope_velocity += rope_velocities[rope]
+
+
+static func get_water_flow(position: Vector3) -> Vector3:
+    if not Ref.world.is_position_loaded(position):
+        return Vector3.ZERO
+    var water_level: int = Ref.world.get_water_level_at(position)
+    if water_level == 0:
+        return Vector3.ZERO
+    var flow := Vector3.ZERO
+    for direction in [Vector3.LEFT, Vector3.RIGHT, Vector3.BACK, Vector3.FORWARD]:
+        var neighbor_position: Vector3 = position + direction
+        if not Ref.world.is_position_loaded(neighbor_position):
+            continue
+        if not Ref.world.is_block_solid_at(neighbor_position):
+            flow += direction * (water_level - Ref.world.get_water_level_at(neighbor_position))
+    return flow / 255.0
 
 
 func water_physics_process(delta: float) -> void :
@@ -540,7 +557,9 @@ func check_fire() -> void :
 
 
 
-func attacked(attacker: Entity, damage: int) -> void :
+func attacked(attacker: Entity, damage: int, _damage_position: Vector3) -> void :
+    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
+        return
     if dead or disabled:
         return
 
@@ -577,6 +596,8 @@ func heal(heal_power: int) -> void :
 
 
 func take_damage(damage: int, type: int) -> void :
+    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
+        return
     if invincible or invincible_temporary:
         return
 
@@ -637,6 +658,8 @@ func damage_equipment(damage: int, index: int = -1) -> void :
 
 
 func die() -> void :
+    if Ref.coop_manager != null and not Ref.coop_manager.can_mutate_runtime_node(self):
+        return
     if disabled or dead:
         return
     if is_instance_valid(held_item):
@@ -656,7 +679,12 @@ func die() -> void :
             child.disabled = true
     %DeathAnimationPlayer.play("die")
 
+    # A handoff waits for the drops to exist before saving the final world.
+    set_meta("coop_death_loot_pending", true)
     await death_drop_item
+    if Ref.coop_manager != null and not Ref.coop_manager.owns_runtime_node(self):
+        set_meta("coop_death_loot_pending", false)
+        return
     var items: Array[ItemState]
     if cooked_death_drop != null and has_node("%Burn") and (get_node("%Burn").burning or get_node("%Burn").died_while_burning):
         items = cooked_death_drop.realize()
@@ -672,6 +700,7 @@ func die() -> void :
         get_tree().get_root().add_child(new_item)
         new_item.delay_merge()
         new_item.initialize(item)
+    set_meta("coop_death_loot_pending", false)
     await %DeathAnimationPlayer.animation_finished
 
     queue_free()
@@ -763,6 +792,9 @@ func preserve_load(file: SaveFile, uuid: String) -> void :
 
 
 func decrease_held_item_durability(amount: int) -> void :
+    # Passive equipment timers pause while a durable inventory result is pending.
+    if self is Player and Ref.coop_manager != null and Ref.coop_manager.chest_lock_active:
+        return
     if held_item == null:
         return
     held_item_inventory.decrease_item_durability(held_item_index, amount)
@@ -847,10 +879,9 @@ func allow_swarm() -> void :
 
 
 func is_future_position_loaded(delta: float) -> bool:
-    var future_position: Vector3 = global_position + velocity * delta
-    if Ref.world.is_position_loaded(future_position):
-        return true
-    return _can_use_session_load_proxy() and Ref.coop_manager.is_position_near_same_instance_player(future_position, process_distance)
+    if not is_inside_tree() or is_queued_for_deletion() or not PhysicsServer3D.body_get_space(get_rid()).is_valid():
+        return false
+    return is_session_position_loaded(global_position + velocity * delta)
 
 
 func distance_process_check() -> void :
