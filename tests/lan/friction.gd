@@ -472,21 +472,55 @@ func _scn_kill(manager: Node) -> bool:
         await get_tree().physics_frame
         check(not manager.chest_pending_token.is_empty(), "chest transfer in flight at kill point")
         await _publish_kill_and_hold()
-    elif point == "install0":
+    elif point == "install0" or point == "switched":
+        # Protocol 7 kill points: install0 = the guest holds its submits for a pre-prepare ("prepared"), switched = the guest flipped and waits for the activation.
         var origin: Vector3 = Ref.player.global_position
         _aim(-PI / 2.0, 0.0)
         Input.action_press("up")
         Input.action_press("sprint")
-        # Guest is frozen, its checkpoint is acknowledged and the host is installing the new owners (phase install_0 .. resume).
         var deadline: int = Time.get_ticks_msec() + 150000
-        while not (manager.lease_frozen and not manager.lease_checkpoint_allowed) and Time.get_ticks_msec() < deadline:
+        var reached: Callable = func(): return manager.lease_prepared_token != "" if point == "install0" else manager.lease_window_epoch != ""
+        while not reached.call() and Time.get_ticks_msec() < deadline:
             await get_tree().physics_frame
-        if not (manager.lease_frozen and not manager.lease_checkpoint_allowed):
-            check(false, "guest never reached the install phase of a handoff")
+        if not reached.call():
+            check(false, "guest never reached the %s state of a handoff" % point)
             return false
         await _publish_kill_and_hold()
+        return false
     else:
         check(false, "unknown kill point " + point)
+    return false
+
+# quit_midaction (G6): the host quits while a guest pickup is pending; the shutdown must finish within 10 s.
+func _scn_quit_midaction(manager: Node) -> bool:
+    _bot_on()
+    if role != "host":
+        if not await _wait_marker("host", "pile"):
+            return false
+        if not await _wait(func(): return not manager.pickup_pending.is_empty(), "pickup pending", 60.0):
+            return false
+        _mark("quitgo")
+        await _wait_marker("host", "quit_done", 60.0)
+        _flush_tele()
+        _finish_io()
+        _mark("complete", {"checks": checks, "failures": failures})
+        print("LOCAL_COOP_RESULT ", role, " ", checks, " checks ", failures, " failures")
+        get_tree().quit(1 if failures else 0)
+        return false
+    _spawn_pile(30)
+    if not await _wait_marker("guest", "quitgo", 120.0):
+        return false
+    var started: int = Time.get_ticks_msec()
+    var committed: bool = await manager._shutdown_host_session(false, "friction quit during a pickup")
+    var elapsed: int = Time.get_ticks_msec() - started
+    check(committed and elapsed <= 10000, "host quit during a pickup completes in %d ms" % elapsed)
+    _event("scenario_done", {"name": "quit_midaction", "elapsed_ms": elapsed})
+    _mark("quit_done", {"elapsed_ms": elapsed})
+    _flush_tele()
+    _finish_io()
+    _mark("complete", {"checks": checks, "failures": failures})
+    print("LOCAL_COOP_RESULT ", role, " ", checks, " checks ", failures, " failures")
+    get_tree().quit(1 if failures else 0)
     return false
 
 func _open_chest_and_read(manager: Node) -> int:

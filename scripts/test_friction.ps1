@@ -34,7 +34,7 @@ $scenarios = $Cells | ForEach-Object { ($_ -split ':')[0] } | Select-Object -Uni
 if (-not $SkipControls) {
     foreach ($control in @('original', 'offline')) { foreach ($enters in @(2, 3)) { Invoke-Run @{ WorldControl = $control; ControlEnters = $enters } } }
 }
-foreach ($scenario in $(if ($SkipSolo) { @() } else { $scenarios | Where-Object { $_ -notmatch '^(kill_|chest_)' } })) {
+foreach ($scenario in $(if ($SkipSolo) { @() } else { $scenarios | Where-Object { $_ -notmatch '^(kill_|chest_|quit_)' } })) {
     for ($i = 0; $i -lt $Repeats; $i++) { Invoke-Run @{ Scenario = $scenario; Solo = $true; TimeoutSeconds = 400 } }
 }
 try {

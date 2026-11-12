@@ -551,6 +551,7 @@ func _lease_install_incoming(instance: String, bundles: Array, terrain: Dictiona
     if terrain.is_empty():
         return
     terrain["epoch"] = terrain_epoch
+    terrain["slice_usec"] = 12000
     var prefix: String = _resolve_dimension_namespace(terrain["dimension"], terrain["pocket_owner_key"]) + "_"
     chunk_authority.seed_versions(instance, terrain["world_data"].get(prefix + "world", {}), prefix, terrain.get("versions", {}))
     _merge_world_patch_into_cache(terrain)
@@ -1505,6 +1506,8 @@ func _apply_canonical_terrain(patch: Dictionary) -> bool:
     var prefix: String = _resolve_dimension_namespace(patch["dimension"], patch["pocket_owner_key"]) + "_"
     var root: Dictionary = patch["world_data"].get(prefix + "world", {})
     var budget_start: int = Time.get_ticks_usec()
+    # Handoff installs run on a larger slice so edits parked on those chunks wait a shorter time.
+    var slice_usec: int = int(patch.get("slice_usec", 2000))
     for chunk in root.get(prefix + "chunk_block", {}):
         installing_chunks[chunk] = true
     for chunk in root.get(prefix + "chunk_block", {}):
@@ -1528,7 +1531,7 @@ func _apply_canonical_terrain(patch: Dictionary) -> bool:
                 world.place_block_at(position, ItemMap.map(blocks[index]), false, false)
             if water.size() == 4096 and world.get_water_level_at(position) != water[index]:
                 world.place_water_at(position, water[index])
-            if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= 2000:
+            if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= slice_usec:
                 await get_tree().process_frame
                 if world != _canonical_world() or instance != get_active_dimension_instance_key() or patch.get("epoch") != terrain_epoch:
                     _end_canonical_install(false)
@@ -1545,7 +1548,7 @@ func _apply_canonical_terrain(patch: Dictionary) -> bool:
             var position := Vector3(chunk + Vector3i(index % 16, index / 256, (index / 16) % 16))
             if world.get_fire_at(position) != fire[index]:
                 world.place_fire_at(position, fire[index])
-            if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= 2000:
+            if index % 128 == 127 and Time.get_ticks_usec() - budget_start >= slice_usec:
                 await get_tree().process_frame
                 if world != _canonical_world() or instance != get_active_dimension_instance_key() or patch.get("epoch") != terrain_epoch:
                     _end_canonical_install(false)
@@ -8681,7 +8684,8 @@ func _capture_host_water_changes(peer_id: int, center_position: Vector3, dimensi
                 if not Ref.world.is_position_loaded(cell_position):
                     continue
                 var water_level: int = int(Ref.world.get_water_level_at(cell_position))
-                if force_full_sync:
+                # First sync sends only the cells that hold something; empty cells are the default on the guest.
+                if force_full_sync and water_level > 0:
                     changes.append([cell_position, water_level])
                 if water_level > 0:
                     current_levels[cell_position] = water_level
@@ -8725,7 +8729,8 @@ func _capture_host_fire_changes(peer_id: int, center_position: Vector3, dimensio
                 if not Ref.world.is_position_loaded(cell_position):
                     continue
                 var fire_level: int = int(Ref.world.get_fire_at(cell_position))
-                if force_full_sync:
+                # First sync sends only the cells that hold something; empty cells are the default on the guest.
+                if force_full_sync and fire_level > 0:
                     changes.append([cell_position, fire_level])
                 if fire_level > 0:
                     current_levels[cell_position] = fire_level

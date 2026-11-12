@@ -81,7 +81,19 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
         $otherRuns = Get-Runs $times $otherLock
         $freezeFlags = [bool[]]@(for ($i = 0; $i -lt $win.Count; $i++) { ($win[$i].sim -eq 0 -or $win[$i].ent -eq 0) -and -not $loading[$i] })
         $freezeRuns = Get-Runs $times $freezeFlags
-        $editRuns = Get-Runs $times ([bool[]]@($win | ForEach-Object { $_.ed -gt 0 }))
+        $editFlags = [bool[]]@($win | ForEach-Object { $_.ed -gt 0 })
+        $allEditRuns = Get-Runs $times $editFlags
+        # Parked remote edits count against G4 only when they wait on a handoff install (an epoch change within 1.5 s); routine canonical installs delay remote edits too but lock no local action and are reported separately.
+        $epochTimes = @($events | Where-Object ev -eq 'epoch' | ForEach-Object { $_.t })
+        $editRuns = @(); $routineEditRuns = @(); $cursor = -1
+        for ($i = 0; $i -lt $win.Count; $i++) {
+            if ($editFlags[$i] -and $cursor -lt 0) { $cursor = $i }
+            if ((-not $editFlags[$i] -or $i -eq $win.Count - 1) -and $cursor -ge 0) {
+                $t0 = $times[$cursor]; $t1 = $times[$i]; $len = $t1 - $t0
+                if (@($epochTimes | Where-Object { [Math]::Abs($_ - $t0) -le 1500 }).Count) { $editRuns += $len } else { $routineEditRuns += $len }
+                $cursor = -1
+            }
+        }
         $nodeEvents[$role] = @($events | Where-Object ev -eq 'node')
         # Host: time from the SWITCH being sent (phase "switching") to the epoch change, per handoff that completed; rejected switches are counted.
         $switchMs = @(); $switchRejected = 0; $switchAt = $null; $idleAt = $null
@@ -112,7 +124,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $Batch -Directory) {
             run = $dir.Name; scenario = $config.scenario; profile = $(if ($config.solo) { 'solo' } else { $config.profile }); disk = $config.disk; role = $role
             elapsed_ms = $done.elapsed_ms; window_ms = $windowMs; frames = $win.Count
             handoff_lock_runs_ms = $handoffRuns; other_lock_ms = $otherRuns; lock_total_ms = (($handoffRuns | Measure-Object -Sum).Sum + ($otherRuns | Measure-Object -Sum).Sum)
-            switch_ms = $switchMs; switch_rejected = $switchRejected; chest_modal_frames = $chestOpenFrames; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; log_reconnects = $logReconnects; pickup_timeouts = $pickupTimeouts; movement_ignored_frames = $ignored
+            switch_ms = $switchMs; switch_rejected = $switchRejected; routine_edit_delay_ms = $routineEditRuns; chest_modal_frames = $chestOpenFrames; freeze_runs_ms = $freezeRuns; edit_delay_runs_ms = $editRuns; reconnects = $reconnectRuns.Count; log_reconnects = $logReconnects; pickup_timeouts = $pickupTimeouts; movement_ignored_frames = $ignored
             break_resets = [int](($win | Measure-Object -Property rst -Sum).Sum)
             frame_p99_ms = (Get-Percentile $dts 0.99); frames_over_50ms = $over50
             pickup_p95_ms = $(if ($pickups -and $pickups.pickup_ms.Count) { Get-Percentile ([double[]]$pickups.pickup_ms) 0.95 } else { $null })
