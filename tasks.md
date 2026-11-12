@@ -1,3 +1,10 @@
+# Handoff redesign (handoff-design.md section 4), status 2026-11-12
+- [x] H0 instrumentation (517e585), H1 ordering proof (517e585), H2 terrain oracle (490e33d)
+- [x] H3 commit_lease rules, H4 ownership diff (31da55d); H5 install replay, H6 checkpoint snapshot, H7 transit and epoch window, H8 pre-prepare (92af9c5)
+- [ ] H8b lost hits on transit mobs: not measured (no mobs in the scenarios)
+- [ ] H9 SWITCH/SWITCHED/ACTIVATED: implemented on build/h9-one-roundtrip-wip, BLOCKED by undelivered pickup replies under the relay (playtest.md 2026-11-12)
+- [ ] H10 recovery and quit kill points; H11 full gate matrix; reviewer pass; README, architecture, gameplay-audit, CONTINUATION, retro updates
+
 # Current work — gameplay quality
 
 Review follow-up in [gameplay-audit.md](gameplay-audit.md): confirmed findings corrected, focused regressions and independent source review complete; final packed/runtime verification underway. Current status NOT READY. Historical361assertions/68scripts, installer23, chest29 and two-process19functional assertions remain in playtest.md. Next: final packed run, exact-artifact offline/LAN comparison, then record the readiness decision. Keep the maintenance workflow below.

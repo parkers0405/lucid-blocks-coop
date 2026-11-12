@@ -1,5 +1,5 @@
 # Lucid Blocks co-op state
-Updated 2026-11-11. NOT READY. Realistic cells (3 repeats): handoff freeze is 733-850 ms at typical latency and 2-4.7 s at bad latency (limits 150 ms action lock, 500 ms p95), so G4/G6 fail on round trips; host mining is also degraded in co-op (3-8 of 20 blocks vs 20 solo). Write-behind commit, hysteresis, rollback and backoff fixes are in; kill tests, shared_loot and chest_cycle conserve items. Native errors match controls except an ENet auth-packet error under the reordering profile. See top entry of playtest.md.
+Updated 2026-11-12. NOT READY. H0-H8 of the one-round-trip handoff are in (commits 517e585..490e33d, protocol 6 still). H9 (protocol 7) is on build/h9-one-roundtrip-wip and BLOCKED: after the first handoff the host reply to every guest pickup is not delivered under the typical relay (guest reconnects), though the handoff itself shows 0 lock frames and switch p95 317 ms. H10, H11, the gate matrix and the reviewer pass are not done. Host mining (4 of 20) still unexplained. See top entry of playtest.md.
 
 - Branch: fix/review-ready-compatibility. Preserve102unrelated.import edits and status-only test line endings.
 - Scope: smooth two-player gameplay with compatibility/functionality retained. No PR creation, merge, main push, installation or release performed.
